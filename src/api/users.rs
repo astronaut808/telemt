@@ -92,7 +92,14 @@ pub(super) async fn create_user(
         shared.ip_tracker.set_user_limit(&body.username, limit).await;
     }
 
-    let users = users_from_config(&cfg, &shared.stats, &shared.ip_tracker).await;
+    let users = users_from_config(
+        &cfg,
+        &shared.stats,
+        &shared.ip_tracker,
+        shared.startup_detected_ip_v4,
+        shared.startup_detected_ip_v6,
+    )
+    .await;
     let user = users
         .into_iter()
         .find(|entry| entry.username == body.username)
@@ -106,7 +113,12 @@ pub(super) async fn create_user(
             current_connections: 0,
             active_unique_ips: 0,
             total_octets: 0,
-            links: build_user_links(&cfg, &secret),
+            links: build_user_links(
+                &cfg,
+                &secret,
+                shared.startup_detected_ip_v4,
+                shared.startup_detected_ip_v6,
+            ),
         });
 
     Ok((CreateUserResponse { user, secret }, revision))
@@ -171,7 +183,14 @@ pub(super) async fn patch_user(
     if let Some(limit) = updated_limit {
         shared.ip_tracker.set_user_limit(user, limit).await;
     }
-    let users = users_from_config(&cfg, &shared.stats, &shared.ip_tracker).await;
+    let users = users_from_config(
+        &cfg,
+        &shared.stats,
+        &shared.ip_tracker,
+        shared.startup_detected_ip_v4,
+        shared.startup_detected_ip_v6,
+    )
+    .await;
     let user_info = users
         .into_iter()
         .find(|entry| entry.username == user)
@@ -211,7 +230,14 @@ pub(super) async fn rotate_secret(
     let revision = save_config_to_disk(&shared.config_path, &cfg).await?;
     drop(_guard);
 
-    let users = users_from_config(&cfg, &shared.stats, &shared.ip_tracker).await;
+    let users = users_from_config(
+        &cfg,
+        &shared.stats,
+        &shared.ip_tracker,
+        shared.startup_detected_ip_v4,
+        shared.startup_detected_ip_v6,
+    )
+    .await;
     let user_info = users
         .into_iter()
         .find(|entry| entry.username == user)
@@ -270,6 +296,8 @@ pub(super) async fn users_from_config(
     cfg: &ProxyConfig,
     stats: &Stats,
     ip_tracker: &UserIpTracker,
+    startup_detected_ip_v4: Option<IpAddr>,
+    startup_detected_ip_v6: Option<IpAddr>,
 ) -> Vec<UserInfo> {
     let ip_counts = ip_tracker
         .get_stats()
@@ -287,7 +315,14 @@ pub(super) async fn users_from_config(
             .access
             .users
             .get(&username)
-            .map(|secret| build_user_links(cfg, secret))
+            .map(|secret| {
+                build_user_links(
+                    cfg,
+                    secret,
+                    startup_detected_ip_v4,
+                    startup_detected_ip_v6,
+                )
+            })
             .unwrap_or(UserLinks {
                 classic: Vec::new(),
                 secure: Vec::new(),
@@ -313,8 +348,13 @@ pub(super) async fn users_from_config(
     users
 }
 
-fn build_user_links(cfg: &ProxyConfig, secret: &str) -> UserLinks {
-    let hosts = resolve_link_hosts(cfg);
+fn build_user_links(
+    cfg: &ProxyConfig,
+    secret: &str,
+    startup_detected_ip_v4: Option<IpAddr>,
+    startup_detected_ip_v6: Option<IpAddr>,
+) -> UserLinks {
+    let hosts = resolve_link_hosts(cfg, startup_detected_ip_v4, startup_detected_ip_v6);
     let port = cfg.general.links.public_port.unwrap_or(cfg.server.port);
     let tls_domains = resolve_tls_domains(cfg);
 
@@ -353,7 +393,11 @@ fn build_user_links(cfg: &ProxyConfig, secret: &str) -> UserLinks {
     }
 }
 
-fn resolve_link_hosts(cfg: &ProxyConfig) -> Vec<String> {
+fn resolve_link_hosts(
+    cfg: &ProxyConfig,
+    startup_detected_ip_v4: Option<IpAddr>,
+    startup_detected_ip_v6: Option<IpAddr>,
+) -> Vec<String> {
     if let Some(host) = cfg
         .general
         .links
@@ -363,6 +407,17 @@ fn resolve_link_hosts(cfg: &ProxyConfig) -> Vec<String> {
         .filter(|value| !value.is_empty())
     {
         return vec![host.to_string()];
+    }
+
+    let mut startup_hosts = Vec::new();
+    if let Some(ip) = startup_detected_ip_v4 {
+        push_unique_host(&mut startup_hosts, &ip.to_string());
+    }
+    if let Some(ip) = startup_detected_ip_v6 {
+        push_unique_host(&mut startup_hosts, &ip.to_string());
+    }
+    if !startup_hosts.is_empty() {
+        return startup_hosts;
     }
 
     let mut hosts = Vec::new();
