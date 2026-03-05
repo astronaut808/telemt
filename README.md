@@ -118,8 +118,8 @@ We welcome ideas, architectural feedback, and pull requests.
 
 ## Quick Start Guide
 
-### [Quick Start Guid RU](docs/QUICK_START_GUIDE.ru.md)  
-### [Quick Start Guid EN](docs/QUICK_START_GUIDE.en.md)
+### [Quick Start Guide RU](docs/QUICK_START_GUIDE.ru.md)  
+### [Quick Start Guide EN](docs/QUICK_START_GUIDE.en.md)
 
 
 ### Advanced
