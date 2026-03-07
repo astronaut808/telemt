@@ -11,7 +11,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
@@ -67,7 +67,7 @@ pub(super) struct ApiRuntimeState {
 pub(super) struct ApiShared {
     pub(super) stats: Arc<Stats>,
     pub(super) ip_tracker: Arc<UserIpTracker>,
-    pub(super) me_pool: Option<Arc<MePool>>,
+    pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     pub(super) upstream_manager: Arc<UpstreamManager>,
     pub(super) config_path: PathBuf,
     pub(super) startup_detected_ip_v4: Option<IpAddr>,
@@ -91,7 +91,7 @@ pub async fn serve(
     listen: SocketAddr,
     stats: Arc<Stats>,
     ip_tracker: Arc<UserIpTracker>,
-    me_pool: Option<Arc<MePool>>,
+    me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
     upstream_manager: Arc<UpstreamManager>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
     admission_rx: watch::Receiver<bool>,
@@ -248,7 +248,7 @@ async fn handle(
             }
             ("GET", "/v1/runtime/gates") => {
                 let revision = current_revision(&shared.config_path).await?;
-                let data = build_runtime_gates_data(shared.as_ref(), cfg.as_ref());
+                let data = build_runtime_gates_data(shared.as_ref(), cfg.as_ref()).await;
                 Ok(success_response(StatusCode::OK, data, revision))
             }
             ("GET", "/v1/limits/effective") => {

@@ -142,12 +142,17 @@ pub(super) fn build_system_info_data(
     }
 }
 
-pub(super) fn build_runtime_gates_data(shared: &ApiShared, cfg: &ProxyConfig) -> RuntimeGatesData {
+pub(super) async fn build_runtime_gates_data(
+    shared: &ApiShared,
+    cfg: &ProxyConfig,
+) -> RuntimeGatesData {
     let me_runtime_ready = if !cfg.general.use_middle_proxy {
         true
     } else {
         shared
             .me_pool
+            .read()
+            .await
             .as_ref()
             .map(|pool| pool.is_runtime_ready())
             .unwrap_or(false)

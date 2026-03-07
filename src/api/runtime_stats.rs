@@ -297,7 +297,7 @@ async fn get_minimal_payload_cached(
         }
     }
 
-    let pool = shared.me_pool.as_ref()?;
+    let pool = shared.me_pool.read().await.clone()?;
     let status = pool.api_status_snapshot().await;
     let runtime = pool.api_runtime_snapshot().await;
     let generated_at_epoch_secs = status.generated_at_epoch_secs;

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rand::Rng;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{RwLock, Semaphore, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 #[cfg(unix)]
@@ -473,6 +473,70 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config.general.upstream_connect_failfast_hard_errors,
         stats.clone(),
     ));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.load_limits(&config.access.user_max_unique_ips).await;
+    ip_tracker
+        .set_limit_policy(
+            config.access.user_max_unique_ips_mode,
+            config.access.user_max_unique_ips_window_secs,
+        )
+        .await;
+    if !config.access.user_max_unique_ips.is_empty() {
+        info!(
+            "IP limits configured for {} users",
+            config.access.user_max_unique_ips.len()
+        );
+    }
+    if !config.network.dns_overrides.is_empty() {
+        info!(
+            "Runtime DNS overrides configured: {} entries",
+            config.network.dns_overrides.len()
+        );
+    }
+
+    let (api_config_tx, api_config_rx) = watch::channel(Arc::new(config.clone()));
+    let initial_admission_open = !config.general.use_middle_proxy;
+    let (admission_tx, admission_rx) = watch::channel(initial_admission_open);
+    let api_me_pool = Arc::new(RwLock::new(None::<Arc<MePool>>));
+
+    if config.server.api.enabled {
+        let listen = match config.server.api.listen.parse::<SocketAddr>() {
+            Ok(listen) => listen,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    listen = %config.server.api.listen,
+                    "Invalid server.api.listen; API is disabled"
+                );
+                SocketAddr::from(([127, 0, 0, 1], 0))
+            }
+        };
+        if listen.port() != 0 {
+            let stats_api = stats.clone();
+            let ip_tracker_api = ip_tracker.clone();
+            let me_pool_api = api_me_pool.clone();
+            let upstream_manager_api = upstream_manager.clone();
+            let config_rx_api = api_config_rx.clone();
+            let admission_rx_api = admission_rx.clone();
+            let config_path_api = std::path::PathBuf::from(&config_path);
+            tokio::spawn(async move {
+                api::serve(
+                    listen,
+                    stats_api,
+                    ip_tracker_api,
+                    me_pool_api,
+                    upstream_manager_api,
+                    config_rx_api,
+                    admission_rx_api,
+                    config_path_api,
+                    None,
+                    None,
+                    process_started_at_epoch_secs,
+                )
+                .await;
+            });
+        }
+    }
 
     let mut tls_domains = Vec::with_capacity(1 + config.censorship.tls_domains.len());
     tls_domains.push(config.censorship.tls_domain.clone());
@@ -619,26 +683,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut use_middle_proxy = config.general.use_middle_proxy;
     let beobachten = Arc::new(BeobachtenStore::new());
     let rng = Arc::new(SecureRandom::new());
-
-    // IP Tracker initialization
-    let ip_tracker = Arc::new(UserIpTracker::new());
-    ip_tracker.load_limits(&config.access.user_max_unique_ips).await;
-    ip_tracker
-        .set_limit_policy(
-            config.access.user_max_unique_ips_mode,
-            config.access.user_max_unique_ips_window_secs,
-        )
-        .await;
-    
-    if !config.access.user_max_unique_ips.is_empty() {
-        info!("IP limits configured for {} users", config.access.user_max_unique_ips.len());
-    }
-    if !config.network.dns_overrides.is_empty() {
-        info!(
-            "Runtime DNS overrides configured: {} entries",
-            config.network.dns_overrides.len()
-        );
-    }
 
     // Connection concurrency limit
     let max_connections = Arc::new(Semaphore::new(10_000));
@@ -1074,6 +1118,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if let Some(ref pool) = me_pool {
         pool.set_runtime_ready(true);
     }
+    *api_me_pool.write().await = me_pool.clone();
 
     // Background tasks
     let um_clone = upstream_manager.clone();
@@ -1114,6 +1159,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         detected_ip_v4,
         detected_ip_v6,
     );
+    let mut config_rx_api_bridge = config_rx.clone();
+    let api_config_tx_bridge = api_config_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            if config_rx_api_bridge.changed().await.is_err() {
+                break;
+            }
+            let cfg = config_rx_api_bridge.borrow_and_update().clone();
+            api_config_tx_bridge.send_replace(cfg);
+        }
+    });
 
     let stats_policy = stats.clone();
     let mut config_rx_policy = config_rx.clone();
@@ -1345,7 +1401,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         print_proxy_links(&host, port, &config);
     }
 
-    let (admission_tx, admission_rx) = watch::channel(true);
     if config.general.use_middle_proxy {
         if let Some(pool) = me_pool.as_ref() {
             let initial_open = pool.admission_ready_conditional_cast().await;
@@ -1544,47 +1599,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             )
             .await;
         });
-    }
-
-    if config.server.api.enabled {
-        let listen = match config.server.api.listen.parse::<SocketAddr>() {
-            Ok(listen) => listen,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    listen = %config.server.api.listen,
-                    "Invalid server.api.listen; API is disabled"
-                );
-                SocketAddr::from(([127, 0, 0, 1], 0))
-            }
-        };
-        if listen.port() != 0 {
-            let stats = stats.clone();
-            let ip_tracker_api = ip_tracker.clone();
-            let me_pool_api = me_pool.clone();
-            let upstream_manager_api = upstream_manager.clone();
-            let config_rx_api = config_rx.clone();
-            let admission_rx_api = admission_rx.clone();
-            let config_path_api = std::path::PathBuf::from(&config_path);
-            let startup_detected_ip_v4 = detected_ip_v4;
-            let startup_detected_ip_v6 = detected_ip_v6;
-            tokio::spawn(async move {
-                api::serve(
-                    listen,
-                    stats,
-                    ip_tracker_api,
-                    me_pool_api,
-                    upstream_manager_api,
-                    config_rx_api,
-                    admission_rx_api,
-                    config_path_api,
-                    startup_detected_ip_v4,
-                    startup_detected_ip_v6,
-                    process_started_at_epoch_secs,
-                )
-                .await;
-            });
-        }
     }
 
     for (listener, listener_proxy_protocol) in listeners {
