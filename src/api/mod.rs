@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::ip_tracker::UserIpTracker;
+use crate::startup::StartupTracker;
 use crate::stats::Stats;
 use crate::transport::middle_proxy::MePool;
 use crate::transport::UpstreamManager;
@@ -25,6 +26,7 @@ mod events;
 mod http_utils;
 mod model;
 mod runtime_edge;
+mod runtime_init;
 mod runtime_min;
 mod runtime_stats;
 mod runtime_watch;
@@ -41,6 +43,7 @@ use runtime_edge::{
     EdgeConnectionsCacheEntry, build_runtime_connections_summary_data,
     build_runtime_events_recent_data,
 };
+use runtime_init::build_runtime_initialization_data;
 use runtime_min::{
     build_runtime_me_pool_state_data, build_runtime_me_quality_data, build_runtime_nat_stun_data,
     build_runtime_upstream_quality_data, build_security_whitelist_data,
@@ -79,6 +82,7 @@ pub(super) struct ApiShared {
     pub(super) runtime_events: Arc<ApiEventStore>,
     pub(super) request_id: Arc<AtomicU64>,
     pub(super) runtime_state: Arc<ApiRuntimeState>,
+    pub(super) startup_tracker: Arc<StartupTracker>,
 }
 
 impl ApiShared {
@@ -99,6 +103,7 @@ pub async fn serve(
     startup_detected_ip_v4: Option<IpAddr>,
     startup_detected_ip_v6: Option<IpAddr>,
     process_started_at_epoch_secs: u64,
+    startup_tracker: Arc<StartupTracker>,
 ) {
     let listener = match TcpListener::bind(listen).await {
         Ok(listener) => listener,
@@ -138,6 +143,7 @@ pub async fn serve(
         )),
         request_id: Arc::new(AtomicU64::new(1)),
         runtime_state: runtime_state.clone(),
+        startup_tracker,
     });
 
     spawn_runtime_watchers(
@@ -249,6 +255,11 @@ async fn handle(
             ("GET", "/v1/runtime/gates") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let data = build_runtime_gates_data(shared.as_ref(), cfg.as_ref()).await;
+                Ok(success_response(StatusCode::OK, data, revision))
+            }
+            ("GET", "/v1/runtime/initialization") => {
+                let revision = current_revision(&shared.config_path).await?;
+                let data = build_runtime_initialization_data(shared.as_ref()).await;
                 Ok(success_response(StatusCode::OK, data, revision))
             }
             ("GET", "/v1/limits/effective") => {

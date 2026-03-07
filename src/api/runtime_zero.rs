@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::config::{MeFloorMode, ProxyConfig, UserMaxUniqueIpsMode};
 
 use super::ApiShared;
+use super::runtime_init::build_runtime_startup_summary;
 
 #[derive(Serialize)]
 pub(super) struct SystemInfoData {
@@ -34,6 +35,9 @@ pub(super) struct RuntimeGatesData {
     pub(super) me_runtime_ready: bool,
     pub(super) me2dc_fallback_enabled: bool,
     pub(super) use_middle_proxy: bool,
+    pub(super) startup_status: &'static str,
+    pub(super) startup_stage: String,
+    pub(super) startup_progress_pct: f64,
 }
 
 #[derive(Serialize)]
@@ -146,6 +150,7 @@ pub(super) async fn build_runtime_gates_data(
     shared: &ApiShared,
     cfg: &ProxyConfig,
 ) -> RuntimeGatesData {
+    let startup_summary = build_runtime_startup_summary(shared).await;
     let me_runtime_ready = if !cfg.general.use_middle_proxy {
         true
     } else {
@@ -164,6 +169,9 @@ pub(super) async fn build_runtime_gates_data(
         me_runtime_ready,
         me2dc_fallback_enabled: cfg.general.me2dc_fallback,
         use_middle_proxy: cfg.general.use_middle_proxy,
+        startup_status: startup_summary.status,
+        startup_stage: startup_summary.stage,
+        startup_progress_pct: startup_summary.progress_pct,
     }
 }
 
