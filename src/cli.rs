@@ -268,7 +268,7 @@ fn generate_systemd_unit(exe_path: &Path, config_path: &Path) -> String {
     format!(
 r#"[Unit]
 Description=Telemt MTProxy
-Documentation=https://github.com/nicepkg/telemt
+Documentation=https://github.com/telemt/telemt
 After=network-online.target
 Wants=network-online.target
 
