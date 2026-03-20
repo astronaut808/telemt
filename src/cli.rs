@@ -401,10 +401,16 @@ pub fn parse_init_args(args: &[String]) -> Option<InitOptions> {
 
 /// Run the fire-and-forget setup.
 pub fn run_init(opts: InitOptions) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::service::{self, InitSystem, ServiceOptions};
+
     eprintln!("[telemt] Fire-and-forget setup");
     eprintln!();
 
-    // 1. Generate or validate secret
+    // 1. Detect init system
+    let init_system = service::detect_init_system();
+    eprintln!("[+] Detected init system: {}", init_system);
+
+    // 2. Generate or validate secret
     let secret = match opts.secret {
         Some(s) => {
             if s.len() != 32 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -421,72 +427,126 @@ pub fn run_init(opts: InitOptions) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[+] Port:   {}", opts.port);
     eprintln!("[+] Domain: {}", opts.domain);
 
-    // 2. Create config directory
+    // 3. Create config directory
     fs::create_dir_all(&opts.config_dir)?;
     let config_path = opts.config_dir.join("config.toml");
 
-    // 3. Write config
+    // 4. Write config
     let config_content = generate_config(&opts.username, &secret, opts.port, &opts.domain);
     fs::write(&config_path, &config_content)?;
     eprintln!("[+] Config written to {}", config_path.display());
 
-    // 4. Write systemd unit
-    let exe_path =
-        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/local/bin/telemt"));
+    // 5. Generate and write service file
+    let exe_path = std::env::current_exe()
+        .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/telemt"));
 
-    let unit_path = Path::new("/etc/systemd/system/telemt.service");
-    let unit_content = generate_systemd_unit(&exe_path, &config_path);
+    let service_opts = ServiceOptions {
+        exe_path: &exe_path,
+        config_path: &config_path,
+        user: None,  // Let systemd/init handle user
+        group: None,
+        pid_file: "/var/run/telemt.pid",
+        working_dir: Some("/var/lib/telemt"),
+        description: "Telemt MTProxy - Telegram MTProto Proxy",
+    };
 
-    match fs::write(unit_path, &unit_content) {
+    let service_path = service::service_file_path(init_system);
+    let service_content = service::generate_service_file(init_system, &service_opts);
+
+    // Ensure parent directory exists
+    if let Some(parent) = Path::new(service_path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    match fs::write(service_path, &service_content) {
         Ok(()) => {
-            eprintln!("[+] Systemd unit written to {}", unit_path.display());
+            eprintln!("[+] Service file written to {}", service_path);
+
+            // Make script executable for OpenRC/FreeBSD
+            #[cfg(unix)]
+            if init_system == InitSystem::OpenRC || init_system == InitSystem::FreeBSDRc {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(service_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(service_path, perms)?;
+            }
         }
         Err(e) => {
-            eprintln!("[!] Cannot write systemd unit (run as root?): {}", e);
-            eprintln!("[!] Manual unit file content:");
-            eprintln!("{}", unit_content);
+            eprintln!("[!] Cannot write service file (run as root?): {}", e);
+            eprintln!("[!] Manual service file content:");
+            eprintln!("{}", service_content);
 
-            // Still print links and config
+            // Still print links and installation instructions
+            eprintln!();
+            eprintln!("{}", service::installation_instructions(init_system));
             print_links(&opts.username, &secret, opts.port, &opts.domain);
             return Ok(());
         }
     }
 
-    // 5. Reload systemd
-    run_cmd("systemctl", &["daemon-reload"]);
+    // 6. Install and enable service based on init system
+    match init_system {
+        InitSystem::Systemd => {
+            run_cmd("systemctl", &["daemon-reload"]);
+            run_cmd("systemctl", &["enable", "telemt.service"]);
+            eprintln!("[+] Service enabled");
 
-    // 6. Enable service
-    run_cmd("systemctl", &["enable", "telemt.service"]);
-    eprintln!("[+] Service enabled");
+            if !opts.no_start {
+                run_cmd("systemctl", &["start", "telemt.service"]);
+                eprintln!("[+] Service started");
 
-    // 7. Start service (unless --no-start)
-    if !opts.no_start {
-        run_cmd("systemctl", &["start", "telemt.service"]);
-        eprintln!("[+] Service started");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let status = Command::new("systemctl")
+                    .args(["is-active", "telemt.service"])
+                    .output();
 
-        // Brief delay then check status
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let status = Command::new("systemctl")
-            .args(["is-active", "telemt.service"])
-            .output();
-
-        match status {
-            Ok(out) if out.status.success() => {
-                eprintln!("[+] Service is running");
-            }
-            _ => {
-                eprintln!("[!] Service may not have started correctly");
-                eprintln!("[!] Check: journalctl -u telemt.service -n 20");
+                match status {
+                    Ok(out) if out.status.success() => {
+                        eprintln!("[+] Service is running");
+                    }
+                    _ => {
+                        eprintln!("[!] Service may not have started correctly");
+                        eprintln!("[!] Check: journalctl -u telemt.service -n 20");
+                    }
+                }
+            } else {
+                eprintln!("[+] Service not started (--no-start)");
+                eprintln!("[+] Start manually: systemctl start telemt.service");
             }
         }
-    } else {
-        eprintln!("[+] Service not started (--no-start)");
-        eprintln!("[+] Start manually: systemctl start telemt.service");
+        InitSystem::OpenRC => {
+            run_cmd("rc-update", &["add", "telemt", "default"]);
+            eprintln!("[+] Service enabled");
+
+            if !opts.no_start {
+                run_cmd("rc-service", &["telemt", "start"]);
+                eprintln!("[+] Service started");
+            } else {
+                eprintln!("[+] Service not started (--no-start)");
+                eprintln!("[+] Start manually: rc-service telemt start");
+            }
+        }
+        InitSystem::FreeBSDRc => {
+            run_cmd("sysrc", &["telemt_enable=YES"]);
+            eprintln!("[+] Service enabled");
+
+            if !opts.no_start {
+                run_cmd("service", &["telemt", "start"]);
+                eprintln!("[+] Service started");
+            } else {
+                eprintln!("[+] Service not started (--no-start)");
+                eprintln!("[+] Start manually: service telemt start");
+            }
+        }
+        InitSystem::Unknown => {
+            eprintln!("[!] Unknown init system - service file written but not installed");
+            eprintln!("[!] You may need to install it manually");
+        }
     }
 
     eprintln!();
 
-    // 8. Print links
+    // 7. Print links
     print_links(&opts.username, &secret, opts.port, &opts.domain);
 
     Ok(())
@@ -578,35 +638,6 @@ weight = 10
         secret = secret,
         port = port,
         domain = domain,
-    )
-}
-
-fn generate_systemd_unit(exe_path: &Path, config_path: &Path) -> String {
-    format!(
-        r#"[Unit]
-Description=Telemt MTProxy
-Documentation=https://github.com/telemt/telemt
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart={exe} {config}
-Restart=always
-RestartSec=5
-LimitNOFILE=65535
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/etc/telemt
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-"#,
-        exe = exe_path.display(),
-        config = config_path.display(),
     )
 }
 

@@ -8,6 +8,7 @@ mod crypto;
 mod daemon;
 mod error;
 mod ip_tracker;
+mod service;
 #[cfg(test)]
 #[path = "tests/ip_tracker_hotpath_adversarial_tests.rs"]
 mod ip_tracker_hotpath_adversarial_tests;
