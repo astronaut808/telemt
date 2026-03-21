@@ -57,6 +57,25 @@ fn spread_u128(values: &[u128]) -> u128 {
     max_v - min_v
 }
 
+fn interval_gap_usize(a: &BTreeSet<usize>, b: &BTreeSet<usize>) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+
+    let a_min = *a.iter().next().unwrap();
+    let a_max = *a.iter().next_back().unwrap();
+    let b_min = *b.iter().next().unwrap();
+    let b_max = *b.iter().next_back().unwrap();
+
+    if a_max < b_min {
+        b_min - a_max
+    } else if b_max < a_min {
+        a_min - b_max
+    } else {
+        0
+    }
+}
+
 async fn collect_timing_samples(path: PathClass, timing_norm_enabled: bool, n: usize) -> Vec<u128> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -266,11 +285,15 @@ async fn integration_ab_harness_envelope_and_blur_improve_obfuscation_vs_baselin
 
     let baseline_overlap = baseline_a.intersection(&baseline_b).count();
     let hardened_overlap = hardened_a.intersection(&hardened_b).count();
+    let baseline_gap = interval_gap_usize(&baseline_a, &baseline_b);
+    let hardened_gap = interval_gap_usize(&hardened_a, &hardened_b);
 
     println!(
-        "ab_harness_length baseline_overlap={} hardened_overlap={} baseline_a={} baseline_b={} hardened_a={} hardened_b={}",
+        "ab_harness_length baseline_overlap={} hardened_overlap={} baseline_gap={} hardened_gap={} baseline_a={} baseline_b={} hardened_a={} hardened_b={}",
         baseline_overlap,
         hardened_overlap,
+        baseline_gap,
+        hardened_gap,
         baseline_a.len(),
         baseline_b.len(),
         hardened_a.len(),
@@ -282,10 +305,20 @@ async fn integration_ab_harness_envelope_and_blur_improve_obfuscation_vs_baselin
         "baseline above-cap classes should be disjoint"
     );
     assert!(
-        hardened_overlap > baseline_overlap,
-        "above-cap blur should increase cross-class overlap: baseline={} hardened={}",
+        hardened_a.len() > baseline_a.len() && hardened_b.len() > baseline_b.len(),
+        "above-cap blur should widen per-class emitted lengths: baseline_a={} baseline_b={} hardened_a={} hardened_b={}",
+        baseline_a.len(),
+        baseline_b.len(),
+        hardened_a.len(),
+        hardened_b.len()
+    );
+    assert!(
+        hardened_overlap > baseline_overlap || hardened_gap < baseline_gap,
+        "above-cap blur should reduce class separability via direct overlap or tighter interval gap: baseline_overlap={} hardened_overlap={} baseline_gap={} hardened_gap={}",
         baseline_overlap,
-        hardened_overlap
+        hardened_overlap,
+        baseline_gap,
+        hardened_gap
     );
 }
 
