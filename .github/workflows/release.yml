@@ -72,13 +72,13 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             export CC=aarch64-linux-gnu-gcc
             export CXX=aarch64-linux-gnu-g++
-            export RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc"
+            export RUSTFLAGS="-C linker=aarch64-linux-gnu-gcc -C lto=fat"
           else
             export CC=clang
             export CXX=clang++
-            export RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
+            export RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld -C lto=fat"
           fi
-
+      
           cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -177,13 +177,13 @@ jobs:
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
             export CC=aarch64-linux-musl-gcc
             export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
-            export RUSTFLAGS="-C target-feature=+crt-static -C linker=aarch64-linux-musl-gcc"
+            export RUSTFLAGS="-C target-feature=+crt-static -C linker=aarch64-linux-musl-gcc -C lto=fat"
           else
             export CC=musl-gcc
             export CC_x86_64_unknown_linux_musl=musl-gcc
-            export RUSTFLAGS="-C target-feature=+crt-static"
+            export RUSTFLAGS="-C target-feature=+crt-static -C lto=fat"
           fi
-  
+      
           cargo build --release --target ${{ matrix.target }}
   
       - name: Package
