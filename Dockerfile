@@ -1,8 +1,7 @@
 # syntax=docker/dockerfile:1
 
-ARG TARGETARCH
-ARG BINARY_AMD64
-ARG BINARY_ARM64
+ARG TELEMT_REPOSITORY=telemt/telemt
+ARG TELEMT_VERSION=latest
 
 # ==========================
 # Minimal Image
@@ -10,54 +9,51 @@ ARG BINARY_ARM64
 FROM debian:12-slim AS minimal
 
 ARG TARGETARCH
-ARG BINARY_AMD64
-ARG BINARY_ARM64
+ARG TELEMT_REPOSITORY
+ARG TELEMT_VERSION
 
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         binutils \
+        ca-certificates \
         curl \
-        xz-utils \
-        ca-certificates; \
+        tar; \
     rm -rf /var/lib/apt/lists/*
 
-# --- Select correct binary ---
 RUN set -eux; \
     case "${TARGETARCH}" in \
-        amd64) BIN="${BINARY_AMD64}" ;; \
-        arm64) BIN="${BINARY_ARM64}" ;; \
+        amd64) ASSET="telemt-x86_64-linux-musl.tar.gz" ;; \
+        arm64) ASSET="telemt-aarch64-linux-musl.tar.gz" ;; \
         *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    echo "Using binary: $BIN"; \
-    test -f "$BIN"; \
-    cp "$BIN" /telemt
-
-# --- Install UPX (arch-aware) ---
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-        amd64) UPX_ARCH="amd64" ;; \
-        arm64) UPX_ARCH="arm64" ;; \
-        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    \
+    VERSION="${TELEMT_VERSION#refs/tags/}"; \
+    if [ -z "${VERSION}" ] || [ "${VERSION}" = "latest" ]; then \
+        BASE_URL="https://github.com/${TELEMT_REPOSITORY}/releases/latest/download"; \
+    else \
+        BASE_URL="https://github.com/${TELEMT_REPOSITORY}/releases/download/${VERSION}"; \
+    fi; \
     curl -fL \
         --retry 5 \
         --retry-delay 3 \
         --connect-timeout 10 \
         --max-time 120 \
-        -o /tmp/upx.tar.xz \
-        "https://github.com/telemt/telemt/releases/download/toolchains/upx-${UPX_ARCH}_linux.tar.xz"; \
-    \
-    tar -xf /tmp/upx.tar.xz -C /tmp; \
-    install -m 0755 /tmp/upx*/upx /usr/local/bin/upx; \
-    rm -rf /tmp/upx*
-
-# --- Optimize binary ---
-RUN set -eux; \
-    test -f /telemt; \
+        -o "/tmp/${ASSET}" \
+        "${BASE_URL}/${ASSET}"; \
+    curl -fL \
+        --retry 5 \
+        --retry-delay 3 \
+        --connect-timeout 10 \
+        --max-time 120 \
+        -o "/tmp/${ASSET}.sha256" \
+        "${BASE_URL}/${ASSET}.sha256"; \
+    cd /tmp; \
+    sha256sum -c "${ASSET}.sha256"; \
+    tar -xzf "${ASSET}" -C /tmp; \
+    test -f /tmp/telemt; \
+    install -m 0755 /tmp/telemt /telemt; \
     strip --strip-unneeded /telemt || true; \
-    upx --best --lzma /telemt || true
+    rm -f "/tmp/${ASSET}" "/tmp/${ASSET}.sha256" /tmp/telemt
 
 # ==========================
 # Debug Image
