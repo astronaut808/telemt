@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use crc32fast::Hasher;
 use crate::crypto::{SecureRandom, sha256_hmac};
 use crate::protocol::constants::{
     MAX_TLS_CIPHERTEXT_SIZE, TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER,
@@ -98,6 +99,31 @@ fn build_compact_cert_info_payload(cert_info: &ParsedCertificateInfo) -> Option<
     Some(payload)
 }
 
+fn hash_compact_cert_info_payload(cert_payload: Vec<u8>) -> Option<Vec<u8>> {
+    if cert_payload.is_empty() {
+        return None;
+    }
+
+    let mut hashed = Vec::with_capacity(cert_payload.len());
+    let mut seed_hasher = Hasher::new();
+    seed_hasher.update(&cert_payload);
+    let mut state = seed_hasher.finalize();
+
+    while hashed.len() < cert_payload.len() {
+        let mut hasher = Hasher::new();
+        hasher.update(&state.to_le_bytes());
+        hasher.update(&cert_payload);
+        state = hasher.finalize();
+
+        let block = state.to_le_bytes();
+        let remaining = cert_payload.len() - hashed.len();
+        let copy_len = remaining.min(block.len());
+        hashed.extend_from_slice(&block[..copy_len]);
+    }
+
+    Some(hashed)
+}
+
 /// Build a ServerHello + CCS + ApplicationData sequence using cached TLS metadata.
 pub fn build_emulated_server_hello(
     secret: &[u8],
@@ -190,7 +216,8 @@ pub fn build_emulated_server_hello(
     let compact_payload = cached
         .cert_info
         .as_ref()
-        .and_then(build_compact_cert_info_payload);
+        .and_then(build_compact_cert_info_payload)
+        .and_then(hash_compact_cert_info_payload);
     let selected_payload: Option<&[u8]> = if use_full_cert_payload {
         cached
             .cert_payload
@@ -221,7 +248,6 @@ pub fn build_emulated_server_hello(
             marker.extend_from_slice(proto);
             marker
         });
-    let mut payload_offset = 0usize;
     for (idx, size) in sizes.into_iter().enumerate() {
         let mut rec = Vec::with_capacity(5 + size);
         rec.push(TLS_RECORD_APPLICATION);
@@ -231,11 +257,10 @@ pub fn build_emulated_server_hello(
         if let Some(payload) = selected_payload {
             if size > 17 {
                 let body_len = size - 17;
-                let remaining = payload.len().saturating_sub(payload_offset);
+                let remaining = payload.len();
                 let copy_len = remaining.min(body_len);
                 if copy_len > 0 {
-                    rec.extend_from_slice(&payload[payload_offset..payload_offset + copy_len]);
-                    payload_offset += copy_len;
+                    rec.extend_from_slice(&payload[..copy_len]);
                 }
                 if body_len > copy_len {
                     rec.extend_from_slice(&rng.bytes(body_len - copy_len));
@@ -317,7 +342,9 @@ mod tests {
         CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsCertPayload, TlsProfileSource,
     };
 
-    use super::build_emulated_server_hello;
+    use super::{
+        build_compact_cert_info_payload, build_emulated_server_hello, hash_compact_cert_info_payload,
+    };
     use crate::crypto::SecureRandom;
     use crate::protocol::constants::{
         TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
@@ -432,7 +459,21 @@ mod tests {
         );
 
         let payload = first_app_data_payload(&response);
-        assert!(payload.starts_with(b"CN=example.com"));
+        let expected_hashed_payload = build_compact_cert_info_payload(
+            cached
+                .cert_info
+                .as_ref()
+                .expect("test fixture must provide certificate info"),
+        )
+        .and_then(hash_compact_cert_info_payload)
+        .expect("compact certificate info payload must be present for this test");
+        let copied_prefix_len = expected_hashed_payload
+            .len()
+            .min(payload.len().saturating_sub(17));
+        assert_eq!(
+            &payload[..copied_prefix_len],
+            &expected_hashed_payload[..copied_prefix_len]
+        );
     }
 
     #[test]
