@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://t.me/telemtrs">
-    <img src="docs/assets/telegram_button.png" alt="Join us in Telegram" />
+    <img src="docs/assets/telegram_button.png" alt="Join us in Telegram" width="200" />
   </a>
 </p>
 
