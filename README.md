@@ -15,7 +15,7 @@
 
 <p align="center">
   <a href="https://t.me/telemtrs">
-    <img src="/docs/assets/telegram_button.svg" width="200"/>
+    <img src="/docs/assets/telegram_button.svg" width="150"/>
   </a>
 </p>
 
