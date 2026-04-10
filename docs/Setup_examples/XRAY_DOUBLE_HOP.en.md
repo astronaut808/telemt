@@ -248,7 +248,7 @@ sudo systemctl enable xray
 
 ## Step 2. Install telemt on Server B (_EU_)
 
-telemt installation is heavily covered in the [Quick Start Guide](../QUICK_START_GUIDE.en.md).
+telemt installation is heavily covered in the [Quick Start Guide](../Quick_start/QUICK_START_GUIDE.en.md).
 By contrast to standard setups, telemt must listen strictly _locally_ (since Xray occupies the public `443` interface) and must expect `PROXYv2` packets.
 
 Edit the configuration file (`config.toml`) on Server B accordingly:
