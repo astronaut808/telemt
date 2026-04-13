@@ -2112,7 +2112,7 @@
   - **Пример**:
 
     ```toml
-    [server.listeners]
+    [[server.listeners]]
     ip = "0.0.0.0"
     ```
 ## announce
@@ -2121,7 +2121,7 @@
   - **Пример**:
 
     ```toml
-    [server.listeners]
+    [[server.listeners]]
     ip = "0.0.0.0"
     announce = "proxy.example.com"
     ```
@@ -2131,7 +2131,7 @@
   - **Пример**:
 
     ```toml
-    [server.listeners]
+    [[server.listeners]]
     ip = "0.0.0.0"
     announce_ip = "203.0.113.10"
     ```
@@ -2144,7 +2144,7 @@
     [server]
     proxy_protocol = false
 
-    [server.listeners]
+    [[server.listeners]]
     ip = "0.0.0.0"
     proxy_protocol = true
     ```
@@ -2155,7 +2155,7 @@
   - **Пример**:
 
     ```toml
-    [server.listeners]
+    [[server.listeners]]
     ip = "0.0.0.0"
     reuse_allow = false
     ```
@@ -2912,7 +2912,7 @@
     ```
 
 
-# [upstreams]
+# [[upstreams]]
 
 
 | Ключ | Тип | По умолчанию |
@@ -2931,18 +2931,18 @@
 
 ## type
   - **Ограничения / валидация**: Обязательный параметр.`"direct"`, `"socks4"`, `"socks5"`, `"shadowsocks"`.
-  - **Описание**: Выбирает реализацию upstream-транспорта для этой записи в `[upstreams]`.
+  - **Описание**: Выбирает реализацию upstream-транспорта для этой записи в `[[upstreams]]`.
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "direct"
 
-    [upstreams]
+    [[upstreams]]
     type = "socks5"
     address = "127.0.0.1:9050"
 
-    [upstreams]
+    [[upstreams]]
     type = "shadowsocks"
     url = "ss://2022-blake3-aes-256-gcm:BASE64PASSWORD@127.0.0.1:8388"
     ```
@@ -2952,7 +2952,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "direct"
     weight = 10
     ```
@@ -2962,7 +2962,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "socks5"
     address = "127.0.0.1:9050"
     enabled = false
@@ -2973,7 +2973,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "socks4"
     address = "10.0.0.10:1080"
     scopes = "me, fetch, dc2"
@@ -2987,11 +2987,11 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "direct"
     interface = "eth0"
 
-    [upstreams]
+    [[upstreams]]
     type = "socks5"
     address = "203.0.113.10:1080"
     interface = "192.0.2.10" # explicit local bind IP
@@ -3004,7 +3004,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "direct"
     bind_addresses = ["192.0.2.10", "192.0.2.11"]
     ```
@@ -3020,7 +3020,7 @@
     [general]
     use_middle_proxy = false
 
-    [upstreams]
+    [[upstreams]]
     type = "shadowsocks"
     url = "ss://2022-blake3-aes-256-gcm:BASE64PASSWORD@127.0.0.1:8388"
     ```
@@ -3030,7 +3030,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "socks5"
     address = "127.0.0.1:9050"
     ```
@@ -3040,7 +3040,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "socks4"
     address = "127.0.0.1:1080"
     user_id = "telemt"
@@ -3051,7 +3051,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "socks5"
     address = "127.0.0.1:9050"
     username = "alice"
@@ -3062,7 +3062,7 @@
   - **Пример**:
 
     ```toml
-    [upstreams]
+    [[upstreams]]
     type = "socks5"
     address = "127.0.0.1:9050"
     username = "alice"
