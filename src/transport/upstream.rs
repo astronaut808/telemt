@@ -329,6 +329,17 @@ pub struct UpstreamManager {
 }
 
 impl UpstreamManager {
+    fn is_unscoped_upstream(upstream: &UpstreamConfig) -> bool {
+        upstream.scopes.is_empty()
+    }
+
+    fn should_check_in_default_dc_connectivity(
+        has_unscoped: bool,
+        upstream: &UpstreamConfig,
+    ) -> bool {
+        !has_unscoped || Self::is_unscoped_upstream(upstream)
+    }
+
     pub fn new(
         configs: Vec<UpstreamConfig>,
         connect_retry_attempts: u32,
@@ -1309,10 +1320,19 @@ impl UpstreamManager {
                 .map(|(i, u)| (i, u.config.clone(), u.bind_rr.clone()))
                 .collect()
         };
+        let has_unscoped = upstreams
+            .iter()
+            .any(|(_, cfg, _)| Self::is_unscoped_upstream(cfg));
 
         let mut all_results = Vec::new();
 
         for (upstream_idx, upstream_config, bind_rr) in &upstreams {
+            // DC connectivity checks should follow the default routing path.
+            // Scoped upstreams are included only when no unscoped upstream exists.
+            if !Self::should_check_in_default_dc_connectivity(has_unscoped, upstream_config) {
+                continue;
+            }
+
             let (upstream_ipv4_enabled, upstream_ipv6_enabled) =
                 Self::resolve_probe_dc_families(upstream_config, ipv4_enabled, ipv6_enabled);
             let upstream_name = match &upstream_config.upstream_type {
@@ -1720,8 +1740,25 @@ impl UpstreamManager {
                 continue;
             }
 
-            let count = self.upstreams.read().await.len();
-            for i in 0..count {
+            let target_upstreams: Vec<usize> = {
+                let guard = self.upstreams.read().await;
+                let has_unscoped = guard
+                    .iter()
+                    .any(|upstream| Self::is_unscoped_upstream(&upstream.config));
+                guard
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, upstream)| {
+                        Self::should_check_in_default_dc_connectivity(
+                            has_unscoped,
+                            &upstream.config,
+                        )
+                    })
+                    .map(|(idx, _)| idx)
+                    .collect()
+            };
+
+            for i in target_upstreams {
                 let (config, bind_rr) = {
                     let guard = self.upstreams.read().await;
                     let u = &guard[i];
@@ -1999,6 +2036,33 @@ mod tests {
             addr: "127.0.0.1:443".to_string(),
         };
         assert!(!UpstreamManager::is_hard_connect_error(&error));
+    }
+
+    #[test]
+    fn unscoped_selection_detects_default_route_upstream() {
+        let mut upstream = UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+                bindtodevice: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+            ipv4: None,
+            ipv6: None,
+        };
+
+        assert!(UpstreamManager::is_unscoped_upstream(&upstream));
+        upstream.scopes = "local".to_string();
+        assert!(!UpstreamManager::is_unscoped_upstream(&upstream));
+        assert!(!UpstreamManager::should_check_in_default_dc_connectivity(
+            true, &upstream
+        ));
+        assert!(UpstreamManager::should_check_in_default_dc_connectivity(
+            false, &upstream
+        ));
     }
 
     #[test]
