@@ -7,6 +7,7 @@
 //! - `status [--pid-file PATH]` - Check daemon status
 //! - `run [OPTIONS] [config.toml]` - Run in foreground (default behavior)
 //! - `healthcheck [OPTIONS] [config.toml]` - Run control-plane health probe
+//! - `check-mask-host <host> [OPTIONS]` - Assess TLS mask host suitability
 
 use rand::RngExt;
 use std::fs;
@@ -14,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::healthcheck::{self, HealthcheckMode};
+use crate::mask_host_check::{self, CheckMaskHostOptions};
 
 #[cfg(unix)]
 use crate::daemon::{self, DEFAULT_PID_FILE, DaemonOptions};
@@ -33,6 +35,8 @@ pub enum Subcommand {
     Status,
     /// Run health probe and exit with status code.
     Healthcheck,
+    /// Assess a TLS mask host and exit with a verdict code.
+    CheckMaskHost,
     /// Fire-and-forget setup (`--init`).
     Init,
 }
@@ -45,6 +49,8 @@ pub struct ParsedCommand {
     pub config_path: String,
     pub healthcheck_mode: HealthcheckMode,
     pub healthcheck_mode_invalid: Option<String>,
+    pub check_mask_host_opts: Option<CheckMaskHostOptions>,
+    pub check_mask_host_error: Option<String>,
     #[cfg(unix)]
     pub daemon_opts: DaemonOptions,
     pub init_opts: Option<InitOptions>,
@@ -61,6 +67,8 @@ impl Default for ParsedCommand {
             config_path: "config.toml".to_string(),
             healthcheck_mode: HealthcheckMode::Liveness,
             healthcheck_mode_invalid: None,
+            check_mask_host_opts: None,
+            check_mask_host_error: None,
             #[cfg(unix)]
             daemon_opts: DaemonOptions::default(),
             init_opts: None,
@@ -103,6 +111,14 @@ pub fn parse_command(args: &[String]) -> ParsedCommand {
             "healthcheck" => {
                 cmd.subcommand = Subcommand::Healthcheck;
             }
+            "check-mask-host" => {
+                cmd.subcommand = Subcommand::CheckMaskHost;
+                match parse_check_mask_host_args(args) {
+                    Ok(opts) => cmd.check_mask_host_opts = Some(opts),
+                    Err(err) => cmd.check_mask_host_error = Some(err),
+                }
+                return cmd;
+            }
             "run" => {
                 cmd.subcommand = Subcommand::Run;
                 #[cfg(unix)]
@@ -125,7 +141,7 @@ pub fn parse_command(args: &[String]) -> ParsedCommand {
     while i < args.len() {
         match args[i].as_str() {
             // Skip subcommand names
-            "start" | "stop" | "reload" | "status" | "run" | "healthcheck" => {}
+            "start" | "stop" | "reload" | "status" | "run" | "healthcheck" | "check-mask-host" => {}
             "--mode" => {
                 i += 1;
                 if i < args.len() {
@@ -206,6 +222,17 @@ pub fn execute_subcommand(cmd: &ParsedCommand) -> Option<i32> {
                 Some(healthcheck::run(&cmd.config_path, cmd.healthcheck_mode))
             }
         }
+        Subcommand::CheckMaskHost => {
+            if let Some(err) = cmd.check_mask_host_error.as_ref() {
+                eprintln!("[telemt] check-mask-host: {err}");
+                Some(2)
+            } else if let Some(opts) = cmd.check_mask_host_opts.as_ref() {
+                Some(mask_host_check::run(opts))
+            } else {
+                eprintln!("[telemt] check-mask-host: missing options");
+                Some(2)
+            }
+        }
         Subcommand::Init => {
             if let Some(opts) = cmd.init_opts.clone() {
                 match run_init(opts) {
@@ -243,6 +270,17 @@ pub fn execute_subcommand(cmd: &ParsedCommand) -> Option<i32> {
                 Some(2)
             } else {
                 Some(healthcheck::run(&cmd.config_path, cmd.healthcheck_mode))
+            }
+        }
+        Subcommand::CheckMaskHost => {
+            if let Some(err) = cmd.check_mask_host_error.as_ref() {
+                eprintln!("[telemt] check-mask-host: {err}");
+                Some(2)
+            } else if let Some(opts) = cmd.check_mask_host_opts.as_ref() {
+                Some(mask_host_check::run(opts))
+            } else {
+                eprintln!("[telemt] check-mask-host: missing options");
+                Some(2)
             }
         }
         Subcommand::Init => {
@@ -465,6 +503,84 @@ pub fn parse_init_args(args: &[String]) -> Option<InitOptions> {
     }
 
     Some(opts)
+}
+
+fn parse_check_mask_host_args(args: &[String]) -> Result<CheckMaskHostOptions, String> {
+    let mut host = None;
+    let mut port = 443u16;
+    let mut sni = None;
+    let mut attempts = 3usize;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--port" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for --port".to_string());
+                }
+                port = args[i]
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid --port value '{}'", args[i]))?;
+            }
+            raw if raw.starts_with("--port=") => {
+                let value = raw.trim_start_matches("--port=");
+                port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid --port value '{value}'"))?;
+            }
+            "--sni" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for --sni".to_string());
+                }
+                sni = Some(args[i].clone());
+            }
+            raw if raw.starts_with("--sni=") => {
+                sni = Some(raw.trim_start_matches("--sni=").to_string());
+            }
+            "--attempts" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("missing value for --attempts".to_string());
+                }
+                attempts = args[i]
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --attempts value '{}'", args[i]))?;
+            }
+            raw if raw.starts_with("--attempts=") => {
+                let value = raw.trim_start_matches("--attempts=");
+                attempts = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --attempts value '{value}'"))?;
+            }
+            raw if raw.starts_with('-') => {
+                return Err(format!("unknown option '{raw}'"));
+            }
+            raw => {
+                if host.is_some() {
+                    return Err(format!("unexpected positional argument '{raw}'"));
+                }
+                host = Some(raw.to_string());
+            }
+        }
+        i += 1;
+    }
+
+    if attempts == 0 {
+        return Err("--attempts must be greater than zero".to_string());
+    }
+
+    let host = host.ok_or_else(|| {
+        "missing host; usage: telemt check-mask-host <host> [--port 443] [--sni domain] [--attempts 3]".to_string()
+    })?;
+
+    Ok(CheckMaskHostOptions {
+        host,
+        port,
+        sni,
+        attempts,
+    })
 }
 
 /// Run the fire-and-forget setup.
@@ -740,4 +856,53 @@ fn print_links(username: &str, secret: &str, port: u16, domain: &str) {
     println!("The proxy will auto-detect and display the correct link on startup.");
     println!("Check: journalctl -u telemt.service | head -30");
     println!("===================");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Subcommand, parse_command};
+
+    #[test]
+    fn parse_check_mask_host_defaults() {
+        let args = vec!["check-mask-host".to_string(), "nginx.org".to_string()];
+        let cmd = parse_command(&args);
+
+        assert_eq!(cmd.subcommand, Subcommand::CheckMaskHost);
+        assert!(cmd.check_mask_host_error.is_none());
+
+        let opts = cmd
+            .check_mask_host_opts
+            .as_ref()
+            .expect("check-mask-host options must be parsed");
+        assert_eq!(opts.host, "nginx.org");
+        assert_eq!(opts.port, 443);
+        assert_eq!(opts.sni.as_deref(), None);
+        assert_eq!(opts.attempts, 3);
+    }
+
+    #[test]
+    fn parse_check_mask_host_custom_flags() {
+        let args = vec![
+            "check-mask-host".to_string(),
+            "1.2.3.4".to_string(),
+            "--sni".to_string(),
+            "nginx.org".to_string(),
+            "--port=8443".to_string(),
+            "--attempts".to_string(),
+            "5".to_string(),
+        ];
+        let cmd = parse_command(&args);
+
+        assert_eq!(cmd.subcommand, Subcommand::CheckMaskHost);
+        assert!(cmd.check_mask_host_error.is_none());
+
+        let opts = cmd
+            .check_mask_host_opts
+            .as_ref()
+            .expect("check-mask-host options must be parsed");
+        assert_eq!(opts.host, "1.2.3.4");
+        assert_eq!(opts.sni.as_deref(), Some("nginx.org"));
+        assert_eq!(opts.port, 8443);
+        assert_eq!(opts.attempts, 5);
+    }
 }

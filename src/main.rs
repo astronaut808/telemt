@@ -21,6 +21,7 @@ mod ip_tracker_hotpath_adversarial_tests;
 mod ip_tracker_regression_tests;
 mod logging;
 mod maestro;
+mod mask_host_check;
 mod metrics;
 mod network;
 mod protocol;
