@@ -1449,6 +1449,7 @@ impl RunningClientHandler {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let user = success.user.clone();
+        let target_dc = success.dc_idx;
 
         let user_limit_reservation = match Self::acquire_user_connection_reservation_static(
             &user,
@@ -1468,9 +1469,29 @@ impl RunningClientHandler {
 
         let route_snapshot = route_runtime.snapshot();
         let session_id = rng.u64();
-        let relay_result = if config.general.use_middle_proxy
+        let use_middle_for_session = if config.general.use_middle_proxy
             && matches!(route_snapshot.mode, RelayRouteMode::Middle)
         {
+            if let Some(ref pool) = me_pool {
+                if pool.admission_ready_for_target_dc(target_dc).await {
+                    true
+                } else {
+                    debug!(
+                        target_dc,
+                        route_generation = route_snapshot.generation,
+                        "Middle-End route unavailable for target DC, falling back to Direct-DC for this session"
+                    );
+                    false
+                }
+            } else {
+                warn!("use_middle_proxy=true but MePool not initialized, falling back to direct");
+                false
+            }
+        } else {
+            false
+        };
+
+        let relay_result = if use_middle_for_session {
             if let Some(ref pool) = me_pool {
                 handle_via_middle_proxy(
                     client_reader,

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,49 @@ use crate::transport::middle_proxy::MePool;
 const STARTUP_FALLBACK_AFTER: Duration = Duration::from_secs(80);
 const RUNTIME_FALLBACK_AFTER: Duration = Duration::from_secs(6);
 
+fn log_admission_coverage_transition(
+    previous_configured_dcs: &BTreeSet<i16>,
+    previous_ready_dcs: &BTreeSet<i16>,
+    configured_dcs: &BTreeSet<i16>,
+    ready_dcs: &BTreeSet<i16>,
+) {
+    for dc in configured_dcs
+        .intersection(previous_ready_dcs)
+        .copied()
+        .filter(|dc| !ready_dcs.contains(dc))
+    {
+        warn!(dc, "ME target DC became unavailable for session routing");
+    }
+
+    for dc in ready_dcs
+        .difference(previous_ready_dcs)
+        .copied()
+        .filter(|dc| configured_dcs.contains(dc))
+    {
+        info!(dc, "ME target DC recovered for session routing");
+    }
+
+    let was_partial = !previous_configured_dcs.is_empty()
+        && !previous_ready_dcs.is_empty()
+        && previous_ready_dcs.len() < previous_configured_dcs.len();
+    let is_partial =
+        !configured_dcs.is_empty() && !ready_dcs.is_empty() && ready_dcs.len() < configured_dcs.len();
+
+    if !was_partial && is_partial {
+        warn!(
+            covered_dcs = configured_dcs.len(),
+            ready_dcs = ready_dcs.len(),
+            "ME partial degradation activated"
+        );
+    } else if was_partial && !is_partial && ready_dcs == configured_dcs {
+        info!(
+            covered_dcs = configured_dcs.len(),
+            ready_dcs = ready_dcs.len(),
+            "ME partial degradation cleared"
+        );
+    }
+}
+
 pub(crate) async fn configure_admission_gate(
     config: &Arc<ProxyConfig>,
     me_pool: Option<Arc<MePool>>,
@@ -20,11 +64,18 @@ pub(crate) async fn configure_admission_gate(
 ) {
     if config.general.use_middle_proxy {
         if let Some(pool) = me_pool.as_ref() {
-            let initial_ready = pool.admission_ready_conditional_cast().await;
+            let initial_coverage = pool.admission_coverage_snapshot().await;
+            let initial_ready = !initial_coverage.configured_dcs.is_empty()
+                && initial_coverage.ready_dcs == initial_coverage.configured_dcs;
+            let initial_partial_ready = !initial_coverage.configured_dcs.is_empty()
+                && !initial_coverage.ready_dcs.is_empty()
+                && initial_coverage.ready_dcs.len() < initial_coverage.configured_dcs.len();
             let mut fallback_enabled = config.general.me2dc_fallback;
             let mut fast_fallback_enabled = fallback_enabled && config.general.me2dc_fast;
             let (initial_gate_open, initial_route_mode, initial_fallback_reason) = if initial_ready
             {
+                (true, RelayRouteMode::Middle, None)
+            } else if initial_partial_ready {
                 (true, RelayRouteMode::Middle, None)
             } else if fast_fallback_enabled {
                 (
@@ -39,6 +90,10 @@ pub(crate) async fn configure_admission_gate(
             let _ = route_runtime.set_mode(initial_route_mode);
             if initial_ready {
                 info!("Conditional-admission gate: open / ME pool READY");
+            } else if initial_partial_ready {
+                warn!(
+                    "Conditional-admission gate: open / ME pool PARTIALLY ready, per-DC Direct fallback active"
+                );
             } else if let Some(reason) = initial_fallback_reason {
                 warn!(
                     fallback_reason = reason,
@@ -57,11 +112,13 @@ pub(crate) async fn configure_admission_gate(
                 let mut gate_open = initial_gate_open;
                 let mut route_mode = initial_route_mode;
                 let mut ready_observed = initial_ready;
-                let mut not_ready_since = if initial_ready {
+                let mut not_ready_since = if initial_ready || initial_partial_ready {
                     None
                 } else {
                     Some(Instant::now())
                 };
+                let mut previous_configured_dcs = initial_coverage.configured_dcs;
+                let mut previous_ready_dcs = initial_coverage.ready_dcs;
                 loop {
                     tokio::select! {
                         changed = config_rx_gate.changed() => {
@@ -76,9 +133,30 @@ pub(crate) async fn configure_admission_gate(
                         }
                         _ = tokio::time::sleep(Duration::from_millis(admission_poll_ms)) => {}
                     }
-                    let ready = pool_for_gate.admission_ready_conditional_cast().await;
+                    let coverage = pool_for_gate.admission_coverage_snapshot().await;
+                    let configured_dcs = coverage.configured_dcs;
+                    let ready_dcs = coverage.ready_dcs;
+                    let ready =
+                        !configured_dcs.is_empty() && ready_dcs.len() == configured_dcs.len();
+                    let partial_ready =
+                        !configured_dcs.is_empty() && !ready_dcs.is_empty() && !ready;
+                    if configured_dcs != previous_configured_dcs || ready_dcs != previous_ready_dcs
+                    {
+                        log_admission_coverage_transition(
+                            &previous_configured_dcs,
+                            &previous_ready_dcs,
+                            &configured_dcs,
+                            &ready_dcs,
+                        );
+                        previous_configured_dcs = configured_dcs.clone();
+                        previous_ready_dcs = ready_dcs.clone();
+                    }
                     let now = Instant::now();
                     let (next_gate_open, next_route_mode, next_fallback_reason) = if ready {
+                        ready_observed = true;
+                        not_ready_since = None;
+                        (true, RelayRouteMode::Middle, None)
+                    } else if partial_ready {
                         ready_observed = true;
                         not_ready_since = None;
                         (true, RelayRouteMode::Middle, None)
@@ -108,11 +186,19 @@ pub(crate) async fn configure_admission_gate(
                         route_mode = next_route_mode;
                         if let Some(snapshot) = route_runtime_gate.set_mode(route_mode) {
                             if matches!(route_mode, RelayRouteMode::Middle) {
-                                info!(
-                                    target_mode = route_mode.as_str(),
-                                    cutover_generation = snapshot.generation,
-                                    "Middle-End routing restored for new sessions"
-                                );
+                                if ready {
+                                    info!(
+                                        target_mode = route_mode.as_str(),
+                                        cutover_generation = snapshot.generation,
+                                        "Middle-End routing restored for new sessions"
+                                    );
+                                } else {
+                                    warn!(
+                                        target_mode = route_mode.as_str(),
+                                        cutover_generation = snapshot.generation,
+                                        "ME pool partially recovered; routing new sessions via Middle-End with per-DC Direct fallback"
+                                    );
+                                }
                             } else {
                                 let fallback_reason = next_fallback_reason.unwrap_or("unknown");
                                 if fallback_reason == "strict_grace_fallback" {
@@ -149,8 +235,12 @@ pub(crate) async fn configure_admission_gate(
                                     fallback_reason = next_fallback_reason.unwrap_or("unknown"),
                                     "Conditional-admission gate opened in ME fallback mode"
                                 );
-                            } else {
+                            } else if ready {
                                 info!("Conditional-admission gate opened / ME pool READY");
+                            } else {
+                                warn!(
+                                    "Conditional-admission gate opened / ME pool PARTIALLY ready, per-DC Direct fallback active"
+                                );
                             }
                         } else {
                             warn!("Conditional-admission gate closed / ME pool is NOT ready");

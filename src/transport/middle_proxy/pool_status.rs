@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use super::pool::{MePool, WriterContour};
 use crate::config::{MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy};
+use crate::network::IpFamily;
 use crate::transport::upstream::IpPreference;
 
 #[derive(Clone, Debug)]
@@ -142,51 +143,102 @@ pub(crate) struct MeApiRuntimeSnapshot {
     pub network_path: Vec<MeApiDcPathSnapshot>,
 }
 
-impl MePool {
-    pub(crate) async fn admission_ready_conditional_cast(&self) -> bool {
-        let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
-        if self.decision.ipv4_me {
-            let map = self.proxy_map_v4.read().await.clone();
-            extend_signed_endpoints(&mut endpoints_by_dc, map);
-        }
-        if self.decision.ipv6_me {
-            let map = self.proxy_map_v6.read().await.clone();
-            extend_signed_endpoints(&mut endpoints_by_dc, map);
-        }
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MeAdmissionCoverageSnapshot {
+    pub configured_dcs: BTreeSet<i16>,
+    pub ready_dcs: BTreeSet<i16>,
+}
 
-        if endpoints_by_dc.is_empty() {
-            return false;
+impl MePool {
+    pub(crate) async fn admission_coverage_snapshot(&self) -> MeAdmissionCoverageSnapshot {
+        let now_epoch_secs = Self::now_epoch_secs();
+        let mut configured_dcs = BTreeSet::<i16>::new();
+
+        if self.family_enabled_for_drain_coverage(IpFamily::V4, now_epoch_secs) {
+            let map = self.proxy_map_v4.read().await;
+            configured_dcs.extend(
+                map.iter()
+                    .filter(|(_, endpoints)| !endpoints.is_empty())
+                    .filter_map(|(dc, _)| i16::try_from(*dc).ok()),
+            );
+        }
+        if self.family_enabled_for_drain_coverage(IpFamily::V6, now_epoch_secs) {
+            let map = self.proxy_map_v6.read().await;
+            configured_dcs.extend(
+                map.iter()
+                    .filter(|(_, endpoints)| !endpoints.is_empty())
+                    .filter_map(|(dc, _)| i16::try_from(*dc).ok()),
+            );
         }
 
         let writers = self.writers.read().await.clone();
-        let mut live_writers_by_dc = HashMap::<i16, usize>::new();
+        let mut ready_dcs = BTreeSet::<i16>::new();
         for writer in writers.iter() {
             if writer.draining.load(Ordering::Relaxed) {
                 continue;
             }
-            if let Ok(dc) = i16::try_from(writer.writer_dc) {
-                *live_writers_by_dc.entry(dc).or_insert(0) += 1;
+            if let Ok(dc) = i16::try_from(writer.writer_dc)
+                && configured_dcs.contains(&dc)
+            {
+                ready_dcs.insert(dc);
             }
         }
 
-        for dc in endpoints_by_dc.keys() {
-            let alive = live_writers_by_dc.get(dc).copied().unwrap_or(0);
-            if alive == 0 {
-                return false;
-            }
+        MeAdmissionCoverageSnapshot {
+            configured_dcs,
+            ready_dcs,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn admission_ready_partial_cast(&self) -> bool {
+        let snapshot = self.admission_coverage_snapshot().await;
+        !snapshot.configured_dcs.is_empty() && !snapshot.ready_dcs.is_empty()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn admission_ready_conditional_cast(&self) -> bool {
+        let snapshot = self.admission_coverage_snapshot().await;
+        !snapshot.configured_dcs.is_empty() && snapshot.ready_dcs == snapshot.configured_dcs
+    }
+
+    pub(crate) async fn admission_ready_for_target_dc(&self, target_dc: i16) -> bool {
+        let now_epoch_secs = Self::now_epoch_secs();
+        let (routed_dc, _) = self.resolve_target_dc_for_routing(target_dc as i32).await;
+        let mut endpoint_count = 0usize;
+
+        if self.family_enabled_for_drain_coverage(IpFamily::V4, now_epoch_secs) {
+            let map = self.proxy_map_v4.read().await;
+            endpoint_count = endpoint_count.saturating_add(
+                map.get(&routed_dc).map(|endpoints| endpoints.len()).unwrap_or(0),
+            );
+        }
+        if self.family_enabled_for_drain_coverage(IpFamily::V6, now_epoch_secs) {
+            let map = self.proxy_map_v6.read().await;
+            endpoint_count = endpoint_count.saturating_add(
+                map.get(&routed_dc).map(|endpoints| endpoints.len()).unwrap_or(0),
+            );
         }
 
-        true
+        if endpoint_count == 0 {
+            return false;
+        }
+
+        let writers = self.writers.read().await.clone();
+        writers.iter().any(|writer| {
+            !writer.draining.load(Ordering::Relaxed) && writer.writer_dc == routed_dc
+        })
     }
 
     #[allow(dead_code)]
     pub(crate) async fn admission_ready_full_floor(&self) -> bool {
         let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
-        if self.decision.ipv4_me {
+        let now_epoch_secs = Self::now_epoch_secs();
+        if self.family_enabled_for_drain_coverage(IpFamily::V4, now_epoch_secs) {
             let map = self.proxy_map_v4.read().await.clone();
             extend_signed_endpoints(&mut endpoints_by_dc, map);
         }
-        if self.decision.ipv6_me {
+        if self.family_enabled_for_drain_coverage(IpFamily::V6, now_epoch_secs) {
             let map = self.proxy_map_v6.read().await.clone();
             extend_signed_endpoints(&mut endpoints_by_dc, map);
         }
@@ -731,7 +783,22 @@ fn ip_preference_label(preference: IpPreference) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+
     use super::ratio_pct;
+    use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeWriterPickMode};
+    use crate::crypto::SecureRandom;
+    use crate::network::probe::NetworkDecision;
+    use crate::stats::Stats;
+    use crate::transport::middle_proxy::codec::WriterCommand;
+    use crate::transport::middle_proxy::pool::{MePool, MeWriter, WriterContour};
 
     #[test]
     fn ratio_pct_is_zero_when_denominator_is_zero() {
@@ -746,5 +813,153 @@ mod tests {
     #[test]
     fn ratio_pct_reports_expected_value() {
         assert_eq!(ratio_pct(1, 4), 25.0);
+    }
+
+    async fn make_pool() -> Arc<MePool> {
+        let general = GeneralConfig::default();
+        let mut proxy_map_v4 = HashMap::new();
+        proxy_map_v4.insert(2, vec![(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 443)]);
+        proxy_map_v4.insert(3, vec![(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)), 443)]);
+        let decision = NetworkDecision {
+            ipv4_me: true,
+            ..NetworkDecision::default()
+        };
+        MePool::new(
+            None,
+            vec![1u8; 32],
+            None,
+            false,
+            None,
+            Vec::new(),
+            1,
+            None,
+            12,
+            1200,
+            proxy_map_v4,
+            HashMap::new(),
+            None,
+            decision,
+            None,
+            Arc::new(SecureRandom::new()),
+            Arc::new(Stats::default()),
+            general.me_keepalive_enabled,
+            general.me_keepalive_interval_secs,
+            general.me_keepalive_jitter_secs,
+            general.me_keepalive_payload_random,
+            general.rpc_proxy_req_every,
+            general.me_warmup_stagger_enabled,
+            general.me_warmup_step_delay_ms,
+            general.me_warmup_step_jitter_ms,
+            general.me_reconnect_max_concurrent_per_dc,
+            general.me_reconnect_backoff_base_ms,
+            general.me_reconnect_backoff_cap_ms,
+            general.me_reconnect_fast_retry_count,
+            general.me_single_endpoint_shadow_writers,
+            general.me_single_endpoint_outage_mode_enabled,
+            general.me_single_endpoint_outage_disable_quarantine,
+            general.me_single_endpoint_outage_backoff_min_ms,
+            general.me_single_endpoint_outage_backoff_max_ms,
+            general.me_single_endpoint_shadow_rotate_every_secs,
+            general.me_floor_mode,
+            general.me_adaptive_floor_idle_secs,
+            general.me_adaptive_floor_min_writers_single_endpoint,
+            general.me_adaptive_floor_min_writers_multi_endpoint,
+            general.me_adaptive_floor_recover_grace_secs,
+            general.me_adaptive_floor_writers_per_core_total,
+            general.me_adaptive_floor_cpu_cores_override,
+            general.me_adaptive_floor_max_extra_writers_single_per_core,
+            general.me_adaptive_floor_max_extra_writers_multi_per_core,
+            general.me_adaptive_floor_max_active_writers_per_core,
+            general.me_adaptive_floor_max_warm_writers_per_core,
+            general.me_adaptive_floor_max_active_writers_global,
+            general.me_adaptive_floor_max_warm_writers_global,
+            general.hardswap,
+            general.me_pool_drain_ttl_secs,
+            general.me_instadrain,
+            general.me_pool_drain_threshold,
+            general.me_pool_drain_soft_evict_enabled,
+            general.me_pool_drain_soft_evict_grace_secs,
+            general.me_pool_drain_soft_evict_per_writer,
+            general.me_pool_drain_soft_evict_budget_per_core,
+            general.me_pool_drain_soft_evict_cooldown_ms,
+            general.effective_me_pool_force_close_secs(),
+            general.me_pool_min_fresh_ratio,
+            general.me_hardswap_warmup_delay_min_ms,
+            general.me_hardswap_warmup_delay_max_ms,
+            general.me_hardswap_warmup_extra_passes,
+            general.me_hardswap_warmup_pass_backoff_base_ms,
+            general.me_bind_stale_mode,
+            general.me_bind_stale_ttl_secs,
+            general.me_secret_atomic_snapshot,
+            general.me_deterministic_writer_sort,
+            MeWriterPickMode::default(),
+            general.me_writer_pick_sample_size,
+            crate::config::MeSocksKdfPolicy::default(),
+            general.me_writer_cmd_channel_capacity,
+            general.me_route_channel_capacity,
+            general.me_route_backpressure_base_timeout_ms,
+            general.me_route_backpressure_high_timeout_ms,
+            general.me_route_backpressure_high_watermark_pct,
+            general.me_reader_route_data_wait_ms,
+            general.me_health_interval_ms_unhealthy,
+            general.me_health_interval_ms_healthy,
+            general.me_warn_rate_limit_ms,
+            MeRouteNoWriterMode::default(),
+            general.me_route_no_writer_wait_ms,
+            general.me_route_hybrid_max_wait_ms,
+            general.me_route_blocking_send_timeout_ms,
+            general.me_route_inline_recovery_attempts,
+            general.me_route_inline_recovery_wait_ms,
+        )
+    }
+
+    async fn insert_live_writer(pool: &Arc<MePool>, writer_id: u64, writer_dc: i32) {
+        let (tx, _writer_rx) = mpsc::channel::<WriterCommand>(8);
+        let writer = MeWriter {
+            id: writer_id,
+            addr: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(
+                    203,
+                    0,
+                    113,
+                    (writer_id as u8).saturating_add(20),
+                )),
+                4000 + writer_id as u16,
+            ),
+            source_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            writer_dc,
+            generation: 1,
+            contour: Arc::new(AtomicU8::new(WriterContour::Active.as_u8())),
+            created_at: Instant::now(),
+            tx: tx.clone(),
+            cancel: CancellationToken::new(),
+            degraded: Arc::new(AtomicBool::new(false)),
+            rtt_ema_ms_x10: Arc::new(AtomicU32::new(0)),
+            draining: Arc::new(AtomicBool::new(false)),
+            draining_started_at_epoch_secs: Arc::new(AtomicU64::new(0)),
+            drain_deadline_epoch_secs: Arc::new(AtomicU64::new(0)),
+            allow_drain_fallback: Arc::new(AtomicBool::new(false)),
+        };
+        pool.writers.write().await.push(writer);
+        pool.registry.register_writer(writer_id, tx).await;
+        pool.conn_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn admission_ready_partial_cast_accepts_partial_dc_coverage() {
+        let pool = make_pool().await;
+        insert_live_writer(&pool, 1, 2).await;
+
+        assert!(pool.admission_ready_partial_cast().await);
+        assert!(!pool.admission_ready_conditional_cast().await);
+    }
+
+    #[tokio::test]
+    async fn admission_ready_for_target_dc_checks_requested_dc() {
+        let pool = make_pool().await;
+        insert_live_writer(&pool, 1, 2).await;
+
+        assert!(pool.admission_ready_for_target_dc(2).await);
+        assert!(!pool.admission_ready_for_target_dc(3).await);
     }
 }
