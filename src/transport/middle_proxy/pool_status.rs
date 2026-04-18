@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::pool::{MePool, WriterContour};
+use super::pool::{MePool, MeWriter, WriterContour};
 use crate::config::{MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy};
 use crate::network::IpFamily;
 use crate::transport::upstream::IpPreference;
@@ -149,26 +149,43 @@ pub(crate) struct MeAdmissionCoverageSnapshot {
     pub ready_dcs: BTreeSet<i16>,
 }
 
+fn writer_ip_family(writer: &MeWriter) -> IpFamily {
+    if writer.addr.is_ipv6() {
+        IpFamily::V6
+    } else {
+        IpFamily::V4
+    }
+}
+
 impl MePool {
     pub(crate) async fn admission_coverage_snapshot(&self) -> MeAdmissionCoverageSnapshot {
         let now_epoch_secs = Self::now_epoch_secs();
         let mut configured_dcs = BTreeSet::<i16>::new();
+        let mut configured_families_by_dc = HashMap::<i16, HashSet<IpFamily>>::new();
 
         if self.family_enabled_for_drain_coverage(IpFamily::V4, now_epoch_secs) {
             let map = self.proxy_map_v4.read().await;
-            configured_dcs.extend(
-                map.iter()
-                    .filter(|(_, endpoints)| !endpoints.is_empty())
-                    .filter_map(|(dc, _)| i16::try_from(*dc).ok()),
-            );
+            for (dc, _) in map.iter().filter(|(_, endpoints)| !endpoints.is_empty()) {
+                if let Ok(dc) = i16::try_from(*dc) {
+                    configured_dcs.insert(dc);
+                    configured_families_by_dc
+                        .entry(dc)
+                        .or_default()
+                        .insert(IpFamily::V4);
+                }
+            }
         }
         if self.family_enabled_for_drain_coverage(IpFamily::V6, now_epoch_secs) {
             let map = self.proxy_map_v6.read().await;
-            configured_dcs.extend(
-                map.iter()
-                    .filter(|(_, endpoints)| !endpoints.is_empty())
-                    .filter_map(|(dc, _)| i16::try_from(*dc).ok()),
-            );
+            for (dc, _) in map.iter().filter(|(_, endpoints)| !endpoints.is_empty()) {
+                if let Ok(dc) = i16::try_from(*dc) {
+                    configured_dcs.insert(dc);
+                    configured_families_by_dc
+                        .entry(dc)
+                        .or_default()
+                        .insert(IpFamily::V6);
+                }
+            }
         }
 
         let writers = self.writers.read().await.clone();
@@ -178,7 +195,9 @@ impl MePool {
                 continue;
             }
             if let Ok(dc) = i16::try_from(writer.writer_dc)
-                && configured_dcs.contains(&dc)
+                && configured_families_by_dc
+                    .get(&dc)
+                    .is_some_and(|families| families.contains(&writer_ip_family(writer)))
             {
                 ready_dcs.insert(dc);
             }
@@ -205,28 +224,30 @@ impl MePool {
     pub(crate) async fn admission_ready_for_target_dc(&self, target_dc: i16) -> bool {
         let now_epoch_secs = Self::now_epoch_secs();
         let (routed_dc, _) = self.resolve_target_dc_for_routing(target_dc as i32).await;
-        let mut endpoint_count = 0usize;
+        let mut configured_families = HashSet::<IpFamily>::new();
 
         if self.family_enabled_for_drain_coverage(IpFamily::V4, now_epoch_secs) {
             let map = self.proxy_map_v4.read().await;
-            endpoint_count = endpoint_count.saturating_add(
-                map.get(&routed_dc).map(|endpoints| endpoints.len()).unwrap_or(0),
-            );
+            if map.get(&routed_dc).is_some_and(|endpoints| !endpoints.is_empty()) {
+                configured_families.insert(IpFamily::V4);
+            }
         }
         if self.family_enabled_for_drain_coverage(IpFamily::V6, now_epoch_secs) {
             let map = self.proxy_map_v6.read().await;
-            endpoint_count = endpoint_count.saturating_add(
-                map.get(&routed_dc).map(|endpoints| endpoints.len()).unwrap_or(0),
-            );
+            if map.get(&routed_dc).is_some_and(|endpoints| !endpoints.is_empty()) {
+                configured_families.insert(IpFamily::V6);
+            }
         }
 
-        if endpoint_count == 0 {
+        if configured_families.is_empty() {
             return false;
         }
 
         let writers = self.writers.read().await.clone();
         writers.iter().any(|writer| {
-            !writer.draining.load(Ordering::Relaxed) && writer.writer_dc == routed_dc
+            !writer.draining.load(Ordering::Relaxed)
+                && writer.writer_dc == routed_dc
+                && configured_families.contains(&writer_ip_family(writer))
         })
     }
 
@@ -248,13 +269,15 @@ impl MePool {
         }
 
         let writers = self.writers.read().await.clone();
-        let mut live_writers_by_dc = HashMap::<i16, usize>::new();
+        let mut live_writers_by_dc_family = HashMap::<(i16, IpFamily), usize>::new();
         for writer in writers.iter() {
             if writer.draining.load(Ordering::Relaxed) {
                 continue;
             }
             if let Ok(dc) = i16::try_from(writer.writer_dc) {
-                *live_writers_by_dc.entry(dc).or_insert(0) += 1;
+                *live_writers_by_dc_family
+                    .entry((dc, writer_ip_family(writer)))
+                    .or_insert(0) += 1;
             }
         }
 
@@ -264,7 +287,19 @@ impl MePool {
                 return false;
             }
             let required = self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
-            let alive = live_writers_by_dc.get(&dc).copied().unwrap_or(0);
+            let alive = endpoints.iter().fold(0usize, |acc, endpoint| {
+                let family = if endpoint.is_ipv6() {
+                    IpFamily::V6
+                } else {
+                    IpFamily::V4
+                };
+                acc.saturating_add(
+                    live_writers_by_dc_family
+                        .get(&(dc, family))
+                        .copied()
+                        .unwrap_or(0),
+                )
+            });
             if alive < required {
                 return false;
             }
@@ -913,20 +948,17 @@ mod tests {
         )
     }
 
-    async fn insert_live_writer(pool: &Arc<MePool>, writer_id: u64, writer_dc: i32) {
+    async fn insert_live_writer(
+        pool: &Arc<MePool>,
+        writer_id: u64,
+        writer_dc: i32,
+        endpoint: SocketAddr,
+    ) {
         let (tx, _writer_rx) = mpsc::channel::<WriterCommand>(8);
         let writer = MeWriter {
             id: writer_id,
-            addr: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(
-                    203,
-                    0,
-                    113,
-                    (writer_id as u8).saturating_add(20),
-                )),
-                4000 + writer_id as u16,
-            ),
-            source_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            addr: endpoint,
+            source_ip: endpoint.ip(),
             writer_dc,
             generation: 1,
             contour: Arc::new(AtomicU8::new(WriterContour::Active.as_u8())),
@@ -948,7 +980,13 @@ mod tests {
     #[tokio::test]
     async fn admission_ready_partial_cast_accepts_partial_dc_coverage() {
         let pool = make_pool().await;
-        insert_live_writer(&pool, 1, 2).await;
+        insert_live_writer(
+            &pool,
+            1,
+            2,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21)), 4001),
+        )
+        .await;
 
         assert!(pool.admission_ready_partial_cast().await);
         assert!(!pool.admission_ready_conditional_cast().await);
@@ -957,9 +995,37 @@ mod tests {
     #[tokio::test]
     async fn admission_ready_for_target_dc_checks_requested_dc() {
         let pool = make_pool().await;
-        insert_live_writer(&pool, 1, 2).await;
+        insert_live_writer(
+            &pool,
+            1,
+            2,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21)), 4001),
+        )
+        .await;
 
         assert!(pool.admission_ready_for_target_dc(2).await);
         assert!(!pool.admission_ready_for_target_dc(3).await);
+    }
+
+    #[tokio::test]
+    async fn admission_ready_for_target_dc_ignores_writer_from_uncovered_family() {
+        let pool = make_pool().await;
+        pool.proxy_map_v4.write().await.remove(&2);
+        pool.proxy_map_v6.write().await.insert(
+            2,
+            vec![(IpAddr::V6("2001:db8::10".parse().unwrap()), 443)],
+        );
+
+        insert_live_writer(
+            &pool,
+            1,
+            2,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21)), 4001),
+        )
+        .await;
+
+        assert!(!pool.admission_ready_for_target_dc(2).await);
+        assert!(!pool.admission_ready_partial_cast().await);
+        assert!(!pool.admission_ready_conditional_cast().await);
     }
 }
