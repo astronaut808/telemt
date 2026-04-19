@@ -1571,6 +1571,13 @@ pub enum UnknownSniAction {
     Drop,
     Mask,
     Accept,
+    /// Reject the TLS handshake by sending a fatal `unrecognized_name` alert
+    /// (RFC 6066, AlertDescription = 112) before closing the connection.
+    /// Mimics nginx `ssl_reject_handshake on;` behavior on the default vhost —
+    /// the wire response indistinguishable from a stock modern web server
+    /// that simply does not host the requested name.
+    #[serde(rename = "reject_handshake")]
+    RejectHandshake,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
