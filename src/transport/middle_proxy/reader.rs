@@ -26,9 +26,14 @@ use super::fairness::{
 };
 use super::registry::RouteResult;
 use super::{ConnRegistry, MeResponse};
+
 const DATA_ROUTE_MAX_ATTEMPTS: usize = 3;
 const DATA_ROUTE_QUEUE_FULL_STARVATION_THRESHOLD: u8 = 3;
 const FAIRNESS_DRAIN_BUDGET_PER_LOOP: usize = 128;
+const FAIRNESS_RETRY_BACKLOG_THRESHOLD_BYTES: u64 = 128 * 1024;
+const FAIRNESS_RETRY_BACKPRESSURED_MIN_MS: u64 = 10;
+const FAIRNESS_RETRY_SHEDDING_MIN_MS: u64 = 12;
+const FAIRNESS_RETRY_SATURATED_MIN_MS: u64 = 15;
 
 fn should_close_on_route_result_for_data(result: RouteResult) -> bool {
     matches!(result, RouteResult::NoConn | RouteResult::ChannelClosed)
@@ -57,8 +62,37 @@ fn should_schedule_fairness_retry(snapshot: &WorkerFairnessSnapshot) -> bool {
     snapshot.total_queued_bytes > 0
 }
 
-fn fairness_retry_delay(route_wait_ms: u64) -> Duration {
-    Duration::from_millis(route_wait_ms.max(1))
+fn pressure_aware_route_wait_ms(route_wait_ms: u64, pressure_state: PressureState) -> u64 {
+    let pressure_floor_ms = match pressure_state {
+        PressureState::Normal => 1,
+        PressureState::Pressured => FAIRNESS_RETRY_BACKPRESSURED_MIN_MS,
+        PressureState::Shedding => FAIRNESS_RETRY_SHEDDING_MIN_MS,
+        PressureState::Saturated => FAIRNESS_RETRY_SATURATED_MIN_MS,
+    };
+
+    route_wait_ms.max(pressure_floor_ms)
+}
+
+fn fairness_retry_wait_ms(snapshot: &WorkerFairnessSnapshot, route_wait_ms: u64) -> u64 {
+    let base_wait_ms = route_wait_ms.max(1);
+
+    if snapshot.total_queued_bytes == 0 {
+        return base_wait_ms;
+    }
+
+    let backlog_floor_ms = if snapshot.backpressured_flows > 0
+        || snapshot.total_queued_bytes >= FAIRNESS_RETRY_BACKLOG_THRESHOLD_BYTES
+    {
+        FAIRNESS_RETRY_BACKPRESSURED_MIN_MS
+    } else {
+        1
+    };
+
+    pressure_aware_route_wait_ms(base_wait_ms.max(backlog_floor_ms), snapshot.pressure_state)
+}
+
+fn fairness_retry_delay(snapshot: &WorkerFairnessSnapshot, route_wait_ms: u64) -> Duration {
+    Duration::from_millis(fairness_retry_wait_ms(snapshot, route_wait_ms))
 }
 
 async fn route_data_with_retry(
@@ -160,7 +194,7 @@ async fn drain_fairness_scheduler(
     reg: &ConnRegistry,
     tx: &mpsc::Sender<WriterCommand>,
     data_route_queue_full_streak: &mut HashMap<u64, u8>,
-    route_wait_ms: u64,
+    base_route_wait_ms: u64,
     stats: &Stats,
 ) {
     for _ in 0..FAIRNESS_DRAIN_BUDGET_PER_LOOP {
@@ -171,6 +205,7 @@ async fn drain_fairness_scheduler(
         let cid = candidate.frame.conn_id;
         let pressure_state = candidate.pressure_state;
         let _flow_class = candidate.flow_class;
+        let route_wait_ms = pressure_aware_route_wait_ms(base_route_wait_ms, pressure_state);
         let routed = route_data_with_retry(
             reg,
             cid,
@@ -244,8 +279,10 @@ pub(crate) async fn reader_loop(
     loop {
         let mut tmp = [0u8; 65_536];
         let backlog_retry_enabled = should_schedule_fairness_retry(&fairness_snapshot);
-        let backlog_retry_delay =
-            fairness_retry_delay(reader_route_data_wait_ms.load(Ordering::Relaxed));
+        let backlog_retry_delay = fairness_retry_delay(
+            &fairness_snapshot,
+            reader_route_data_wait_ms.load(Ordering::Relaxed),
+        );
         let mut retry_only = false;
         let n = tokio::select! {
             res = rd.read(&mut tmp) => res.map_err(ProxyError::Io)?,
@@ -486,7 +523,8 @@ mod tests {
 
     use super::{
         MeResponse, RouteResult, WorkerFairnessSnapshot, fairness_retry_delay,
-        is_data_route_queue_full, route_data_with_retry, should_close_on_queue_full_streak,
+        fairness_retry_wait_ms, is_data_route_queue_full, pressure_aware_route_wait_ms,
+        route_data_with_retry, should_close_on_queue_full_streak,
         should_close_on_route_result_for_ack, should_close_on_route_result_for_data,
         should_schedule_fairness_retry,
     };
@@ -541,8 +579,49 @@ mod tests {
 
     #[test]
     fn fairness_retry_delay_never_drops_below_one_millisecond() {
-        assert_eq!(fairness_retry_delay(0), Duration::from_millis(1));
-        assert_eq!(fairness_retry_delay(2), Duration::from_millis(2));
+        let snapshot = WorkerFairnessSnapshot::default();
+        assert_eq!(fairness_retry_delay(&snapshot, 0), Duration::from_millis(1));
+        assert_eq!(fairness_retry_delay(&snapshot, 2), Duration::from_millis(2));
+    }
+
+    #[test]
+    fn pressure_aware_route_wait_ms_raises_retry_window_under_pressure() {
+        assert_eq!(pressure_aware_route_wait_ms(2, PressureState::Normal), 2);
+        assert_eq!(
+            pressure_aware_route_wait_ms(2, PressureState::Pressured),
+            10
+        );
+        assert_eq!(
+            pressure_aware_route_wait_ms(2, PressureState::Shedding),
+            12
+        );
+        assert_eq!(
+            pressure_aware_route_wait_ms(2, PressureState::Saturated),
+            15
+        );
+    }
+
+    #[test]
+    fn fairness_retry_wait_ms_raises_retry_window_for_bulk_backlog_even_before_shedding() {
+        let snapshot = WorkerFairnessSnapshot {
+            pressure_state: PressureState::Normal,
+            total_queued_bytes: 128 * 1024,
+            backpressured_flows: 1,
+            ..WorkerFairnessSnapshot::default()
+        };
+
+        assert_eq!(fairness_retry_wait_ms(&snapshot, 2), 10);
+    }
+
+    #[test]
+    fn fairness_retry_wait_ms_respects_higher_pressure_floor() {
+        let snapshot = WorkerFairnessSnapshot {
+            pressure_state: PressureState::Saturated,
+            total_queued_bytes: 128 * 1024,
+            ..WorkerFairnessSnapshot::default()
+        };
+
+        assert_eq!(fairness_retry_wait_ms(&snapshot, 2), 15);
     }
 
     #[test]
