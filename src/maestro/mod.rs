@@ -631,11 +631,25 @@ async fn run_telemt_core(
     )
     .await;
 
-    // If ME failed to initialize, force direct-only mode.
+    // If ME initialization produced a usable pool, keep middle-proxy mode.
+    // Otherwise fall back to direct-only mode.
     if me_pool.is_some() {
         startup_tracker.set_transport_mode("middle_proxy").await;
-        startup_tracker.set_degraded(false).await;
-        info!("Transport: Middle-End Proxy - all DC-over-RPC");
+        if let Some(pool) = me_pool.as_ref() {
+            let coverage = pool.admission_coverage_snapshot().await;
+            let fully_covered = !coverage.configured_dcs.is_empty()
+                && coverage.ready_dcs == coverage.configured_dcs;
+            startup_tracker.set_degraded(!fully_covered).await;
+            if fully_covered {
+                info!("Transport: Middle-End Proxy - all DC-over-RPC");
+            } else {
+                warn!(
+                    configured_dcs = coverage.configured_dcs.len(),
+                    ready_dcs = coverage.ready_dcs.len(),
+                    "Transport: Middle-End Proxy with partial DC coverage and per-DC Direct fallback"
+                );
+            }
+        }
     } else {
         let _ = use_middle_proxy;
         use_middle_proxy = false;
