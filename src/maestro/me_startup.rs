@@ -19,6 +19,23 @@ use crate::transport::middle_proxy::MePool;
 
 use super::helpers::load_startup_proxy_config_snapshot;
 
+async fn log_me_init_outcome(pool: &Arc<MePool>, attempt: u32) {
+    let coverage = pool.admission_coverage_snapshot().await;
+    let configured_dcs = coverage.configured_dcs.len();
+    let ready_dcs = coverage.ready_dcs.len();
+
+    if configured_dcs > 0 && ready_dcs == configured_dcs {
+        info!(attempt, "Middle-End pool initialized successfully");
+    } else {
+        warn!(
+            attempt,
+            configured_dcs,
+            ready_dcs,
+            "Middle-End pool initialized with partial DC coverage; per-DC Direct fallback remains active while recovery continues"
+        );
+    }
+}
+
 pub(crate) async fn initialize_me_pool(
     use_middle_proxy: bool,
     config: &ProxyConfig,
@@ -347,10 +364,7 @@ pub(crate) async fn initialize_me_pool(
                                         startup_tracker_bg
                                             .set_me_status(StartupMeStatus::Ready, "ready")
                                             .await;
-                                        info!(
-                                            attempt = init_attempt,
-                                            "Middle-End pool initialized successfully"
-                                        );
+                                        log_me_init_outcome(&pool_bg, init_attempt).await;
 
                                             // ── Supervised background tasks ──────────────────
                                             // Each task runs inside a nested tokio::spawn so
@@ -474,10 +488,7 @@ pub(crate) async fn initialize_me_pool(
                                 startup_tracker
                                     .set_me_status(StartupMeStatus::Ready, "ready")
                                     .await;
-                                info!(
-                                    attempt = init_attempt,
-                                    "Middle-End pool initialized successfully"
-                                );
+                                log_me_init_outcome(&pool, init_attempt).await;
 
                                 // ── Supervised background tasks ──────────────────
                                 let pool_clone = pool.clone();

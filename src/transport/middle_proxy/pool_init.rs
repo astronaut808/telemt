@@ -11,6 +11,23 @@ use crate::error::{ProxyError, Result};
 
 use super::pool::MePool;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MeInitCoverage {
+    Full,
+    Partial { missing_dcs: Vec<i32> },
+    Empty { missing_dcs: Vec<i32> },
+}
+
+fn classify_me_init_coverage(missing_dcs: Vec<i32>, active_writers: usize) -> MeInitCoverage {
+    if missing_dcs.is_empty() {
+        MeInitCoverage::Full
+    } else if active_writers > 0 {
+        MeInitCoverage::Partial { missing_dcs }
+    } else {
+        MeInitCoverage::Empty { missing_dcs }
+    }
+}
+
 impl MePool {
     pub async fn init(self: &Arc<Self>, pool_size: usize, rng: &Arc<SecureRandom>) -> Result<()> {
         let family_order = self.family_order();
@@ -95,10 +112,20 @@ impl MePool {
                     missing_dcs.push(*dc);
                 }
             }
-            if !missing_dcs.is_empty() {
-                return Err(ProxyError::Proxy(format!(
-                    "ME init incomplete: no live writers for DC groups {missing_dcs:?}"
-                )));
+            match classify_me_init_coverage(missing_dcs, self.connection_count()) {
+                MeInitCoverage::Full => {}
+                MeInitCoverage::Partial { missing_dcs } => {
+                    warn!(
+                        active_writers = self.connection_count(),
+                        missing_dc = ?missing_dcs,
+                        "ME init reached partial DC coverage; proceeding with per-DC Direct fallback while recovery continues"
+                    );
+                }
+                MeInitCoverage::Empty { missing_dcs } => {
+                    return Err(ProxyError::Proxy(format!(
+                        "ME init incomplete: no live writers for DC groups {missing_dcs:?}"
+                    )));
+                }
             }
 
             // Stage 2: continue saturating multi-endpoint DC groups in background.
@@ -262,5 +289,35 @@ impl MePool {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MeInitCoverage, classify_me_init_coverage};
+
+    #[test]
+    fn classify_me_init_coverage_reports_full_when_nothing_is_missing() {
+        assert_eq!(classify_me_init_coverage(Vec::new(), 0), MeInitCoverage::Full);
+    }
+
+    #[test]
+    fn classify_me_init_coverage_reports_partial_when_some_writers_exist() {
+        assert_eq!(
+            classify_me_init_coverage(vec![1, 4], 3),
+            MeInitCoverage::Partial {
+                missing_dcs: vec![1, 4]
+            }
+        );
+    }
+
+    #[test]
+    fn classify_me_init_coverage_reports_empty_when_no_writers_exist() {
+        assert_eq!(
+            classify_me_init_coverage(vec![-4, 1], 0),
+            MeInitCoverage::Empty {
+                missing_dcs: vec![-4, 1]
+            }
+        );
     }
 }
