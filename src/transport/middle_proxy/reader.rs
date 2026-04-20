@@ -35,6 +35,13 @@ const FAIRNESS_RETRY_BACKPRESSURED_MIN_MS: u64 = 10;
 const FAIRNESS_RETRY_SHEDDING_MIN_MS: u64 = 12;
 const FAIRNESS_RETRY_SATURATED_MIN_MS: u64 = 15;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FairnessRetryPlan {
+    wait_ms: u64,
+    backlog_floor_applied: bool,
+    pressure_floor: Option<PressureState>,
+}
+
 fn should_close_on_route_result_for_data(result: RouteResult) -> bool {
     matches!(result, RouteResult::NoConn | RouteResult::ChannelClosed)
 }
@@ -73,13 +80,20 @@ fn pressure_aware_route_wait_ms(route_wait_ms: u64, pressure_state: PressureStat
     route_wait_ms.max(pressure_floor_ms)
 }
 
-fn fairness_retry_wait_ms(snapshot: &WorkerFairnessSnapshot, route_wait_ms: u64) -> u64 {
+fn fairness_retry_plan(snapshot: &WorkerFairnessSnapshot, route_wait_ms: u64) -> FairnessRetryPlan {
     let base_wait_ms = route_wait_ms.max(1);
 
     if snapshot.total_queued_bytes == 0 {
-        return base_wait_ms;
+        return FairnessRetryPlan {
+            wait_ms: base_wait_ms,
+            backlog_floor_applied: false,
+            pressure_floor: None,
+        };
     }
 
+    let backlog_floor_applied = snapshot.backpressured_flows > 0
+        || snapshot.total_queued_bytes >= FAIRNESS_RETRY_BACKLOG_THRESHOLD_BYTES
+        && base_wait_ms < FAIRNESS_RETRY_BACKPRESSURED_MIN_MS;
     let backlog_floor_ms = if snapshot.backpressured_flows > 0
         || snapshot.total_queued_bytes >= FAIRNESS_RETRY_BACKLOG_THRESHOLD_BYTES
     {
@@ -87,12 +101,30 @@ fn fairness_retry_wait_ms(snapshot: &WorkerFairnessSnapshot, route_wait_ms: u64)
     } else {
         1
     };
+    let pre_pressure_wait_ms = base_wait_ms.max(backlog_floor_ms);
+    let pressure_floor = match snapshot.pressure_state {
+        PressureState::Normal => None,
+        PressureState::Pressured if pre_pressure_wait_ms < FAIRNESS_RETRY_BACKPRESSURED_MIN_MS => {
+            Some(PressureState::Pressured)
+        }
+        PressureState::Shedding if pre_pressure_wait_ms < FAIRNESS_RETRY_SHEDDING_MIN_MS => {
+            Some(PressureState::Shedding)
+        }
+        PressureState::Saturated if pre_pressure_wait_ms < FAIRNESS_RETRY_SATURATED_MIN_MS => {
+            Some(PressureState::Saturated)
+        }
+        _ => None,
+    };
 
-    pressure_aware_route_wait_ms(base_wait_ms.max(backlog_floor_ms), snapshot.pressure_state)
+    FairnessRetryPlan {
+        wait_ms: pressure_aware_route_wait_ms(pre_pressure_wait_ms, snapshot.pressure_state),
+        backlog_floor_applied,
+        pressure_floor,
+    }
 }
 
 fn fairness_retry_delay(snapshot: &WorkerFairnessSnapshot, route_wait_ms: u64) -> Duration {
-    Duration::from_millis(fairness_retry_wait_ms(snapshot, route_wait_ms))
+    Duration::from_millis(fairness_retry_plan(snapshot, route_wait_ms).wait_ms)
 }
 
 async fn route_data_with_retry(
@@ -279,6 +311,10 @@ pub(crate) async fn reader_loop(
     loop {
         let mut tmp = [0u8; 65_536];
         let backlog_retry_enabled = should_schedule_fairness_retry(&fairness_snapshot);
+        let retry_plan = fairness_retry_plan(
+            &fairness_snapshot,
+            reader_route_data_wait_ms.load(Ordering::Relaxed),
+        );
         let backlog_retry_delay = fairness_retry_delay(
             &fairness_snapshot,
             reader_route_data_wait_ms.load(Ordering::Relaxed),
@@ -293,6 +329,13 @@ pub(crate) async fn reader_loop(
             _ = cancel.cancelled() => return Ok(()),
         };
         if retry_only {
+            stats.increment_me_fair_retry_only_wakeup_total();
+            if retry_plan.backlog_floor_applied {
+                stats.increment_me_fair_retry_backlog_floor_total();
+            }
+            if let Some(pressure_floor) = retry_plan.pressure_floor {
+                stats.increment_me_fair_retry_pressure_floor(pressure_floor.as_u8());
+            }
             let route_wait_ms = reader_route_data_wait_ms.load(Ordering::Relaxed);
             drain_fairness_scheduler(
                 &mut fairness,
@@ -514,16 +557,25 @@ pub(crate) async fn reader_loop(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::time::Instant;
     use std::time::Duration;
 
     use bytes::Bytes;
+    use tokio::sync::mpsc;
 
     use super::PressureState;
     use crate::transport::middle_proxy::ConnRegistry;
+    use crate::transport::middle_proxy::fairness::{
+        AdmissionDecision, WorkerFairnessConfig, WorkerFairnessState,
+    };
+    use crate::transport::middle_proxy::codec::WriterCommand;
+    use crate::stats::Stats;
 
     use super::{
-        MeResponse, RouteResult, WorkerFairnessSnapshot, fairness_retry_delay,
-        fairness_retry_wait_ms, is_data_route_queue_full, pressure_aware_route_wait_ms,
+        FAIRNESS_RETRY_BACKLOG_THRESHOLD_BYTES, FairnessRetryPlan, MeResponse, RouteResult,
+        WorkerFairnessSnapshot, drain_fairness_scheduler, fairness_retry_delay, fairness_retry_plan,
+        is_data_route_queue_full, pressure_aware_route_wait_ms,
         route_data_with_retry, should_close_on_queue_full_streak,
         should_close_on_route_result_for_ack, should_close_on_route_result_for_data,
         should_schedule_fairness_retry,
@@ -610,7 +662,7 @@ mod tests {
             ..WorkerFairnessSnapshot::default()
         };
 
-        assert_eq!(fairness_retry_wait_ms(&snapshot, 2), 10);
+        assert_eq!(fairness_retry_plan(&snapshot, 2).wait_ms, 10);
     }
 
     #[test]
@@ -621,7 +673,26 @@ mod tests {
             ..WorkerFairnessSnapshot::default()
         };
 
-        assert_eq!(fairness_retry_wait_ms(&snapshot, 2), 15);
+        assert_eq!(fairness_retry_plan(&snapshot, 2).wait_ms, 15);
+    }
+
+    #[test]
+    fn fairness_retry_plan_reports_backlog_and_pressure_floor_activation() {
+        let snapshot = WorkerFairnessSnapshot {
+            pressure_state: PressureState::Saturated,
+            total_queued_bytes: 128 * 1024,
+            backpressured_flows: 1,
+            ..WorkerFairnessSnapshot::default()
+        };
+
+        assert_eq!(
+            fairness_retry_plan(&snapshot, 2),
+            FairnessRetryPlan {
+                wait_ms: 15,
+                backlog_floor_applied: true,
+                pressure_floor: Some(PressureState::Saturated),
+            }
+        );
     }
 
     #[test]
@@ -670,6 +741,158 @@ mod tests {
             routed,
             RouteResult::QueueFullBase | RouteResult::QueueFullHigh
         ));
+    }
+
+    #[tokio::test]
+    async fn long_media_backlog_recovers_after_retry_pacing_window() {
+        let reg = ConnRegistry::with_route_channel_capacity(1);
+        let (conn_id, mut rx) = reg.register().await;
+        let stats = Stats::default();
+        let (writer_tx, _writer_rx) = mpsc::channel::<WriterCommand>(1);
+        let mut data_route_queue_full_streak = HashMap::<u64, u8>::new();
+        let mut fairness = WorkerFairnessState::new(
+            WorkerFairnessConfig {
+                worker_id: 1,
+                max_active_flows: reg.route_channel_capacity().saturating_mul(4).max(256),
+                max_total_queued_bytes: 4 * 1024 * 1024,
+                max_flow_queued_bytes: 512 * 1024,
+                ..WorkerFairnessConfig::default()
+            },
+            Instant::now(),
+        );
+
+        assert!(matches!(
+            reg.route_nowait(conn_id, MeResponse::Ack(1)).await,
+            RouteResult::Routed
+        ));
+
+        let payload = Bytes::from(vec![0x11; 160 * 1024]);
+        assert!(matches!(
+            fairness.enqueue_data(conn_id, 0, payload.clone(), Instant::now()),
+            AdmissionDecision::Admit
+        ));
+
+        let snapshot = fairness.snapshot();
+        assert!(snapshot.total_queued_bytes >= FAIRNESS_RETRY_BACKLOG_THRESHOLD_BYTES);
+        let backlog_retry_delay = fairness_retry_delay(&snapshot, 2);
+        assert_eq!(backlog_retry_delay, Duration::from_millis(10));
+
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+
+            let mut delivered = Vec::new();
+            while delivered.len() < 1 {
+                match rx.recv().await {
+                    Some(MeResponse::Ack(_)) => {}
+                    Some(MeResponse::Data { data, .. }) => delivered.push(data),
+                    Some(MeResponse::Close) => panic!("unexpected close while draining backlog"),
+                    None => panic!("route channel closed before backlog drain completed"),
+                }
+            }
+            delivered
+        });
+
+        for _ in 0..8 {
+            tokio::time::sleep(backlog_retry_delay).await;
+
+            drain_fairness_scheduler(
+                &mut fairness,
+                &reg,
+                &writer_tx,
+                &mut data_route_queue_full_streak,
+                2,
+                &stats,
+            )
+            .await;
+
+            if fairness.snapshot().total_queued_bytes == 0 {
+                break;
+            }
+        }
+
+        let delivered = tokio::time::timeout(Duration::from_millis(200), consumer)
+            .await
+            .expect("backlog drain timed out")
+            .unwrap();
+        assert_eq!(delivered, vec![payload]);
+
+        let snapshot_after = fairness.snapshot();
+        assert_eq!(snapshot_after.total_queued_bytes, 0);
+        assert_eq!(snapshot_after.active_flows, 1);
+        assert!(data_route_queue_full_streak.is_empty());
+    }
+
+    #[tokio::test]
+    async fn quickack_flow_is_not_stuck_behind_bulk_backlog() {
+        let reg = ConnRegistry::with_route_channel_capacity(1);
+        let (bulk_conn_id, mut bulk_rx) = reg.register().await;
+        let (short_conn_id, mut short_rx) = reg.register().await;
+        let stats = Stats::default();
+        let (writer_tx, _writer_rx) = mpsc::channel::<WriterCommand>(1);
+        let mut data_route_queue_full_streak = HashMap::<u64, u8>::new();
+        let mut fairness = WorkerFairnessState::new(
+            WorkerFairnessConfig {
+                worker_id: 1,
+                max_active_flows: reg.route_channel_capacity().saturating_mul(4).max(256),
+                max_total_queued_bytes: 4 * 1024 * 1024,
+                max_flow_queued_bytes: 512 * 1024,
+                ..WorkerFairnessConfig::default()
+            },
+            Instant::now(),
+        );
+
+        let bulk_payload = Bytes::from(vec![0x41; 160 * 1024]);
+        let short_payload = Bytes::from_static(b"short-media-probe");
+
+        assert!(matches!(
+            fairness.enqueue_data(bulk_conn_id, 0, bulk_payload.clone(), Instant::now()),
+            AdmissionDecision::Admit
+        ));
+        assert!(matches!(
+            fairness.enqueue_data(
+                short_conn_id,
+                crate::protocol::constants::RPC_FLAG_QUICKACK,
+                short_payload.clone(),
+                Instant::now(),
+            ),
+            AdmissionDecision::Admit
+        ));
+
+        drain_fairness_scheduler(
+            &mut fairness,
+            &reg,
+            &writer_tx,
+            &mut data_route_queue_full_streak,
+            2,
+            &stats,
+        )
+        .await;
+
+        match short_rx.try_recv() {
+            Ok(MeResponse::Data { flags, data }) => {
+                assert_eq!(flags, crate::protocol::constants::RPC_FLAG_QUICKACK);
+                assert_eq!(data, short_payload);
+            }
+            other => panic!("expected short flow to drain first, got {other:?}"),
+        }
+        assert!(bulk_rx.try_recv().is_err());
+
+        for _ in 0..8 {
+            drain_fairness_scheduler(
+                &mut fairness,
+                &reg,
+                &writer_tx,
+                &mut data_route_queue_full_streak,
+                2,
+                &stats,
+            )
+            .await;
+            if bulk_rx.try_recv().is_ok() {
+                return;
+            }
+        }
+
+        panic!("bulk flow did not drain after repeated scheduler rounds");
     }
 }
 

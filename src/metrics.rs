@@ -1447,6 +1447,51 @@ async fn render_metrics(
             0
         }
     );
+    let _ = writeln!(
+        out,
+        "telemt_me_fair_events_total{{event=\"retry_only_wakeup\"}} {}",
+        if me_allows_normal {
+            stats.get_me_fair_retry_only_wakeup_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_fair_events_total{{event=\"retry_backlog_floor\"}} {}",
+        if me_allows_normal {
+            stats.get_me_fair_retry_backlog_floor_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_fair_events_total{{event=\"retry_pressure_floor_pressured\"}} {}",
+        if me_allows_normal {
+            stats.get_me_fair_retry_pressure_floor_pressured_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_fair_events_total{{event=\"retry_pressure_floor_shedding\"}} {}",
+        if me_allows_normal {
+            stats.get_me_fair_retry_pressure_floor_shedding_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_fair_events_total{{event=\"retry_pressure_floor_saturated\"}} {}",
+        if me_allows_normal {
+            stats.get_me_fair_retry_pressure_floor_saturated_total()
+        } else {
+            0
+        }
+    );
 
     let _ = writeln!(
         out,

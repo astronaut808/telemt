@@ -187,6 +187,11 @@ pub struct Stats {
     me_fair_shed_drops_total: AtomicU64,
     me_fair_penalties_total: AtomicU64,
     me_fair_downstream_stalls_total: AtomicU64,
+    me_fair_retry_only_wakeup_total: AtomicU64,
+    me_fair_retry_backlog_floor_total: AtomicU64,
+    me_fair_retry_pressure_floor_pressured_total: AtomicU64,
+    me_fair_retry_pressure_floor_shedding_total: AtomicU64,
+    me_fair_retry_pressure_floor_saturated_total: AtomicU64,
     me_d2c_batches_total: AtomicU64,
     me_d2c_batch_frames_total: AtomicU64,
     me_d2c_batch_bytes_total: AtomicU64,
@@ -938,6 +943,38 @@ impl Stats {
         if self.telemetry_me_allows_normal() && value > 0 {
             self.me_fair_downstream_stalls_total
                 .fetch_add(value, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_fair_retry_only_wakeup_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_fair_retry_only_wakeup_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_fair_retry_backlog_floor_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_fair_retry_backlog_floor_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_fair_retry_pressure_floor(&self, pressure_state: u8) {
+        if !self.telemetry_me_allows_normal() {
+            return;
+        }
+        match pressure_state {
+            1 => {
+                self.me_fair_retry_pressure_floor_pressured_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            2 => {
+                self.me_fair_retry_pressure_floor_shedding_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            3 => {
+                self.me_fair_retry_pressure_floor_saturated_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
     pub fn increment_me_d2c_batches_total(&self) {
@@ -1926,6 +1963,24 @@ impl Stats {
     }
     pub fn get_me_fair_downstream_stalls_total(&self) -> u64 {
         self.me_fair_downstream_stalls_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_fair_retry_only_wakeup_total(&self) -> u64 {
+        self.me_fair_retry_only_wakeup_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_fair_retry_backlog_floor_total(&self) -> u64 {
+        self.me_fair_retry_backlog_floor_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_fair_retry_pressure_floor_pressured_total(&self) -> u64 {
+        self.me_fair_retry_pressure_floor_pressured_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_fair_retry_pressure_floor_shedding_total(&self) -> u64 {
+        self.me_fair_retry_pressure_floor_shedding_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_fair_retry_pressure_floor_saturated_total(&self) -> u64 {
+        self.me_fair_retry_pressure_floor_saturated_total
+            .load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_batches_total(&self) -> u64 {
         self.me_d2c_batches_total.load(Ordering::Relaxed)
