@@ -248,6 +248,48 @@ metrics_whitelist = ["127.0.0.1/32", "::1/128", "0.0.0.0/0"]
 > [!WARNING]
 > Значение `"0.0.0.0/0"` в `metrics_whitelist` открывает доступ к метрикам с любого IP-адреса. Рекомендуется заменить его на ваш личный IP, например: `"1.2.3.4/32"`.
 
+## Полезные ME fairness-метрики
+
+Эти метрики помогают разбирать поведение `use_middle_proxy = true`, особенно буферизацию медиа, retry pacing и восстановление очереди downstream backlog.
+
+- `telemt_me_fair_pressure_state`
+  - Текущий уровень локального fairness-pressure у worker’а.
+  - `0` означает нормальный режим. Более высокие значения означают рост давления и более агрессивное защитное поведение.
+- `telemt_me_fair_active_flows`
+  - Количество активных flow, которые сейчас отслеживает fairness scheduler.
+- `telemt_me_fair_queued_bytes`
+  - Общий объем байт, которые сейчас стоят в очереди внутри fairness scheduler.
+- `telemt_me_fair_flow_state_gauge{class="standing"}`
+  - Количество flow, которые scheduler сейчас считает здоровыми.
+- `telemt_me_fair_flow_state_gauge{class="backpressured"}`
+  - Количество flow, которые сейчас испытывают downstream backpressure.
+- `telemt_me_fair_events_total{event="scheduler_round"}`
+  - Общее число выполненных fairness scheduling rounds.
+- `telemt_me_fair_events_total{event="deficit_grant"}`
+  - Сколько раз flow получал deficit budget и мог продолжать отправку.
+- `telemt_me_fair_events_total{event="deficit_skip"}`
+  - Сколько раз flow оставался в очереди, но еще не получил достаточный deficit budget.
+- `telemt_me_fair_events_total{event="enqueue_reject"}`
+  - Сколько попыток поставить frame в fairness-очередь были отклонены.
+- `telemt_me_fair_events_total{event="shed_drop"}`
+  - Сколько frame было отброшено fairness-слоем при shed/load-shedding режиме.
+- `telemt_me_fair_events_total{event="penalty"}`
+  - Сколько penalty-событий fairness применил к flow.
+- `telemt_me_fair_events_total{event="downstream_stall"}`
+  - Сколько раз downstream delivery зависал уже после того, как данные были поставлены в очередь.
+- `telemt_me_fair_events_total{event="retry_only_wakeup"}`
+  - Сколько раз reader loop просыпался специально для повторной попытки доставки уже накопленного fairness backlog.
+- `telemt_me_fair_events_total{event="retry_backlog_floor"}`
+  - Сколько retry-only wakeup применили backlog-size floor, который увеличивает retry delay и не дает слишком агрессивно крутить retry на больших медиа-очередях.
+- `telemt_me_fair_events_total{event="retry_pressure_floor_pressured"}`
+  - Сколько retry-only wakeup подняли минимальный retry delay из-за перехода fairness pressure в состояние `pressured`.
+- `telemt_me_fair_events_total{event="retry_pressure_floor_shedding"}`
+  - Сколько retry-only wakeup подняли минимальный retry delay из-за перехода fairness pressure в состояние `shedding`.
+- `telemt_me_fair_events_total{event="retry_pressure_floor_saturated"}`
+  - Сколько retry-only wakeup подняли минимальный retry delay из-за перехода fairness pressure в состояние `saturated`.
+
+В здоровом ME-сценарии нормально, если со временем растут `scheduler_round`, `deficit_grant` и иногда `retry_only_wakeup`. А вот устойчивый рост `downstream_stall`, `enqueue_reject`, `shed_drop` или постоянно ненулевое pressure-state уже больше похожи на реальную перегрузку или несправедливую доставку.
+
 ## Дополнительные параметры
 
 ### Домен в ссылке вместо IP

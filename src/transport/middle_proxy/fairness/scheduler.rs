@@ -590,10 +590,13 @@ impl WorkerFairnessState {
             .last_drain_at
             .map(|ts| now.saturating_duration_since(ts) >= config.standing_queue_min_age)
             .unwrap_or(true);
+        let aged_without_progress_under_pressure =
+            pressure_state >= PressureState::Pressured && drain_stalled;
 
         let standing = fairness.pending_bytes >= config.standing_queue_min_backlog_bytes
             && queue_age >= config.standing_queue_min_age
-            && (fairness.consecutive_stalls >= config.standing_stall_threshold || drain_stalled);
+            && (fairness.consecutive_stalls >= config.standing_stall_threshold
+                || aged_without_progress_under_pressure);
 
         if standing {
             let scheduler_state = if pressure_state >= PressureState::Shedding {

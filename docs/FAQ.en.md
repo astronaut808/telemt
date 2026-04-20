@@ -231,6 +231,48 @@ metrics_whitelist = ["127.0.0.1/32", "::1/128", "0.0.0.0/0"]
 > [!WARNING]
 > The value `"0.0.0.0/0"` in `metrics_whitelist` opens access to metrics from any IP address. It is recommended to replace it with your personal IP, for example: `"1.2.3.4/32"`.
 
+### Useful ME fairness metrics
+
+These metrics help diagnose `use_middle_proxy = true` behavior, especially media buffering, retry pacing, and downstream backlog recovery.
+
+- `telemt_me_fair_pressure_state`
+  - Current worker-local fairness pressure level.
+  - `0` means normal operation. Higher values mean stronger pressure and more aggressive protective behavior.
+- `telemt_me_fair_active_flows`
+  - Number of active flows currently tracked by the fairness scheduler.
+- `telemt_me_fair_queued_bytes`
+  - Total bytes currently queued inside the fairness scheduler.
+- `telemt_me_fair_flow_state_gauge{class="standing"}`
+  - Number of flows currently considered healthy by the scheduler.
+- `telemt_me_fair_flow_state_gauge{class="backpressured"}`
+  - Number of flows currently experiencing downstream backpressure.
+- `telemt_me_fair_events_total{event="scheduler_round"}`
+  - Total number of fairness scheduling rounds executed.
+- `telemt_me_fair_events_total{event="deficit_grant"}`
+  - Number of times a flow received deficit budget and was allowed to continue sending.
+- `telemt_me_fair_events_total{event="deficit_skip"}`
+  - Number of times a flow remained queued but did not yet receive enough deficit budget.
+- `telemt_me_fair_events_total{event="enqueue_reject"}`
+  - Number of frame enqueue attempts rejected by the fairness layer.
+- `telemt_me_fair_events_total{event="shed_drop"}`
+  - Number of frames dropped by the fairness layer while shedding load.
+- `telemt_me_fair_events_total{event="penalty"}`
+  - Number of fairness penalty events applied to flows.
+- `telemt_me_fair_events_total{event="downstream_stall"}`
+  - Number of times downstream delivery stalled after data was already queued.
+- `telemt_me_fair_events_total{event="retry_only_wakeup"}`
+  - Number of retry-only wakeups where the reader loop woke up specifically to re-attempt already queued fairness backlog.
+- `telemt_me_fair_events_total{event="retry_backlog_floor"}`
+  - Number of retry-only wakeups where the backlog-size floor increased the retry delay to avoid overly tight retry pacing on large queued media.
+- `telemt_me_fair_events_total{event="retry_pressure_floor_pressured"}`
+  - Number of retry-only wakeups where the minimum retry delay was raised because fairness pressure reached the `pressured` state.
+- `telemt_me_fair_events_total{event="retry_pressure_floor_shedding"}`
+  - Number of retry-only wakeups where the minimum retry delay was raised because fairness pressure reached the `shedding` state.
+- `telemt_me_fair_events_total{event="retry_pressure_floor_saturated"}`
+  - Number of retry-only wakeups where the minimum retry delay was raised because fairness pressure reached the `saturated` state.
+
+In a healthy ME scenario, it is normal for `scheduler_round`, `deficit_grant`, and sometimes `retry_only_wakeup` to grow over time. Persistent growth of `downstream_stall`, `enqueue_reject`, `shed_drop`, or sustained non-zero pressure states is a stronger sign of actual overload or unfair delivery.
+
 ### Too many open files
 - On a fresh Linux install the default open file limit is low; under load `telemt` may fail with `Accept error: Too many open files`
 - **Systemd**: add `LimitNOFILE=65536` to the `[Service]` section (already included in the example above)
