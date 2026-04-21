@@ -350,11 +350,7 @@ fn set_supplementary_groups(gid: Gid) -> Result<(), nix::Error> {
                 groups.as_ptr(),
             )
         };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Errno::last())
-        }
+        if rc == 0 { Ok(()) } else { Err(Errno::last()) }
     }
 
     #[cfg(not(target_os = "macos"))]

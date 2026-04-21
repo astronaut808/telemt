@@ -7,31 +7,42 @@ use tracing::{info, warn};
 
 use crate::config::ProxyConfig;
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
+use crate::startup::StartupTracker;
 use crate::transport::middle_proxy::MePool;
 
 const STARTUP_FALLBACK_AFTER: Duration = Duration::from_secs(80);
 const RUNTIME_FALLBACK_AFTER: Duration = Duration::from_secs(6);
+const COVERAGE_TRANSITION_LOG_RATE_LIMIT: Duration = Duration::from_secs(30);
 
 fn log_admission_coverage_transition(
     previous_configured_dcs: &BTreeSet<i16>,
     previous_ready_dcs: &BTreeSet<i16>,
     configured_dcs: &BTreeSet<i16>,
     ready_dcs: &BTreeSet<i16>,
+    now: Instant,
+    last_per_dc_log_at: &mut Option<Instant>,
 ) {
-    for dc in configured_dcs
-        .intersection(previous_ready_dcs)
-        .copied()
-        .filter(|dc| !ready_dcs.contains(dc))
-    {
-        warn!(dc, "ME target DC became unavailable for session routing");
-    }
+    let should_log_per_dc = last_per_dc_log_at.is_none_or(|last| {
+        now.saturating_duration_since(last) >= COVERAGE_TRANSITION_LOG_RATE_LIMIT
+    });
+    if should_log_per_dc {
+        for dc in configured_dcs
+            .intersection(previous_ready_dcs)
+            .copied()
+            .filter(|dc| !ready_dcs.contains(dc))
+        {
+            warn!(dc, "ME target DC became unavailable for session routing");
+        }
 
-    for dc in ready_dcs
-        .difference(previous_ready_dcs)
-        .copied()
-        .filter(|dc| configured_dcs.contains(dc))
-    {
-        info!(dc, "ME target DC recovered for session routing");
+        for dc in ready_dcs
+            .difference(previous_ready_dcs)
+            .copied()
+            .filter(|dc| configured_dcs.contains(dc))
+        {
+            info!(dc, "ME target DC recovered for session routing");
+        }
+
+        *last_per_dc_log_at = Some(now);
     }
 
     let was_partial = !previous_configured_dcs.is_empty()
@@ -61,6 +72,7 @@ pub(crate) async fn configure_admission_gate(
     route_runtime: Arc<RouteRuntimeController>,
     admission_tx: &watch::Sender<bool>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
+    startup_tracker: Arc<StartupTracker>,
 ) {
     if config.general.use_middle_proxy {
         if let Some(pool) = me_pool.as_ref() {
@@ -88,6 +100,7 @@ pub(crate) async fn configure_admission_gate(
             };
             admission_tx.send_replace(initial_gate_open);
             let _ = route_runtime.set_mode(initial_route_mode);
+            startup_tracker.set_degraded(!initial_ready).await;
             if initial_ready {
                 info!("Conditional-admission gate: open / ME pool READY");
             } else if initial_partial_ready {
@@ -106,6 +119,7 @@ pub(crate) async fn configure_admission_gate(
             let pool_for_gate = pool.clone();
             let admission_tx_gate = admission_tx.clone();
             let route_runtime_gate = route_runtime.clone();
+            let startup_tracker_gate = startup_tracker.clone();
             let mut config_rx_gate = config_rx.clone();
             let mut admission_poll_ms = config.general.me_admission_poll_ms.max(1);
             tokio::spawn(async move {
@@ -119,6 +133,8 @@ pub(crate) async fn configure_admission_gate(
                 };
                 let mut previous_configured_dcs = initial_coverage.configured_dcs;
                 let mut previous_ready_dcs = initial_coverage.ready_dcs;
+                let mut degraded = !initial_ready;
+                let mut last_per_dc_log_at = None;
                 loop {
                     tokio::select! {
                         changed = config_rx_gate.changed() => {
@@ -136,6 +152,7 @@ pub(crate) async fn configure_admission_gate(
                     let coverage = pool_for_gate.admission_coverage_snapshot().await;
                     let configured_dcs = coverage.configured_dcs;
                     let ready_dcs = coverage.ready_dcs;
+                    let now = Instant::now();
                     let ready =
                         !configured_dcs.is_empty() && ready_dcs.len() == configured_dcs.len();
                     let partial_ready =
@@ -147,11 +164,12 @@ pub(crate) async fn configure_admission_gate(
                             &previous_ready_dcs,
                             &configured_dcs,
                             &ready_dcs,
+                            now,
+                            &mut last_per_dc_log_at,
                         );
                         previous_configured_dcs = configured_dcs.clone();
                         previous_ready_dcs = ready_dcs.clone();
                     }
-                    let now = Instant::now();
                     let (next_gate_open, next_route_mode, next_fallback_reason) = if ready {
                         ready_observed = true;
                         not_ready_since = None;
@@ -181,6 +199,12 @@ pub(crate) async fn configure_admission_gate(
                         }
                     };
                     let next_fallback_active = next_fallback_reason.is_some();
+                    let next_degraded = !ready;
+
+                    if next_degraded != degraded {
+                        degraded = next_degraded;
+                        startup_tracker_gate.set_degraded(degraded).await;
+                    }
 
                     if next_route_mode != route_mode {
                         route_mode = next_route_mode;
@@ -251,6 +275,7 @@ pub(crate) async fn configure_admission_gate(
         } else {
             admission_tx.send_replace(false);
             let _ = route_runtime.set_mode(RelayRouteMode::Direct);
+            startup_tracker.set_degraded(true).await;
             warn!("Conditional-admission gate: closed / ME pool is UNAVAILABLE");
         }
     } else {

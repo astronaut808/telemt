@@ -728,6 +728,7 @@ async fn run_telemt_core(
         route_runtime.clone(),
         &admission_tx,
         config_rx.clone(),
+        startup_tracker.clone(),
     )
     .await;
     let _admission_tx_hold = admission_tx;
