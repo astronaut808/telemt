@@ -106,6 +106,66 @@ async fn read_with_progress_returns_error_from_failed_reader() {
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
 }
 
+#[tokio::test(start_paused = true)]
+async fn read_with_progress_timeout_extends_deadline_after_each_chunk() {
+    let (mut reader, mut writer) = duplex(16);
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 4];
+        read_exact_with_progress_timeout(
+            &mut reader,
+            &mut buf,
+            Duration::from_secs(1),
+            HandshakeStage::DirectMtproto,
+        )
+        .await
+        .unwrap();
+        buf
+    });
+
+    writer.write_all(&[0xAA, 0xBB]).await.unwrap();
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_millis(900)).await;
+    tokio::task::yield_now().await;
+
+    writer.write_all(&[0xCC, 0xDD]).await.unwrap();
+    tokio::task::yield_now().await;
+
+    let buf = tokio::time::timeout(Duration::from_secs(1), read_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(buf, [0xAA, 0xBB, 0xCC, 0xDD]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn read_with_progress_timeout_fails_after_progress_stops() {
+    let (mut reader, mut writer) = duplex(16);
+    let read_task = tokio::spawn(async move {
+        let mut buf = [0u8; 4];
+        read_exact_with_progress_timeout(
+            &mut reader,
+            &mut buf,
+            Duration::from_secs(1),
+            HandshakeStage::TlsPrefix,
+        )
+        .await
+        .unwrap_err()
+    });
+
+    writer.write_all(&[0x16, 0x03]).await.unwrap();
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(Duration::from_millis(1100)).await;
+    tokio::task::yield_now().await;
+
+    let err = tokio::time::timeout(Duration::from_secs(1), read_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+}
+
 #[test]
 fn handshake_timeout_with_mask_grace_handles_maximum_values_without_overflow() {
     let mut config = ProxyConfig::default();
