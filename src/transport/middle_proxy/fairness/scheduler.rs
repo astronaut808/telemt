@@ -138,6 +138,9 @@ impl WorkerFairnessState {
     }
 
     pub(crate) fn set_backpressure_enabled(&mut self, enabled: bool) {
+        if self.config.backpressure_enabled == enabled {
+            return;
+        }
         self.config.backpressure_enabled = enabled;
         self.config.pressure.backpressure_enabled = enabled;
         self.evaluate_pressure(Instant::now(), true);

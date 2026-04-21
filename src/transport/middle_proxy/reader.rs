@@ -262,9 +262,8 @@ pub(crate) async fn reader_loop(
         let fairshare_enabled = route_fairshare_enabled.load(Ordering::Relaxed);
         fairness.set_backpressure_enabled(backpressure_enabled);
         let fairness_has_backlog = should_schedule_fairness_retry(&fairness_snapshot);
-        let fairshare_active = fairshare_enabled || fairness_has_backlog;
         let mut tmp = [0u8; 65_536];
-        let backlog_retry_enabled = fairshare_active && fairness_has_backlog;
+        let backlog_retry_enabled = fairness_has_backlog;
         let backlog_retry_delay =
             fairness_retry_delay(reader_route_data_wait_ms.load(Ordering::Relaxed));
         let mut retry_only = false;
@@ -368,7 +367,7 @@ pub(crate) async fn reader_loop(
                 let data = body.slice(12..);
                 trace!(cid, flags, len = data.len(), "RPC_PROXY_ANS");
 
-                if fairshare_active {
+                if fairshare_enabled {
                     let admission = fairness.enqueue_data(cid, flags, data, Instant::now());
                     if !matches!(admission, AdmissionDecision::Admit) {
                         stats.increment_me_route_drop_queue_full();
