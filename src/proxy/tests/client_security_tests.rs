@@ -282,7 +282,7 @@ async fn user_connection_reservation_drop_enqueues_cleanup_synchronously() {
     assert_eq!(stats.get_user_curr_connects(&user), 1);
 
     let reservation =
-        UserConnectionReservation::new(stats.clone(), ip_tracker.clone(), user.clone(), ip);
+        UserConnectionReservation::new(stats.clone(), ip_tracker.clone(), user.clone(), ip, true);
 
     // Drop the reservation synchronously without any tokio::spawn/await yielding!
     drop(reservation);
@@ -320,6 +320,7 @@ async fn relay_task_abort_releases_user_gate_and_ip_reservation() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 8).await;
 
     let mut cfg = ProxyConfig::default();
     cfg.access.user_max_tcp_conns.insert(user.to_string(), 8);
@@ -437,6 +438,7 @@ async fn relay_cutover_releases_user_gate_and_ip_reservation() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 8).await;
 
     let mut cfg = ProxyConfig::default();
     cfg.access.user_max_tcp_conns.insert(user.to_string(), 8);
@@ -954,6 +956,36 @@ async fn reservation_limit_failure_does_not_leak_curr_connects_counter() {
     first.release().await;
     ip_tracker.drain_cleanup_queue().await;
 
+    assert_eq!(stats.get_user_curr_connects(user), 0);
+    assert_eq!(ip_tracker.get_active_ip_count(user).await, 0);
+}
+
+#[tokio::test]
+async fn unlimited_unique_ip_user_is_still_visible_in_active_ip_tracker() {
+    let user = "active-ip-observed-user";
+    let config = crate::config::ProxyConfig::default();
+    let stats = Arc::new(crate::stats::Stats::new());
+    let ip_tracker = Arc::new(crate::ip_tracker::UserIpTracker::new());
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 200, 17)), 50017);
+
+    let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+        user,
+        &config,
+        stats.clone(),
+        peer,
+        ip_tracker.clone(),
+    )
+    .await
+    .expect("reservation without unique-IP limit must succeed");
+
+    assert_eq!(stats.get_user_curr_connects(user), 1);
+    assert_eq!(
+        ip_tracker.get_active_ip_count(user).await,
+        1,
+        "active IP observability must not depend on unique-IP limit enforcement"
+    );
+
+    reservation.release().await;
     assert_eq!(stats.get_user_curr_connects(user), 0);
     assert_eq!(ip_tracker.get_active_ip_count(user).await, 0);
 }
@@ -2879,6 +2911,7 @@ async fn explicit_reservation_release_cleans_user_and_ip_immediately() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 4).await;
 
     let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
@@ -2917,6 +2950,7 @@ async fn explicit_reservation_release_does_not_double_decrement_on_drop() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 4).await;
 
     let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
@@ -2947,6 +2981,7 @@ async fn drop_fallback_eventually_cleans_user_and_ip_reservation() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 1).await;
 
     let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
@@ -3029,6 +3064,7 @@ async fn release_abort_storm_does_not_leak_user_or_ip_reservations() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, ATTEMPTS + 16).await;
 
     for idx in 0..ATTEMPTS {
         let peer = SocketAddr::new(
@@ -3079,6 +3115,7 @@ async fn release_abort_loop_preserves_immediate_same_ip_reacquire() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 1).await;
 
     for _ in 0..ITERATIONS {
         let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
@@ -3137,6 +3174,7 @@ async fn adversarial_mixed_release_drop_abort_wave_converges_to_zero() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, RESERVATIONS + 8).await;
 
     let mut reservations = Vec::with_capacity(RESERVATIONS);
     for idx in 0..RESERVATIONS {
@@ -3217,6 +3255,8 @@ async fn parallel_users_abort_release_isolation_preserves_independent_cleanup() 
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user_a, 64).await;
+    ip_tracker.set_user_limit(user_b, 64).await;
 
     let mut tasks = tokio::task::JoinSet::new();
     for idx in 0..64usize {
@@ -3278,6 +3318,7 @@ async fn concurrent_release_storm_leaves_zero_user_and_ip_footprint() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, RESERVATIONS + 8).await;
 
     let mut reservations = Vec::with_capacity(RESERVATIONS);
     for idx in 0..RESERVATIONS {
@@ -3332,6 +3373,7 @@ async fn relay_connect_error_releases_user_and_ip_before_return() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 8).await;
 
     let mut config = ProxyConfig::default();
     config.access.user_max_tcp_conns.insert(user.to_string(), 1);
@@ -3427,6 +3469,7 @@ async fn mixed_release_and_drop_same_ip_preserves_counter_correctness() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 1).await;
 
     let reservation_a = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
@@ -3487,6 +3530,7 @@ async fn drop_one_of_two_same_ip_reservations_keeps_ip_active() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 1).await;
 
     let reservation_a = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
@@ -3696,6 +3740,7 @@ async fn cross_thread_drop_uses_captured_runtime_for_ip_cleanup() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 8).await;
 
     let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
@@ -3740,6 +3785,7 @@ async fn immediate_reacquire_after_cross_thread_drop_succeeds() {
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
+    ip_tracker.set_user_limit(user, 1).await;
 
     let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
