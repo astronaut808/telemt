@@ -961,6 +961,36 @@ async fn reservation_limit_failure_does_not_leak_curr_connects_counter() {
 }
 
 #[tokio::test]
+async fn unlimited_unique_ip_user_is_still_visible_in_active_ip_tracker() {
+    let user = "active-ip-observed-user";
+    let config = crate::config::ProxyConfig::default();
+    let stats = Arc::new(crate::stats::Stats::new());
+    let ip_tracker = Arc::new(crate::ip_tracker::UserIpTracker::new());
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 200, 17)), 50017);
+
+    let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+        user,
+        &config,
+        stats.clone(),
+        peer,
+        ip_tracker.clone(),
+    )
+    .await
+    .expect("reservation without unique-IP limit must succeed");
+
+    assert_eq!(stats.get_user_curr_connects(user), 1);
+    assert_eq!(
+        ip_tracker.get_active_ip_count(user).await,
+        1,
+        "active IP observability must not depend on unique-IP limit enforcement"
+    );
+
+    reservation.release().await;
+    assert_eq!(stats.get_user_curr_connects(user), 0);
+    assert_eq!(ip_tracker.get_active_ip_count(user).await, 0);
+}
+
+#[tokio::test]
 async fn short_tls_probe_is_masked_through_client_pipeline() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = listener.local_addr().unwrap();

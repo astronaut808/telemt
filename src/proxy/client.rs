@@ -1612,22 +1612,19 @@ impl RunningClientHandler {
             });
         }
 
-        let tracks_ip = ip_tracker.get_user_limit(user).await.is_some();
-        if tracks_ip {
-            match ip_tracker.check_and_add(user, peer_addr.ip()).await {
-                Ok(()) => {}
-                Err(reason) => {
-                    stats.decrement_user_curr_connects(user);
-                    warn!(
-                        user = %user,
-                        ip = %peer_addr.ip(),
-                        reason = %reason,
-                        "IP limit exceeded"
-                    );
-                    return Err(ProxyError::ConnectionLimitExceeded {
-                        user: user.to_string(),
-                    });
-                }
+        match ip_tracker.check_and_add(user, peer_addr.ip()).await {
+            Ok(()) => {}
+            Err(reason) => {
+                stats.decrement_user_curr_connects(user);
+                warn!(
+                    user = %user,
+                    ip = %peer_addr.ip(),
+                    reason = %reason,
+                    "IP limit exceeded"
+                );
+                return Err(ProxyError::ConnectionLimitExceeded {
+                    user: user.to_string(),
+                });
             }
         }
 
@@ -1636,7 +1633,7 @@ impl RunningClientHandler {
             ip_tracker,
             user.to_string(),
             peer_addr.ip(),
-            tracks_ip,
+            true,
         ))
     }
 
@@ -1679,23 +1676,21 @@ impl RunningClientHandler {
             });
         }
 
-        if ip_tracker.get_user_limit(user).await.is_some() {
-            match ip_tracker.check_and_add(user, peer_addr.ip()).await {
-                Ok(()) => {
-                    ip_tracker.remove_ip(user, peer_addr.ip()).await;
-                }
-                Err(reason) => {
-                    stats.decrement_user_curr_connects(user);
-                    warn!(
-                        user = %user,
-                        ip = %peer_addr.ip(),
-                        reason = %reason,
-                        "IP limit exceeded"
-                    );
-                    return Err(ProxyError::ConnectionLimitExceeded {
-                        user: user.to_string(),
-                    });
-                }
+        match ip_tracker.check_and_add(user, peer_addr.ip()).await {
+            Ok(()) => {
+                ip_tracker.remove_ip(user, peer_addr.ip()).await;
+            }
+            Err(reason) => {
+                stats.decrement_user_curr_connects(user);
+                warn!(
+                    user = %user,
+                    ip = %peer_addr.ip(),
+                    reason = %reason,
+                    "IP limit exceeded"
+                );
+                return Err(ProxyError::ConnectionLimitExceeded {
+                    user: user.to_string(),
+                });
             }
         }
 
