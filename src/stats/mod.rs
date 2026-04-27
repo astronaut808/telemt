@@ -93,6 +93,13 @@ pub struct Stats {
     current_connections_direct: AtomicU64,
     current_connections_me: AtomicU64,
     handshake_timeouts: AtomicU64,
+    client_first_byte_idle_timeout_total: AtomicU64,
+    handshake_timeout_first_packet_prelude_total: AtomicU64,
+    handshake_timeout_tls_flow_total: AtomicU64,
+    handshake_timeout_direct_flow_total: AtomicU64,
+    tls_handshake_timeout_clienthello_body_total: AtomicU64,
+    tls_handshake_timeout_core_total: AtomicU64,
+    tls_handshake_timeout_post_serverhello_mtproto_total: AtomicU64,
     accept_permit_timeout_total: AtomicU64,
     conntrack_control_enabled_gauge: AtomicBool,
     conntrack_control_available_gauge: AtomicBool,
@@ -573,6 +580,55 @@ impl Stats {
     pub fn increment_handshake_timeouts(&self) {
         if self.telemetry_core_enabled() {
             self.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_client_first_byte_idle_timeout_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.client_first_byte_idle_timeout_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_handshake_timeout_first_packet_prelude_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.handshake_timeout_first_packet_prelude_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_handshake_timeout_tls_flow_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.handshake_timeout_tls_flow_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_handshake_timeout_direct_flow_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.handshake_timeout_direct_flow_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_tls_handshake_timeout_clienthello_body_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.tls_handshake_timeout_clienthello_body_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_tls_handshake_timeout_core_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.tls_handshake_timeout_core_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn increment_tls_handshake_timeout_post_serverhello_mtproto_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.tls_handshake_timeout_post_serverhello_mtproto_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2410,6 +2466,34 @@ impl Stats {
 
     pub fn get_handshake_timeouts(&self) -> u64 {
         self.handshake_timeouts.load(Ordering::Relaxed)
+    }
+    pub fn get_client_first_byte_idle_timeout_total(&self) -> u64 {
+        self.client_first_byte_idle_timeout_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_handshake_timeout_first_packet_prelude_total(&self) -> u64 {
+        self.handshake_timeout_first_packet_prelude_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_handshake_timeout_tls_flow_total(&self) -> u64 {
+        self.handshake_timeout_tls_flow_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_handshake_timeout_direct_flow_total(&self) -> u64 {
+        self.handshake_timeout_direct_flow_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_tls_handshake_timeout_clienthello_body_total(&self) -> u64 {
+        self.tls_handshake_timeout_clienthello_body_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_tls_handshake_timeout_core_total(&self) -> u64 {
+        self.tls_handshake_timeout_core_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_tls_handshake_timeout_post_serverhello_mtproto_total(&self) -> u64 {
+        self.tls_handshake_timeout_post_serverhello_mtproto_total
+            .load(Ordering::Relaxed)
     }
     pub fn get_upstream_connect_attempt_total(&self) -> u64 {
         self.upstream_connect_attempt_total.load(Ordering::Relaxed)

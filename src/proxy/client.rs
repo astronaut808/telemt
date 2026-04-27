@@ -25,6 +25,40 @@ enum HandshakeOutcome {
     NeedsMasking(PostHandshakeFuture),
 }
 
+#[derive(Clone, Copy)]
+enum HandshakeTimeoutPhase {
+    FirstPacketPrelude,
+    TlsFlow,
+    DirectFlow,
+}
+
+impl HandshakeTimeoutPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPacketPrelude => "first_packet_prelude",
+            Self::TlsFlow => "tls_flow",
+            Self::DirectFlow => "direct_flow",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TlsHandshakeTimeoutStage {
+    ClientHelloBody,
+    Core,
+    PostServerhelloMtproto,
+}
+
+impl TlsHandshakeTimeoutStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientHelloBody => "clienthello_body",
+            Self::Core => "core",
+            Self::PostServerhelloMtproto => "post_serverhello_mtproto",
+        }
+    }
+}
+
 #[must_use = "UserConnectionReservation must be kept alive to retain user/IP reservation until release or drop"]
 struct UserConnectionReservation {
     stats: Arc<Stats>,
@@ -373,6 +407,34 @@ fn record_handshake_failure_class(
     record_beobachten_class(beobachten, config, peer_ip, class);
 }
 
+fn increment_handshake_timeout_phase(stats: &Stats, phase: HandshakeTimeoutPhase) {
+    match phase {
+        HandshakeTimeoutPhase::FirstPacketPrelude => {
+            stats.increment_handshake_timeout_first_packet_prelude_total();
+        }
+        HandshakeTimeoutPhase::TlsFlow => {
+            stats.increment_handshake_timeout_tls_flow_total();
+        }
+        HandshakeTimeoutPhase::DirectFlow => {
+            stats.increment_handshake_timeout_direct_flow_total();
+        }
+    }
+}
+
+fn increment_tls_handshake_timeout_stage(stats: &Stats, stage: TlsHandshakeTimeoutStage) {
+    match stage {
+        TlsHandshakeTimeoutStage::ClientHelloBody => {
+            stats.increment_tls_handshake_timeout_clienthello_body_total();
+        }
+        TlsHandshakeTimeoutStage::Core => {
+            stats.increment_tls_handshake_timeout_core_total();
+        }
+        TlsHandshakeTimeoutStage::PostServerhelloMtproto => {
+            stats.increment_tls_handshake_timeout_post_serverhello_mtproto_total();
+        }
+    }
+}
+
 #[inline]
 fn increment_bad_on_unknown_tls_sni(stats: &Stats, error: &ProxyError) {
     if matches!(error, ProxyError::UnknownTlsSni) {
@@ -552,6 +614,7 @@ where
                 return Err(ProxyError::Io(e));
             }
             Err(_) => {
+                stats.increment_client_first_byte_idle_timeout_total();
                 debug!(
                     peer = %real_peer,
                     idle_secs = first_byte_idle_secs,
@@ -567,6 +630,8 @@ where
     let config_for_timeout = config.clone();
     let beobachten_for_timeout = beobachten.clone();
     let peer_for_timeout = real_peer.ip();
+    let mut timeout_phase = HandshakeTimeoutPhase::FirstPacketPrelude;
+    let mut tls_timeout_stage = TlsHandshakeTimeoutStage::ClientHelloBody;
 
     // Phase 2: active handshake (with timeout after the first client byte)
     let outcome = match timeout(handshake_timeout, async {
@@ -582,6 +647,7 @@ where
         debug!(peer = %real_peer, is_tls = is_tls, "Handshake type detected");
 
         if is_tls {
+            timeout_phase = HandshakeTimeoutPhase::TlsFlow;
             let tls_len = u16::from_be_bytes([first_bytes[3], first_bytes[4]]) as usize;
 
             // RFC 8446 §5.1: TLS record payload MUST NOT exceed 2^14 (16_384) bytes.
@@ -610,6 +676,7 @@ where
 
             let mut handshake = vec![0u8; 5 + tls_len];
             handshake[..5].copy_from_slice(&first_bytes);
+            tls_timeout_stage = TlsHandshakeTimeoutStage::ClientHelloBody;
             let body_read = match read_with_progress(&mut stream, &mut handshake[5..]).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -648,6 +715,7 @@ where
             }
 
             let (read_half, write_half) = tokio::io::split(stream);
+            tls_timeout_stage = TlsHandshakeTimeoutStage::Core;
 
             let (mut tls_reader, tls_writer, tls_user) = match handle_tls_handshake_with_shared(
                 &handshake, read_half, write_half, real_peer,
@@ -674,6 +742,7 @@ where
             };
 
             debug!(peer = %peer, "Reading MTProto handshake through TLS");
+            tls_timeout_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto;
             let mtproto_data = tls_reader.read_exact(HANDSHAKE_LEN).await?;
             let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..].try_into()
                 .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
@@ -724,6 +793,7 @@ where
                 ),
             )))
         } else {
+            timeout_phase = HandshakeTimeoutPhase::DirectFlow;
             if !config.general.modes.classic && !config.general.modes.secure {
                 debug!(peer = %real_peer, "Non-TLS modes disabled");
                 stats.increment_connects_bad_with_class("direct_modes_disabled");
@@ -801,8 +871,21 @@ where
         }
         Err(_) => {
             stats_for_timeout.increment_handshake_timeouts();
+            increment_handshake_timeout_phase(stats_for_timeout.as_ref(), timeout_phase);
+            if matches!(timeout_phase, HandshakeTimeoutPhase::TlsFlow) {
+                increment_tls_handshake_timeout_stage(stats_for_timeout.as_ref(), tls_timeout_stage);
+            }
             stats_for_timeout.increment_handshake_failure_class("timeout");
-            debug!(peer = %peer, "Handshake timeout");
+            if matches!(timeout_phase, HandshakeTimeoutPhase::TlsFlow) {
+                debug!(
+                    peer = %peer,
+                    phase = timeout_phase.as_str(),
+                    tls_stage = tls_timeout_stage.as_str(),
+                    "Handshake timeout"
+                );
+            } else {
+                debug!(peer = %peer, phase = timeout_phase.as_str(), "Handshake timeout");
+            }
             record_beobachten_class(
                 &beobachten_for_timeout,
                 &config_for_timeout,
@@ -1091,6 +1174,7 @@ impl RunningClientHandler {
                     return Err(ProxyError::Io(e));
                 }
                 Err(_) => {
+                    self.stats.increment_client_first_byte_idle_timeout_total();
                     debug!(
                         peer = %self.peer,
                         idle_secs = first_byte_idle_secs,
@@ -1107,6 +1191,8 @@ impl RunningClientHandler {
         let beobachten_for_timeout = self.beobachten.clone();
         let peer_for_timeout = self.peer.ip();
         let peer_for_log = self.peer;
+        let mut timeout_phase = HandshakeTimeoutPhase::FirstPacketPrelude;
+        let mut tls_timeout_stage = TlsHandshakeTimeoutStage::ClientHelloBody;
 
         let outcome = match timeout(handshake_timeout, async {
             let mut first_bytes = [0u8; 5];
@@ -1123,8 +1209,11 @@ impl RunningClientHandler {
             debug!(peer = %peer, is_tls = is_tls, "Handshake type detected");
 
             if is_tls {
-                self.handle_tls_client(first_bytes, local_addr).await
+                timeout_phase = HandshakeTimeoutPhase::TlsFlow;
+                self.handle_tls_client(first_bytes, local_addr, &mut tls_timeout_stage)
+                    .await
             } else {
+                timeout_phase = HandshakeTimeoutPhase::DirectFlow;
                 self.handle_direct_client(first_bytes, local_addr).await
             }
         })
@@ -1144,8 +1233,25 @@ impl RunningClientHandler {
             }
             Err(_) => {
                 stats.increment_handshake_timeouts();
+                increment_handshake_timeout_phase(stats.as_ref(), timeout_phase);
+                if matches!(timeout_phase, HandshakeTimeoutPhase::TlsFlow) {
+                    increment_tls_handshake_timeout_stage(stats.as_ref(), tls_timeout_stage);
+                }
                 stats.increment_handshake_failure_class("timeout");
-                debug!(peer = %peer_for_log, "Handshake timeout");
+                if matches!(timeout_phase, HandshakeTimeoutPhase::TlsFlow) {
+                    debug!(
+                        peer = %peer_for_log,
+                        phase = timeout_phase.as_str(),
+                        tls_stage = tls_timeout_stage.as_str(),
+                        "Handshake timeout"
+                    );
+                } else {
+                    debug!(
+                        peer = %peer_for_log,
+                        phase = timeout_phase.as_str(),
+                        "Handshake timeout"
+                    );
+                }
                 record_beobachten_class(
                     &beobachten_for_timeout,
                     &config_for_timeout,
@@ -1163,6 +1269,7 @@ impl RunningClientHandler {
         mut self,
         first_bytes: [u8; 5],
         local_addr: SocketAddr,
+        tls_timeout_stage: &mut TlsHandshakeTimeoutStage,
     ) -> Result<HandshakeOutcome> {
         let peer = self.peer;
 
@@ -1197,6 +1304,7 @@ impl RunningClientHandler {
 
         let mut handshake = vec![0u8; 5 + tls_len];
         handshake[..5].copy_from_slice(&first_bytes);
+        *tls_timeout_stage = TlsHandshakeTimeoutStage::ClientHelloBody;
         let body_read = match read_with_progress(&mut self.stream, &mut handshake[5..]).await {
             Ok(n) => n,
             Err(e) => {
@@ -1241,6 +1349,7 @@ impl RunningClientHandler {
         let buffer_pool = self.buffer_pool.clone();
 
         let (read_half, write_half) = self.stream.into_split();
+        *tls_timeout_stage = TlsHandshakeTimeoutStage::Core;
 
         let (mut tls_reader, tls_writer, tls_user) = match handle_tls_handshake_with_shared(
             &handshake,
@@ -1275,6 +1384,7 @@ impl RunningClientHandler {
         };
 
         debug!(peer = %peer, "Reading MTProto handshake through TLS");
+        *tls_timeout_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto;
         let mtproto_data = tls_reader.read_exact(HANDSHAKE_LEN).await?;
         let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
             .try_into()
