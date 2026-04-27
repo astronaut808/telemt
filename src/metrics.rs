@@ -471,6 +471,96 @@ async fn render_metrics(
 
     let _ = writeln!(
         out,
+        "# HELP telemt_client_first_byte_idle_timeout_total Connections closed after waiting for the first client byte beyond the idle budget"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_client_first_byte_idle_timeout_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_client_first_byte_idle_timeout_total {}",
+        if core_enabled {
+            stats.get_client_first_byte_idle_timeout_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_handshake_timeout_phase_total Handshake timeouts by handshake progress phase"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_handshake_timeout_phase_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_handshake_timeout_phase_total{{phase=\"first_packet_prelude\"}} {}",
+        if core_enabled {
+            stats.get_handshake_timeout_first_packet_prelude_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_handshake_timeout_phase_total{{phase=\"tls_flow\"}} {}",
+        if core_enabled {
+            stats.get_handshake_timeout_tls_flow_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_handshake_timeout_phase_total{{phase=\"direct_flow\"}} {}",
+        if core_enabled {
+            stats.get_handshake_timeout_direct_flow_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_tls_handshake_timeout_stage_total TLS handshake timeouts by internal TLS-stage progress"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_tls_handshake_timeout_stage_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_tls_handshake_timeout_stage_total{{stage=\"clienthello_body\"}} {}",
+        if core_enabled {
+            stats.get_tls_handshake_timeout_clienthello_body_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_tls_handshake_timeout_stage_total{{stage=\"core\"}} {}",
+        if core_enabled {
+            stats.get_tls_handshake_timeout_core_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_tls_handshake_timeout_stage_total{{stage=\"post_serverhello_mtproto\"}} {}",
+        if core_enabled {
+            stats.get_tls_handshake_timeout_post_serverhello_mtproto_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
         "# HELP telemt_auth_expensive_checks_total Expensive authentication candidate checks executed during handshake validation"
     );
     let _ = writeln!(out, "# TYPE telemt_auth_expensive_checks_total counter");
