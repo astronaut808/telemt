@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Post-handshake future (relay phase, runs outside handshake timeout)
 type PostHandshakeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -680,7 +680,7 @@ where
             let body_read = match read_with_progress(&mut stream, &mut handshake[5..]).await {
                 Ok(n) => n,
                 Err(e) => {
-                    debug!(peer = %real_peer, error = %e, tls_len = tls_len, "TLS ClientHello body read failed; engaging masking fallback");
+                    info!(peer = %real_peer, error = %e, tls_len = tls_len, "TLS ClientHello body read failed; engaging masking fallback");
                     stats.increment_connects_bad_with_class("tls_clienthello_read_error");
                     maybe_apply_mask_reject_delay(&config).await;
                     let initial_len = 5;
@@ -698,7 +698,7 @@ where
             };
 
             if body_read < tls_len {
-                debug!(peer = %real_peer, got = body_read, expected = tls_len, "Truncated in-range TLS ClientHello; engaging masking fallback");
+                info!(peer = %real_peer, got = body_read, expected = tls_len, "Truncated in-range TLS ClientHello; engaging masking fallback");
                 stats.increment_connects_bad_with_class("tls_clienthello_truncated");
                 maybe_apply_mask_reject_delay(&config).await;
                 let initial_len = 5 + body_read;
@@ -877,15 +877,15 @@ where
             }
             stats_for_timeout.increment_handshake_failure_class("timeout");
             if matches!(timeout_phase, HandshakeTimeoutPhase::TlsFlow) {
-                debug!(
-                    peer = %peer,
-                    phase = timeout_phase.as_str(),
-                    tls_stage = tls_timeout_stage.as_str(),
-                    "Handshake timeout"
-                );
-            } else {
-                debug!(peer = %peer, phase = timeout_phase.as_str(), "Handshake timeout");
-            }
+                    info!(
+                        peer = %peer,
+                        phase = timeout_phase.as_str(),
+                        tls_stage = tls_timeout_stage.as_str(),
+                        "Handshake timeout"
+                    );
+                } else {
+                    info!(peer = %peer, phase = timeout_phase.as_str(), "Handshake timeout");
+                }
             record_beobachten_class(
                 &beobachten_for_timeout,
                 &config_for_timeout,
@@ -1239,14 +1239,14 @@ impl RunningClientHandler {
                 }
                 stats.increment_handshake_failure_class("timeout");
                 if matches!(timeout_phase, HandshakeTimeoutPhase::TlsFlow) {
-                    debug!(
+                    info!(
                         peer = %peer_for_log,
                         phase = timeout_phase.as_str(),
                         tls_stage = tls_timeout_stage.as_str(),
                         "Handshake timeout"
                     );
                 } else {
-                    debug!(
+                    info!(
                         peer = %peer_for_log,
                         phase = timeout_phase.as_str(),
                         "Handshake timeout"
@@ -1308,7 +1308,7 @@ impl RunningClientHandler {
         let body_read = match read_with_progress(&mut self.stream, &mut handshake[5..]).await {
             Ok(n) => n,
             Err(e) => {
-                debug!(peer = %peer, error = %e, tls_len = tls_len, "TLS ClientHello body read failed; engaging masking fallback");
+                info!(peer = %peer, error = %e, tls_len = tls_len, "TLS ClientHello body read failed; engaging masking fallback");
                 self.stats
                     .increment_connects_bad_with_class("tls_clienthello_read_error");
                 maybe_apply_mask_reject_delay(&self.config).await;
@@ -1326,7 +1326,7 @@ impl RunningClientHandler {
         };
 
         if body_read < tls_len {
-            debug!(peer = %peer, got = body_read, expected = tls_len, "Truncated in-range TLS ClientHello; engaging masking fallback");
+            info!(peer = %peer, got = body_read, expected = tls_len, "Truncated in-range TLS ClientHello; engaging masking fallback");
             self.stats
                 .increment_connects_bad_with_class("tls_clienthello_truncated");
             maybe_apply_mask_reject_delay(&self.config).await;
