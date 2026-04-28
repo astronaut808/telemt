@@ -245,6 +245,58 @@ fn post_tls_mtproto_timeout(config: &ProxyConfig) -> Duration {
     Duration::from_secs(config.timeouts.client_handshake).saturating_add(Duration::from_secs(30))
 }
 
+struct PostTlsMtprotoTimeout {
+    bytes_received: usize,
+}
+
+enum PostTlsMtprotoReadError {
+    Io(std::io::Error),
+    Timeout(PostTlsMtprotoTimeout),
+}
+
+async fn read_post_tls_mtproto_handshake<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    overall_timeout: Duration,
+    idle_gap_timeout: Duration,
+) -> std::result::Result<[u8; HANDSHAKE_LEN], PostTlsMtprotoReadError> {
+    let mut handshake = [0u8; HANDSHAKE_LEN];
+    let mut received = 0usize;
+    let overall_deadline = tokio::time::Instant::now() + overall_timeout;
+
+    while received < HANDSHAKE_LEN {
+        let now = tokio::time::Instant::now();
+        if now >= overall_deadline {
+            return Err(PostTlsMtprotoReadError::Timeout(PostTlsMtprotoTimeout {
+                bytes_received: received,
+            }));
+        }
+
+        let remaining_overall = overall_deadline.saturating_duration_since(now);
+        let read_budget = remaining_overall.min(idle_gap_timeout);
+
+        let read_result = timeout(read_budget, reader.read(&mut handshake[received..])).await;
+        match read_result {
+            Ok(Ok(0)) => {
+                return Err(PostTlsMtprotoReadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("expected {} bytes, got {}", HANDSHAKE_LEN, received),
+                )));
+            }
+            Ok(Ok(n)) => {
+                received += n;
+            }
+            Ok(Err(e)) => return Err(PostTlsMtprotoReadError::Io(e)),
+            Err(_) => {
+                return Err(PostTlsMtprotoReadError::Timeout(PostTlsMtprotoTimeout {
+                    bytes_received: received,
+                }));
+            }
+        }
+    }
+
+    Ok(handshake)
+}
+
 fn effective_client_first_byte_idle_secs(config: &ProxyConfig, shared: &ProxySharedState) -> u64 {
     let idle_secs = config.timeouts.client_first_byte_idle_secs;
     if idle_secs == 0 {
@@ -753,10 +805,16 @@ where
                 async move {
                     debug!(peer = %real_peer, "Reading MTProto handshake through TLS");
                     let mtproto_timeout = post_tls_mtproto_timeout(&config);
-                    let mtproto_data = match timeout(mtproto_timeout, tls_reader.read_exact(HANDSHAKE_LEN)).await {
-                        Ok(Ok(data)) => data,
-                        Ok(Err(e)) => return Err(ProxyError::Io(e)),
-                        Err(_) => {
+                    let mtproto_idle_gap_timeout = Duration::from_secs(config.timeouts.client_handshake);
+                    let mtproto_handshake = match read_post_tls_mtproto_handshake(
+                        &mut tls_reader,
+                        mtproto_timeout,
+                        mtproto_idle_gap_timeout,
+                    )
+                    .await
+                    {
+                        Ok(handshake) => handshake,
+                        Err(PostTlsMtprotoReadError::Timeout(timeout)) => {
                             stats.increment_handshake_timeouts();
                             increment_handshake_timeout_phase(stats.as_ref(), HandshakeTimeoutPhase::TlsFlow);
                             increment_tls_handshake_timeout_stage(
@@ -769,16 +827,15 @@ where
                                 phase = HandshakeTimeoutPhase::TlsFlow.as_str(),
                                 tls_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto.as_str(),
                                 timeout_secs = mtproto_timeout.as_secs(),
+                                idle_gap_timeout_secs = mtproto_idle_gap_timeout.as_secs(),
+                                bytes_received = timeout.bytes_received,
                                 "Handshake timeout"
                             );
                             record_beobachten_class(&beobachten, &config, real_peer.ip(), "other");
                             return Err(ProxyError::TgHandshakeTimeout);
                         }
+                        Err(PostTlsMtprotoReadError::Io(e)) => return Err(ProxyError::Io(e)),
                     };
-
-                    let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
-                        .try_into()
-                        .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
 
                     let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
                         &mtproto_handshake, tls_reader, tls_writer, real_peer,
@@ -1425,10 +1482,16 @@ impl RunningClientHandler {
             async move {
                 debug!(peer = %peer, "Reading MTProto handshake through TLS");
                 let mtproto_timeout = post_tls_mtproto_timeout(&config);
-                let mtproto_data = match timeout(mtproto_timeout, tls_reader.read_exact(HANDSHAKE_LEN)).await {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(e)) => return Err(ProxyError::Io(e)),
-                    Err(_) => {
+                let mtproto_idle_gap_timeout = Duration::from_secs(config.timeouts.client_handshake);
+                let mtproto_handshake = match read_post_tls_mtproto_handshake(
+                    &mut tls_reader,
+                    mtproto_timeout,
+                    mtproto_idle_gap_timeout,
+                )
+                .await
+                {
+                    Ok(handshake) => handshake,
+                    Err(PostTlsMtprotoReadError::Timeout(timeout)) => {
                         stats.increment_handshake_timeouts();
                         increment_handshake_timeout_phase(stats.as_ref(), HandshakeTimeoutPhase::TlsFlow);
                         increment_tls_handshake_timeout_stage(
@@ -1441,16 +1504,15 @@ impl RunningClientHandler {
                             phase = HandshakeTimeoutPhase::TlsFlow.as_str(),
                             tls_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto.as_str(),
                             timeout_secs = mtproto_timeout.as_secs(),
+                            idle_gap_timeout_secs = mtproto_idle_gap_timeout.as_secs(),
+                            bytes_received = timeout.bytes_received,
                             "Handshake timeout"
                         );
                         record_beobachten_class(&self.beobachten, &config, peer.ip(), "other");
                         return Err(ProxyError::TgHandshakeTimeout);
                     }
+                    Err(PostTlsMtprotoReadError::Io(e)) => return Err(ProxyError::Io(e)),
                 };
-
-                let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
-                    .try_into()
-                    .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
 
                 let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
                     &mtproto_handshake,
