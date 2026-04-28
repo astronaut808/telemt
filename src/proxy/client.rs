@@ -237,6 +237,14 @@ fn handshake_timeout_with_mask_grace(config: &ProxyConfig) -> Duration {
     }
 }
 
+fn post_tls_mtproto_timeout(config: &ProxyConfig) -> Duration {
+    // Apple/Darwin resume paths can delay the first encrypted MTProto bytes
+    // after the TLS facade succeeds, so we grant a bounded extra budget only
+    // to this post-TLS continuation stage instead of widening all handshake
+    // phases globally.
+    Duration::from_secs(config.timeouts.client_handshake).saturating_add(Duration::from_secs(30))
+}
+
 fn effective_client_first_byte_idle_secs(config: &ProxyConfig, shared: &ProxySharedState) -> u64 {
     let idle_secs = config.timeouts.client_first_byte_idle_secs;
     if idle_secs == 0 {
@@ -741,56 +749,86 @@ where
                 }
             };
 
-            debug!(peer = %peer, "Reading MTProto handshake through TLS");
-            tls_timeout_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto;
-            let mtproto_data = tls_reader.read_exact(HANDSHAKE_LEN).await?;
-            let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..].try_into()
-                .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
-
-            let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
-                &mtproto_handshake, tls_reader, tls_writer, real_peer,
-                &config, &replay_checker, true, Some(tls_user.as_str()),
-                shared.as_ref(),
-            ).await {
-                HandshakeResult::Success(result) => result,
-                HandshakeResult::BadClient { reader, writer } => {
-                    // MTProto failed after TLS ServerHello was already sent.
-                    // Switch fallback relay back to raw transport so the mask
-                    // backend receives valid TLS records (not unwrapped payload).
-                    let (reader, pending_plaintext) = reader.into_inner_with_pending_plaintext();
-                    let writer = writer.into_inner();
-                    let pending_record = if pending_plaintext.is_empty() {
-                        Vec::new()
-                    } else {
-                        wrap_tls_application_record(&pending_plaintext)
-                    };
-                    let reader = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(pending_record), reader);
-                    stats.increment_connects_bad_with_class("tls_mtproto_bad_client");
-                    debug!(
-                        peer = %peer,
-                        "Authenticated TLS session failed MTProto validation; engaging masking fallback"
-                    );
-                    return Ok(masking_outcome(
-                        reader,
-                        writer,
-                        Vec::new(),
-                        real_peer,
-                        local_addr,
-                        config.clone(),
-                        beobachten.clone(),
-                    ));
-                }
-                HandshakeResult::Error(e) => return Err(e),
-            };
-
             Ok(HandshakeOutcome::NeedsRelay(Box::pin(
-                RunningClientHandler::handle_authenticated_static_with_shared(
-                    crypto_reader, crypto_writer, success,
-                    upstream_manager, stats, config, buffer_pool, rng, me_pool,
-                    route_runtime.clone(),
-                    local_addr, real_peer, ip_tracker.clone(),
-                    shared.clone(),
-                ),
+                async move {
+                    debug!(peer = %real_peer, "Reading MTProto handshake through TLS");
+                    let mtproto_timeout = post_tls_mtproto_timeout(&config);
+                    let mtproto_data = match timeout(mtproto_timeout, tls_reader.read_exact(HANDSHAKE_LEN)).await {
+                        Ok(Ok(data)) => data,
+                        Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                        Err(_) => {
+                            stats.increment_handshake_timeouts();
+                            increment_handshake_timeout_phase(stats.as_ref(), HandshakeTimeoutPhase::TlsFlow);
+                            increment_tls_handshake_timeout_stage(
+                                stats.as_ref(),
+                                TlsHandshakeTimeoutStage::PostServerhelloMtproto,
+                            );
+                            stats.increment_handshake_failure_class("timeout");
+                            info!(
+                                peer = %real_peer,
+                                phase = HandshakeTimeoutPhase::TlsFlow.as_str(),
+                                tls_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto.as_str(),
+                                timeout_secs = mtproto_timeout.as_secs(),
+                                "Handshake timeout"
+                            );
+                            record_beobachten_class(&beobachten, &config, real_peer.ip(), "other");
+                            return Err(ProxyError::TgHandshakeTimeout);
+                        }
+                    };
+
+                    let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
+                        .try_into()
+                        .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
+
+                    let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
+                        &mtproto_handshake, tls_reader, tls_writer, real_peer,
+                        &config, &replay_checker, true, Some(tls_user.as_str()),
+                        shared.as_ref(),
+                    ).await {
+                        HandshakeResult::Success(result) => result,
+                        HandshakeResult::BadClient { reader, writer } => {
+                            // MTProto failed after TLS ServerHello was already sent.
+                            // Switch fallback relay back to raw transport so the mask
+                            // backend receives valid TLS records (not unwrapped payload).
+                            let (reader, pending_plaintext) = reader.into_inner_with_pending_plaintext();
+                            let writer = writer.into_inner();
+                            let pending_record = if pending_plaintext.is_empty() {
+                                Vec::new()
+                            } else {
+                                wrap_tls_application_record(&pending_plaintext)
+                            };
+                            let reader = tokio::io::AsyncReadExt::chain(std::io::Cursor::new(pending_record), reader);
+                            stats.increment_connects_bad_with_class("tls_mtproto_bad_client");
+                            debug!(
+                                peer = %real_peer,
+                                "Authenticated TLS session failed MTProto validation; engaging masking fallback"
+                            );
+                            let outcome = masking_outcome(
+                                reader,
+                                writer,
+                                Vec::new(),
+                                real_peer,
+                                local_addr,
+                                config.clone(),
+                                beobachten.clone(),
+                            );
+                            if let HandshakeOutcome::NeedsMasking(fut) = outcome {
+                                return fut.await;
+                            }
+                            unreachable!("masking_outcome must return NeedsMasking");
+                        }
+                        HandshakeResult::Error(e) => return Err(e),
+                    };
+
+                    RunningClientHandler::handle_authenticated_static_with_shared(
+                        crypto_reader, crypto_writer, success,
+                        upstream_manager, stats, config, buffer_pool, rng, me_pool,
+                        route_runtime.clone(),
+                        local_addr, real_peer, ip_tracker.clone(),
+                        shared.clone(),
+                    )
+                    .await
+                }
             )))
         } else {
             timeout_phase = HandshakeTimeoutPhase::DirectFlow;
@@ -1383,75 +1421,104 @@ impl RunningClientHandler {
             }
         };
 
-        debug!(peer = %peer, "Reading MTProto handshake through TLS");
-        *tls_timeout_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto;
-        let mtproto_data = tls_reader.read_exact(HANDSHAKE_LEN).await?;
-        let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
-            .try_into()
-            .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
-
-        let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
-            &mtproto_handshake,
-            tls_reader,
-            tls_writer,
-            peer,
-            &config,
-            &replay_checker,
-            true,
-            Some(tls_user.as_str()),
-            self.shared.as_ref(),
-        )
-        .await
-        {
-            HandshakeResult::Success(result) => result,
-            HandshakeResult::BadClient { reader, writer } => {
-                // MTProto failed after TLS ServerHello was already sent.
-                // Switch fallback relay back to raw transport so the mask
-                // backend receives valid TLS records (not unwrapped payload).
-                let (reader, pending_plaintext) = reader.into_inner_with_pending_plaintext();
-                let writer = writer.into_inner();
-                let pending_record = if pending_plaintext.is_empty() {
-                    Vec::new()
-                } else {
-                    wrap_tls_application_record(&pending_plaintext)
-                };
-                let reader =
-                    tokio::io::AsyncReadExt::chain(std::io::Cursor::new(pending_record), reader);
-                stats.increment_connects_bad_with_class("tls_mtproto_bad_client");
-                debug!(
-                    peer = %peer,
-                    "Authenticated TLS session failed MTProto validation; engaging masking fallback"
-                );
-                return Ok(masking_outcome(
-                    reader,
-                    writer,
-                    Vec::new(),
-                    peer,
-                    local_addr,
-                    config.clone(),
-                    self.beobachten.clone(),
-                ));
-            }
-            HandshakeResult::Error(e) => return Err(e),
-        };
-
         Ok(HandshakeOutcome::NeedsRelay(Box::pin(
-            Self::handle_authenticated_static_with_shared(
-                crypto_reader,
-                crypto_writer,
-                success,
-                self.upstream_manager,
-                self.stats,
-                self.config,
-                buffer_pool,
-                self.rng,
-                self.me_pool,
-                self.route_runtime.clone(),
-                local_addr,
-                peer,
-                self.ip_tracker,
-                self.shared,
-            ),
+            async move {
+                debug!(peer = %peer, "Reading MTProto handshake through TLS");
+                let mtproto_timeout = post_tls_mtproto_timeout(&config);
+                let mtproto_data = match timeout(mtproto_timeout, tls_reader.read_exact(HANDSHAKE_LEN)).await {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(e)) => return Err(ProxyError::Io(e)),
+                    Err(_) => {
+                        stats.increment_handshake_timeouts();
+                        increment_handshake_timeout_phase(stats.as_ref(), HandshakeTimeoutPhase::TlsFlow);
+                        increment_tls_handshake_timeout_stage(
+                            stats.as_ref(),
+                            TlsHandshakeTimeoutStage::PostServerhelloMtproto,
+                        );
+                        stats.increment_handshake_failure_class("timeout");
+                        info!(
+                            peer = %peer,
+                            phase = HandshakeTimeoutPhase::TlsFlow.as_str(),
+                            tls_stage = TlsHandshakeTimeoutStage::PostServerhelloMtproto.as_str(),
+                            timeout_secs = mtproto_timeout.as_secs(),
+                            "Handshake timeout"
+                        );
+                        record_beobachten_class(&self.beobachten, &config, peer.ip(), "other");
+                        return Err(ProxyError::TgHandshakeTimeout);
+                    }
+                };
+
+                let mtproto_handshake: [u8; HANDSHAKE_LEN] = mtproto_data[..]
+                    .try_into()
+                    .map_err(|_| ProxyError::InvalidHandshake("Short MTProto handshake".into()))?;
+
+                let (crypto_reader, crypto_writer, success) = match handle_mtproto_handshake_with_shared(
+                    &mtproto_handshake,
+                    tls_reader,
+                    tls_writer,
+                    peer,
+                    &config,
+                    &replay_checker,
+                    true,
+                    Some(tls_user.as_str()),
+                    self.shared.as_ref(),
+                )
+                .await
+                {
+                    HandshakeResult::Success(result) => result,
+                    HandshakeResult::BadClient { reader, writer } => {
+                        // MTProto failed after TLS ServerHello was already sent.
+                        // Switch fallback relay back to raw transport so the mask
+                        // backend receives valid TLS records (not unwrapped payload).
+                        let (reader, pending_plaintext) = reader.into_inner_with_pending_plaintext();
+                        let writer = writer.into_inner();
+                        let pending_record = if pending_plaintext.is_empty() {
+                            Vec::new()
+                        } else {
+                            wrap_tls_application_record(&pending_plaintext)
+                        };
+                        let reader =
+                            tokio::io::AsyncReadExt::chain(std::io::Cursor::new(pending_record), reader);
+                        stats.increment_connects_bad_with_class("tls_mtproto_bad_client");
+                        debug!(
+                            peer = %peer,
+                            "Authenticated TLS session failed MTProto validation; engaging masking fallback"
+                        );
+                        let outcome = masking_outcome(
+                            reader,
+                            writer,
+                            Vec::new(),
+                            peer,
+                            local_addr,
+                            config.clone(),
+                            self.beobachten.clone(),
+                        );
+                        if let HandshakeOutcome::NeedsMasking(fut) = outcome {
+                            return fut.await;
+                        }
+                        unreachable!("masking_outcome must return NeedsMasking");
+                    }
+                    HandshakeResult::Error(e) => return Err(e),
+                };
+
+                Self::handle_authenticated_static_with_shared(
+                    crypto_reader,
+                    crypto_writer,
+                    success,
+                    self.upstream_manager,
+                    self.stats,
+                    self.config,
+                    buffer_pool,
+                    self.rng,
+                    self.me_pool,
+                    self.route_runtime.clone(),
+                    local_addr,
+                    peer,
+                    self.ip_tracker,
+                    self.shared,
+                )
+                .await
+            },
         )))
     }
 
