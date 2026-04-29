@@ -3117,7 +3117,7 @@ async fn render_metrics(
             );
         }
 
-        let ip_stats = ip_tracker.get_stats().await;
+        let ip_stats = ip_tracker.get_stats_snapshot().await;
         let ip_counts: HashMap<String, usize> = ip_stats
             .into_iter()
             .map(|(user, count, _)| (user, count))
@@ -3129,7 +3129,7 @@ async fn render_metrics(
         unique_users.extend(ip_counts.keys().cloned());
         let unique_users_vec: Vec<String> = unique_users.iter().cloned().collect();
         let recent_counts = ip_tracker
-            .get_recent_counts_for_users(&unique_users_vec)
+            .get_recent_counts_for_users_snapshot(&unique_users_vec)
             .await;
 
         let _ = writeln!(

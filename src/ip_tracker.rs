@@ -9,9 +9,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, RwLockWriteGuard};
 
 use crate::config::UserMaxUniqueIpsMode;
+
+const CLEANUP_DRAIN_BATCH_LIMIT: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct UserIpTracker {
@@ -86,16 +88,27 @@ impl UserIpTracker {
     }
 
     pub(crate) async fn drain_cleanup_queue(&self) {
-        // Serialize queue draining and active-IP mutation so check-and-add cannot
-        // observe stale active entries that are already queued for removal.
-        let _drain_guard = self.cleanup_drain_lock.lock().await;
+        let Ok(_drain_guard) = self.cleanup_drain_lock.try_lock() else {
+            return;
+        };
+
         let to_remove = {
             match self.cleanup_queue.lock() {
                 Ok(mut queue) => {
                     if queue.is_empty() {
                         return;
                     }
-                    std::mem::take(&mut *queue)
+                    let mut drained =
+                        HashMap::with_capacity(queue.len().min(CLEANUP_DRAIN_BATCH_LIMIT));
+                    for _ in 0..CLEANUP_DRAIN_BATCH_LIMIT {
+                        let Some(key) = queue.keys().next().cloned() else {
+                            break;
+                        };
+                        if let Some(count) = queue.remove(&key) {
+                            drained.insert(key, count);
+                        }
+                    }
+                    drained
                 }
                 Err(poisoned) => {
                     let mut queue = poisoned.into_inner();
@@ -103,12 +116,24 @@ impl UserIpTracker {
                         self.cleanup_queue.clear_poison();
                         return;
                     }
-                    let drained = std::mem::take(&mut *queue);
+                    let mut drained =
+                        HashMap::with_capacity(queue.len().min(CLEANUP_DRAIN_BATCH_LIMIT));
+                    for _ in 0..CLEANUP_DRAIN_BATCH_LIMIT {
+                        let Some(key) = queue.keys().next().cloned() else {
+                            break;
+                        };
+                        if let Some(count) = queue.remove(&key) {
+                            drained.insert(key, count);
+                        }
+                    }
                     self.cleanup_queue.clear_poison();
                     drained
                 }
             }
         };
+        if to_remove.is_empty() {
+            return;
+        }
 
         let mut active_ips = self.active_ips.write().await;
         for ((user, ip), pending_count) in to_remove {
@@ -137,6 +162,24 @@ impl UserIpTracker {
             .as_secs()
     }
 
+    async fn active_and_recent_write(
+        &self,
+    ) -> (
+        RwLockWriteGuard<'_, HashMap<String, HashMap<IpAddr, usize>>>,
+        RwLockWriteGuard<'_, HashMap<String, HashMap<IpAddr, Instant>>>,
+    ) {
+        loop {
+            let active_ips = self.active_ips.write().await;
+            match self.recent_ips.try_write() {
+                Ok(recent_ips) => return (active_ips, recent_ips),
+                Err(_) => {
+                    drop(active_ips);
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
     async fn maybe_compact_empty_users(&self) {
         const COMPACT_INTERVAL_SECS: u64 = 60;
         let now_epoch_secs = Self::now_epoch_secs();
@@ -157,10 +200,9 @@ impl UserIpTracker {
             return;
         }
 
-        let mut active_ips = self.active_ips.write().await;
-        let mut recent_ips = self.recent_ips.write().await;
         let window = *self.limit_window.read().await;
         let now = Instant::now();
+        let (mut active_ips, mut recent_ips) = self.active_and_recent_write().await;
 
         for user_recent in recent_ips.values_mut() {
             Self::prune_recent(user_recent, now, window);
@@ -261,12 +303,10 @@ impl UserIpTracker {
         let window = *self.limit_window.read().await;
         let now = Instant::now();
 
-        let mut active_ips = self.active_ips.write().await;
+        let (mut active_ips, mut recent_ips) = self.active_and_recent_write().await;
         let user_active = active_ips
             .entry(username.to_string())
             .or_insert_with(HashMap::new);
-
-        let mut recent_ips = self.recent_ips.write().await;
         let user_recent = recent_ips
             .entry(username.to_string())
             .or_insert_with(HashMap::new);
@@ -326,6 +366,13 @@ impl UserIpTracker {
 
     pub async fn get_recent_counts_for_users(&self, users: &[String]) -> HashMap<String, usize> {
         self.drain_cleanup_queue().await;
+        self.get_recent_counts_for_users_snapshot(users).await
+    }
+
+    pub(crate) async fn get_recent_counts_for_users_snapshot(
+        &self,
+        users: &[String],
+    ) -> HashMap<String, usize> {
         let window = *self.limit_window.read().await;
         let now = Instant::now();
         let recent_ips = self.recent_ips.read().await;
@@ -400,19 +447,29 @@ impl UserIpTracker {
 
     pub async fn get_stats(&self) -> Vec<(String, usize, usize)> {
         self.drain_cleanup_queue().await;
+        self.get_stats_snapshot().await
+    }
+
+    pub(crate) async fn get_stats_snapshot(&self) -> Vec<(String, usize, usize)> {
         let active_ips = self.active_ips.read().await;
+        let active_counts = active_ips
+            .iter()
+            .map(|(username, user_ips)| (username.clone(), user_ips.len()))
+            .collect::<Vec<_>>();
+        drop(active_ips);
+
         let max_ips = self.max_ips.read().await;
         let default_max_ips = *self.default_max_ips.read().await;
 
-        let mut stats = Vec::new();
-        for (username, user_ips) in active_ips.iter() {
+        let mut stats = Vec::with_capacity(active_counts.len());
+        for (username, active_count) in active_counts {
             let limit = max_ips
-                .get(username)
+                .get(&username)
                 .copied()
                 .filter(|limit| *limit > 0)
                 .or((default_max_ips > 0).then_some(default_max_ips))
                 .unwrap_or(0);
-            stats.push((username.clone(), user_ips.len(), limit));
+            stats.push((username, active_count, limit));
         }
 
         stats.sort_by(|a, b| a.0.cmp(&b.0));

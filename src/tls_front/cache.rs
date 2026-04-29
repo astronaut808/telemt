@@ -348,11 +348,17 @@ mod tests {
     #[tokio::test]
     async fn test_take_full_cert_budget_for_ip_zero_ttl_always_allows_full_payload() {
         let cache = TlsFrontCache::new(&["example.com".to_string()], 1024, "tlsfront-test-cache");
-        let ip: IpAddr = "127.0.0.1".parse().expect("ip");
         let ttl = Duration::ZERO;
 
-        assert!(cache.take_full_cert_budget_for_ip(ip, ttl).await);
-        assert!(cache.take_full_cert_budget_for_ip(ip, ttl).await);
+        for idx in 0..100_000u32 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                10,
+                ((idx >> 16) & 0xff) as u8,
+                ((idx >> 8) & 0xff) as u8,
+                (idx & 0xff) as u8,
+            ));
+            assert!(cache.take_full_cert_budget_for_ip(ip, ttl).await);
+        }
 
         assert!(cache.full_cert_sent.read().await.is_empty());
     }
