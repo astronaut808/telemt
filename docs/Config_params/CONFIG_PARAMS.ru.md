@@ -162,6 +162,8 @@
 | [`log_level`](#log_level) | `"debug"`, `"verbose"`, `"normal"`, or `"silent"` | `"normal"` |
 | [`disable_colors`](#disable_colors) | `bool` | `false` |
 | [`me_socks_kdf_policy`](#me_socks_kdf_policy) | `"strict"` or `"compat"` | `"strict"` |
+| [`me_route_backpressure_enabled`](#me_route_backpressure_enabled) | `bool` | `false` |
+| [`me_route_fairshare_enabled`](#me_route_fairshare_enabled) | `bool` | `false` |
 | [`me_route_backpressure_base_timeout_ms`](#me_route_backpressure_base_timeout_ms) | `u64` | `25` |
 | [`me_route_backpressure_high_timeout_ms`](#me_route_backpressure_high_timeout_ms) | `u64` | `120` |
 | [`me_route_backpressure_high_watermark_pct`](#me_route_backpressure_high_watermark_pct) | `u8` | `80` |
@@ -975,6 +977,24 @@
     [general]
     me_socks_kdf_policy = "strict"
     ```
+## me_route_backpressure_enabled
+  - **Ограничения / валидация**: `bool`.
+  - **Описание**: Включает адаптивные таймауты записи маршрута в зависимости от заполнения канала.
+  - **Example**:
+
+    ```toml
+    [general]
+    me_route_backpressure_enabled = false
+    ```
+## me_route_fairshare_enabled
+  - **Ограничения / валидация**: `bool`.
+  - **Описание**: Включает справедливое распределение нагрузки маршрутизации между writer-потоками.
+  - **Example**:
+
+    ```toml
+    [general]
+    me_route_fairshare_enabled = false
+    ```
 ## me_route_backpressure_base_timeout_ms
   - **Ограничения / валидация**: Должно быть в пределах `1..=5000` (миллисекунд).
   - **Описание**: Базовый таймаут (в миллисекундах) ожидания при режиме **backpressure** (ситуация, при которой данные обрабатываются медленне, чем получаются) для отправки через ME route-channel.
@@ -1755,6 +1775,7 @@
 | [`metrics_whitelist`](#metrics_whitelist) | `IpNetwork[]` | `["127.0.0.1/32", "::1/128"]` |
 | [`max_connections`](#max_connections) | `u32` | `10000` |
 | [`accept_permit_timeout_ms`](#accept_permit_timeout_ms) | `u64` | `250` |
+| [`listen_backlog`](#listen_backlog) | `u32` | `1024` |
 
 ## port
   - **Ограничения / валидация**: `u16`.
@@ -1764,6 +1785,15 @@
     ```toml
     [server]
     port = 443
+    ```
+## listen_backlog
+  - **Ограничения / валидация**: `u32`. `0` использует системный backlog по умолчанию.
+  - **Описание**: Значение backlog, передаваемое в `listen(2)` для TCP-сокетов.
+  - **Example**:
+
+    ```toml
+    [server]
+    listen_backlog = 1024
     ```
 ## listen_addr_ipv4
   - **Ограничения / валидация**: `String` (необязательный параметр). Если задан, должен содержать валидный IPv4-адрес в формате строки.
@@ -2011,6 +2041,7 @@
 | [`runtime_edge_top_n`](#runtime_edge_top_n) | `usize` | `10` |
 | [`runtime_edge_events_capacity`](#runtime_edge_events_capacity) | `usize` | `256` |
 | [`read_only`](#read_only) | `bool` | `false` |
+| [`gray_action`](#gray_action) | `"drop"`, `"api"`, or `"200"` | `"drop"` |
 
 ## enabled
   - **Ограничения / валидация**: `bool`.
@@ -2020,6 +2051,15 @@
     ```toml
     [server.api]
     enabled = true
+    ```
+## gray_action
+  - **Ограничения / валидация**: `"drop"`, `"api"` или `"200"`.
+  - **Описание**: Политика ответа API в «серых» (ограниченных) состояниях: сброс, обычный API-ответ, либо `200 OK`.
+  - **Example**:
+
+    ```toml
+    [server.api]
+    gray_action = "drop"
     ```
 ## listen
   - **Ограничения / валидация**: `String`. Должно быть в формате `IP:PORT`.
@@ -2213,6 +2253,15 @@
     [timeouts]
     client_handshake = 30
     ```
+## client_first_byte_idle_secs
+  - **Ограничения / валидация**: `u64` (секунды). `0` отключает проверку простоя до первого байта.
+  - **Описание**: Максимальное время ожидания первого байта полезной нагрузки от клиента после установления сессии.
+  - **Example**:
+
+    ```toml
+    [timeouts]
+    client_first_byte_idle_secs = 300
+    ```
 ## relay_idle_policy_v2_enabled
   - **Ограничения / валидация**: `bool`.
   - **Описание**: Включает политику простоя клиента для промежуточного узла.
@@ -2317,6 +2366,7 @@
 | [`server_hello_delay_max_ms`](#server_hello_delay_max_ms) | `u64` | `0` |
 | [`tls_new_session_tickets`](#tls_new_session_tickets) | `u8` | `0` |
 | [`tls_full_cert_ttl_secs`](#tls_full_cert_ttl_secs) | `u64` | `90` |
+| [`serverhello_compact`](#serverhello_compact) | `bool` | `false` |
 | [`alpn_enforce`](#alpn_enforce) | `bool` | `true` |
 | [`mask_proxy_protocol`](#mask_proxy_protocol) | `u8` | `0` |
 | [`mask_shape_hardening`](#mask_shape_hardening) | `bool` | `true` |
@@ -2492,6 +2542,15 @@
     ```toml
     [censorship]
     tls_full_cert_ttl_secs = 90
+    ```
+## serverhello_compact
+  - **Ограничения / валидация**: `bool`.
+  - **Описание**: Включает компактный профиль ServerHello/Fake-TLS для снижения сигнатуры размера ответа.
+  - **Example**:
+
+    ```toml
+    [censorship]
+    serverhello_compact = false
     ```
 ## alpn_enforce
   - **Ограничения / валидация**: `bool`.
@@ -2837,6 +2896,8 @@
 | [`replay_check_len`](#replay_check_len) | `usize` | `65536` |
 | [`replay_window_secs`](#replay_window_secs) | `u64` | `120` |
 | [`ignore_time_skew`](#ignore_time_skew) | `bool` | `false` |
+| [`user_rate_limits`](#user_rate_limits) | `Map<String, RateLimitBps>` | `{}` |
+| [`cidr_rate_limits`](#cidr_rate_limits) | `Map<IpNetwork, RateLimitBps>` | `{}` |
 
 ## users
   - **Ограничения / валидация**: Не должно быть пустым (должен существовать хотя бы один пользователь). Каждое значение должно состоять **ровно из 32 шестнадцатеричных символов**.
@@ -2965,6 +3026,24 @@
     ```
 
 
+## user_rate_limits
+  - **Ограничения / валидация**: Таблица `username -> { up_bps, down_bps }`. Должно быть ненулевое значение хотя бы в одном направлении.
+  - **Описание**: Персональные лимиты скорости по пользователям в байтах/сек для отправки (`up_bps`) и получения (`down_bps`).
+  - **Example**:
+
+    ```toml
+    [access.user_rate_limits]
+    alice = { up_bps = 1048576, down_bps = 2097152 }
+    ```
+## cidr_rate_limits
+  - **Ограничения / валидация**: Таблица `CIDR -> { up_bps, down_bps }`. CIDR должен корректно разбираться как `IpNetwork`; хотя бы одно направление должно быть ненулевым.
+  - **Описание**: Лимиты скорости для подсетей источников, применяются поверх пользовательских ограничений.
+  - **Example**:
+
+    ```toml
+    [access.cidr_rate_limits]
+    "203.0.113.0/24" = { up_bps = 0, down_bps = 1048576 }
+    ```
 # [[upstreams]]
 
 
