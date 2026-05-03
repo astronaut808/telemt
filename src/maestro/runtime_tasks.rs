@@ -21,6 +21,7 @@ use crate::startup::{
 use crate::stats::beobachten::BeobachtenStore;
 use crate::stats::telemetry::TelemetryPolicy;
 use crate::stats::{ReplayChecker, Stats};
+use crate::tls_front::TlsFrontCache;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::{MePool, MeReinitTrigger};
 
@@ -328,6 +329,7 @@ pub(crate) async fn spawn_metrics_if_configured(
     beobachten: Arc<BeobachtenStore>,
     shared_state: Arc<ProxySharedState>,
     ip_tracker: Arc<UserIpTracker>,
+    tls_cache: Option<Arc<TlsFrontCache>>,
     config_rx: watch::Receiver<Arc<ProxyConfig>>,
 ) {
     // metrics_listen takes precedence; fall back to metrics_port for backward compat.
@@ -363,6 +365,7 @@ pub(crate) async fn spawn_metrics_if_configured(
         let shared_state = shared_state.clone();
         let config_rx_metrics = config_rx.clone();
         let ip_tracker_metrics = ip_tracker.clone();
+        let tls_cache_metrics = tls_cache.clone();
         let whitelist = config.server.metrics_whitelist.clone();
         let listen_backlog = config.server.listen_backlog;
         tokio::spawn(async move {
@@ -374,6 +377,7 @@ pub(crate) async fn spawn_metrics_if_configured(
                 beobachten,
                 shared_state,
                 ip_tracker_metrics,
+                tls_cache_metrics,
                 config_rx_metrics,
                 whitelist,
             )

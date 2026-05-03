@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::tls_front::types::{
-    CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsFetchResult,
+    CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsFetchResult, TlsProfileSource,
 };
 
 const FULL_CERT_SENT_SWEEP_INTERVAL_SECS: u64 = 30;
@@ -40,6 +40,30 @@ pub struct TlsFrontCache {
     full_cert_sent_shards: Vec<RwLock<HashMap<IpAddr, Instant>>>,
     full_cert_sent_last_sweep_epoch_secs: AtomicU64,
     disk_path: PathBuf,
+}
+
+/// Read-only health view for one configured TLS front domain.
+#[derive(Debug, Clone)]
+pub(crate) struct TlsFrontProfileHealth {
+    pub(crate) domain: String,
+    pub(crate) source: &'static str,
+    pub(crate) age_seconds: u64,
+    pub(crate) is_default: bool,
+    pub(crate) has_cert_info: bool,
+    pub(crate) has_cert_payload: bool,
+    pub(crate) app_data_records: usize,
+    pub(crate) ticket_records: usize,
+    pub(crate) change_cipher_spec_count: u8,
+    pub(crate) total_app_data_len: usize,
+}
+
+fn profile_source_label(source: TlsProfileSource) -> &'static str {
+    match source {
+        TlsProfileSource::Default => "default",
+        TlsProfileSource::Raw => "raw",
+        TlsProfileSource::Rustls => "rustls",
+        TlsProfileSource::Merged => "merged",
+    }
 }
 
 #[allow(dead_code)]
@@ -91,6 +115,51 @@ impl TlsFrontCache {
 
     pub async fn contains_domain(&self, domain: &str) -> bool {
         self.memory.read().await.contains_key(domain)
+    }
+
+    pub(crate) async fn profile_health_snapshot(
+        &self,
+        domains: &[String],
+        max_domains: usize,
+    ) -> (Vec<TlsFrontProfileHealth>, usize) {
+        let guard = self.memory.read().await;
+        let now = SystemTime::now();
+        let mut snapshot = Vec::with_capacity(domains.len().min(max_domains));
+        let mut suppressed = 0usize;
+
+        for domain in domains {
+            if snapshot.len() >= max_domains {
+                suppressed = suppressed.saturating_add(1);
+                continue;
+            }
+
+            let cached = guard
+                .get(domain)
+                .cloned()
+                .unwrap_or_else(|| self.default.clone());
+            let behavior = &cached.behavior_profile;
+            let age_seconds = now
+                .duration_since(cached.fetched_at)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+
+            snapshot.push(TlsFrontProfileHealth {
+                domain: domain.clone(),
+                source: profile_source_label(behavior.source),
+                age_seconds,
+                is_default: cached.domain == "default",
+                has_cert_info: cached.cert_info.is_some(),
+                has_cert_payload: cached.cert_payload.is_some(),
+                app_data_records: cached.app_data_records_sizes.len().max(
+                    behavior.app_data_record_sizes.len(),
+                ),
+                ticket_records: behavior.ticket_record_sizes.len(),
+                change_cipher_spec_count: behavior.change_cipher_spec_count,
+                total_app_data_len: cached.total_app_data_len,
+            });
+        }
+
+        (snapshot, suppressed)
     }
 
     fn full_cert_sent_shard_index(client_ip: IpAddr) -> usize {

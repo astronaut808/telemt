@@ -126,9 +126,50 @@ openssl s_client -connect ORIGIN_IP:443 -servername YOUR_DOMAIN </dev/null
 2. Дайте ему получить TLS front profile data для выбранного домена.
 3. Если `tls_front_dir` хранится persistently, убедитесь, что TLS front cache заполнен.
 
-Persisted cache artifacts полезны, но не обязательны, если packet capture уже показывают runtime result.
+Сохранённые артефакты кэша полезны, но не обязательны, если packet capture уже показывает результат в runtime.
 
-### 4. Снять direct-origin trace
+### 4. Проверить метрики состояния TLS-front profile
+
+Если endpoint метрик включён, перед проверкой через packet capture можно быстро проверить состояние TLS-front profile:
+
+```bash
+curl -s http://127.0.0.1:9999/metrics | grep -E 'telemt_tls_front_profile|telemt_tls_fetch_profile_cache|telemt_tls_front_full_cert'
+```
+
+Метрики состояния профиля показывают runtime-состояние настроенных TLS-front доменов:
+
+- `telemt_tls_front_profile_domains` показывает количество настроенных, экспортируемых и скрытых из-за лимита доменов.
+- `telemt_tls_front_profile_info` показывает источник профиля и флаги доступных данных по каждому домену.
+- `telemt_tls_front_profile_age_seconds` показывает возраст закешированного профиля.
+- `telemt_tls_front_profile_app_data_records` показывает количество закешированных AppData records.
+- `telemt_tls_front_profile_ticket_records` показывает количество закешированных ticket-like tail records.
+- `telemt_tls_front_profile_change_cipher_spec_records` показывает закешированное количество ChangeCipherSpec records.
+- `telemt_tls_front_profile_app_data_bytes` показывает общий размер закешированных AppData bytes.
+
+Интерпретация:
+
+- `source="merged"` или `source="raw"` означает, что используются реальные данные TLS-профиля.
+- `source="default"` или `is_default="true"` означает, что домен сейчас работает на synthetic default fallback.
+- `has_cert_payload="true"` означает, что certificate payload доступен для TLS emulation.
+- Ненулевые AppData/ticket/CCS counters показывают захваченную форму server flight.
+
+Пример здорового состояния:
+
+```text
+telemt_tls_front_profile_domains{status="configured"} 1
+telemt_tls_front_profile_domains{status="emitted"} 1
+telemt_tls_front_profile_domains{status="suppressed"} 0
+telemt_tls_front_profile_info{domain="itunes.apple.com",source="merged",is_default="false",has_cert_info="true",has_cert_payload="true"} 1
+telemt_tls_front_profile_age_seconds{domain="itunes.apple.com"} 20
+telemt_tls_front_profile_app_data_records{domain="itunes.apple.com"} 3
+telemt_tls_front_profile_ticket_records{domain="itunes.apple.com"} 1
+telemt_tls_front_profile_change_cipher_spec_records{domain="itunes.apple.com"} 1
+telemt_tls_front_profile_app_data_bytes{domain="itunes.apple.com"} 5240
+```
+
+Эти метрики не доказывают побайтную эквивалентность с origin. Это эксплуатационный сигнал состояния: настроенный домен действительно основан на реальных закешированных данных профиля, а не на default fallback.
+
+### 5. Снять direct-origin trace
 
 С отдельной клиентской машины подключитесь напрямую к origin:
 
@@ -142,7 +183,7 @@ Capture:
 sudo tcpdump -i any -w origin-direct.pcap host ORIGIN_IP and port 443
 ```
 
-### 5. Снять Telemt FakeTLS success-path trace
+### 6. Снять Telemt FakeTLS success-path trace
 
 Теперь подключитесь к Telemt через реальный Telegram client с `ee` proxy link, который указывает на Telemt instance.
 
@@ -154,7 +195,7 @@ Capture:
 sudo tcpdump -i any -w telemt-emulated.pcap host TELEMT_IP and port 443
 ```
 
-### 6. Декодировать структуру TLS records
+### 7. Декодировать структуру TLS records
 
 Используйте `tshark`, чтобы вывести record-level structure:
 
@@ -182,7 +223,7 @@ tshark -r telemt-emulated.pcap -Y "tls.record" -T fields \
 - `20` = ChangeCipherSpec
 - `23` = ApplicationData
 
-### 7. Собрать сравнительную таблицу
+### 8. Собрать сравнительную таблицу
 
 Обычно достаточно короткой таблицы такого вида:
 

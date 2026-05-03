@@ -128,7 +128,48 @@ Recommended for cleaner testing:
 
 Persisted cache artifacts are useful, but they are not required if packet captures already demonstrate the runtime result.
 
-### 4. Capture a direct-origin trace
+### 4. Check TLS-front profile health metrics
+
+If the metrics endpoint is enabled, check the TLS-front profile health before packet-capture validation:
+
+```bash
+curl -s http://127.0.0.1:9999/metrics | grep -E 'telemt_tls_front_profile|telemt_tls_fetch_profile_cache|telemt_tls_front_full_cert'
+```
+
+The profile-health metrics expose the runtime state of configured TLS front domains:
+
+- `telemt_tls_front_profile_domains` shows configured, emitted, and suppressed domain series.
+- `telemt_tls_front_profile_info` shows profile source and feature flags per domain.
+- `telemt_tls_front_profile_age_seconds` shows cached profile age.
+- `telemt_tls_front_profile_app_data_records` shows cached AppData record count.
+- `telemt_tls_front_profile_ticket_records` shows cached ticket-like tail record count.
+- `telemt_tls_front_profile_change_cipher_spec_records` shows cached ChangeCipherSpec count.
+- `telemt_tls_front_profile_app_data_bytes` shows total cached AppData bytes.
+
+Interpretation:
+
+- `source="merged"` or `source="raw"` means real TLS profile data is being used.
+- `source="default"` or `is_default="true"` means the domain currently uses the synthetic default fallback.
+- `has_cert_payload="true"` means certificate payload data is available for TLS emulation.
+- Non-zero AppData/ticket/CCS counters show captured server-flight shape.
+
+Example healthy output:
+
+```text
+telemt_tls_front_profile_domains{status="configured"} 1
+telemt_tls_front_profile_domains{status="emitted"} 1
+telemt_tls_front_profile_domains{status="suppressed"} 0
+telemt_tls_front_profile_info{domain="itunes.apple.com",source="merged",is_default="false",has_cert_info="true",has_cert_payload="true"} 1
+telemt_tls_front_profile_age_seconds{domain="itunes.apple.com"} 20
+telemt_tls_front_profile_app_data_records{domain="itunes.apple.com"} 3
+telemt_tls_front_profile_ticket_records{domain="itunes.apple.com"} 1
+telemt_tls_front_profile_change_cipher_spec_records{domain="itunes.apple.com"} 1
+telemt_tls_front_profile_app_data_bytes{domain="itunes.apple.com"} 5240
+```
+
+These metrics do not prove byte-level origin equivalence. They are an operational health signal that the configured domain is backed by real cached profile data instead of default fallback data.
+
+### 5. Capture a direct-origin trace
 
 From a separate client host, connect directly to the origin:
 
@@ -142,7 +183,7 @@ Capture with:
 sudo tcpdump -i any -w origin-direct.pcap host ORIGIN_IP and port 443
 ```
 
-### 5. Capture a Telemt FakeTLS success-path trace
+### 6. Capture a Telemt FakeTLS success-path trace
 
 Now connect to Telemt with a real Telegram client through an `ee` proxy link that targets the Telemt instance.
 
@@ -154,7 +195,7 @@ Capture with:
 sudo tcpdump -i any -w telemt-emulated.pcap host TELEMT_IP and port 443
 ```
 
-### 6. Decode TLS record structure
+### 7. Decode TLS record structure
 
 Use `tshark` to print record-level structure:
 
@@ -182,7 +223,7 @@ Focus on the server flight after ClientHello:
 - `20` = ChangeCipherSpec
 - `23` = ApplicationData
 
-### 7. Build a comparison table
+### 8. Build a comparison table
 
 A compact table like the following is usually enough:
 
