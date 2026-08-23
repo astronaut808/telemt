@@ -21,6 +21,10 @@ impl WebSession {
             return;
         };
         let generation = manager.active_generation();
+        if !*generation.admission_rx.borrow() {
+            self.stream_finished(stream_id, peer_port);
+            return;
+        }
         let Ok(connection_permit) = generation.max_connections.clone().try_acquire_owned() else {
             manager.record_stream_rejected();
             self.stream_finished(stream_id, peer_port);

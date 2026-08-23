@@ -305,8 +305,18 @@ impl RuntimeGeneration {
 #[cfg(test)]
 /// Builds a lightweight runtime generation without network startup tasks.
 pub(crate) fn test_runtime_generation(id: u64, config: ProxyConfig) -> Arc<RuntimeGeneration> {
-    let (config_tx, config_rx) = watch::channel(Arc::new(config.clone()));
     let (_admission_tx, admission_rx) = watch::channel(true);
+    test_runtime_generation_with_admission(id, config, admission_rx)
+}
+
+#[cfg(test)]
+/// Builds a lightweight runtime generation with a controllable admission gate.
+pub(crate) fn test_runtime_generation_with_admission(
+    id: u64,
+    config: ProxyConfig,
+    admission_rx: watch::Receiver<bool>,
+) -> Arc<RuntimeGeneration> {
+    let (config_tx, config_rx) = watch::channel(Arc::new(config.clone()));
     let stats = Arc::new(Stats::new());
     let upstream_manager = Arc::new(UpstreamManager::new(
         config.upstreams,

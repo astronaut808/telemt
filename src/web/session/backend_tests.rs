@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 use super::*;
 use crate::config::{
@@ -12,7 +13,9 @@ use crate::config::{
     WebSecretMode,
 };
 use crate::crypto::{AesCtr, sha256};
-use crate::maestro::generation::{RuntimeGeneration, test_runtime_generation};
+use crate::maestro::generation::{
+    RuntimeGeneration, test_runtime_generation_with_admission,
+};
 use crate::protocol::constants::{
     DC_IDX_POS, HANDSHAKE_LEN, IV_LEN, PREKEY_LEN, PROTO_TAG_POS, ProtoTag, SKIP_LEN,
 };
@@ -23,6 +26,7 @@ struct TestRuntime {
     session: Arc<WebSession>,
     manager: Arc<WebProcessRuntime>,
     generation: Arc<RuntimeGeneration>,
+    admission_tx: watch::Sender<bool>,
 }
 
 impl TestRuntime {
@@ -106,7 +110,8 @@ fn test_runtime_with_dc(
     config.rebuild_runtime_user_auth().unwrap();
     let limits = config.web.limits.clone();
     let timeouts = config.web.timeouts.clone();
-    let generation = test_runtime_generation(1, config);
+    let (admission_tx, admission_rx) = watch::channel(true);
+    let generation = test_runtime_generation_with_admission(1, config, admission_rx);
     let manager = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
     let session = WebSession::new(
         Arc::downgrade(&manager),
@@ -121,6 +126,7 @@ fn test_runtime_with_dc(
         session,
         manager,
         generation,
+        admission_tx,
     }
 }
 
@@ -259,6 +265,39 @@ async fn delayed_valid_handshake_reaches_the_authenticated_relay() {
     assert!(runtime.session.state.lock().streams.contains_key(&1));
     assert_eq!(runtime.generation.stats.get_connects_bad(), 0);
     assert_eq!(runtime.generation.stats.get_handshake_timeouts(), 0);
+
+    runtime.shutdown().await;
+    drop(upstream);
+}
+
+#[tokio::test]
+async fn closed_generation_admission_rejects_web_stream_before_backend() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let runtime = test_runtime_with_dc(WebCarrier::Https, 1, Some(listener.local_addr().unwrap()));
+    runtime.admission_tx.send_replace(false);
+
+    assert_eq!(runtime.process_frame(1, 1, FrameType::Open, &[]), Ok(1));
+    settle_tasks().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err(),
+        "WEB stream bypassed the closed generation admission gate"
+    );
+    assert!(!runtime.session.state.lock().streams.contains_key(&1));
+    assert_eq!(runtime.generation.max_connections.available_permits(), 64);
+
+    runtime.admission_tx.send_replace(true);
+    assert_eq!(runtime.process_frame(2, 2, FrameType::Open, &[]), Ok(2));
+    assert_eq!(
+        runtime.process_frame(2, 3, FrameType::Data, &valid_plain_handshake()),
+        Ok(3)
+    );
+    let (upstream, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .expect("a new WEB stream did not start after admission reopened")
+        .unwrap();
+    assert_eq!(runtime.generation.max_connections.available_permits(), 63);
 
     runtime.shutdown().await;
     drop(upstream);
