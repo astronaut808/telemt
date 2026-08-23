@@ -130,7 +130,7 @@ pub struct WebLimitsConfig {
     /// Process-wide live logical-stream ceiling.
     #[serde(default = "default_web_max_streams_global")]
     pub max_streams_global: usize,
-    /// Process-wide concurrent inner MTProxy handshake ceiling.
+    /// Process-wide ceiling for inner MTProxy handshakes that received a first byte.
     #[serde(default = "default_web_max_stream_handshakes")]
     pub max_stream_handshakes: usize,
     /// Closed stream identifiers retained by one session.
@@ -249,7 +249,7 @@ pub struct WebTimeoutsConfig {
     /// Deadline for collecting one authenticated carrier request body.
     #[serde(default = "default_web_body_timeout_secs")]
     pub body_secs: u64,
-    /// Deadline for the inner MTProxy handshake on one logical stream.
+    /// Deadline from the first inner byte through MTProxy authentication.
     #[serde(default = "default_web_stream_handshake_timeout_secs")]
     pub stream_handshake_secs: u64,
     /// Maximum wait for one empty downlink long poll.

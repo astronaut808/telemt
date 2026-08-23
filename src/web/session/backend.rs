@@ -9,6 +9,10 @@ use crate::web::stream::WebLogicalStream;
 
 use super::{WebSession, inbound_queue_cost};
 
+#[cfg(test)]
+#[path = "backend_tests.rs"]
+mod tests;
+
 impl WebSession {
     /// Starts one owned inner handshake and relay task for an admitted stream.
     pub(super) fn spawn_stream(self: &Arc<Self>, stream_id: u32, peer_port: u16) {
@@ -19,10 +23,6 @@ impl WebSession {
         let generation = manager.active_generation();
         let Ok(connection_permit) = generation.max_connections.clone().try_acquire_owned() else {
             manager.record_stream_rejected();
-            self.stream_finished(stream_id, peer_port);
-            return;
-        };
-        let Some(handshake_permit) = manager.try_stream_handshake() else {
             self.stream_finished(stream_id, peer_port);
             return;
         };
@@ -46,7 +46,6 @@ impl WebSession {
                     stream,
                     deps,
                     replay_checker,
-                    handshake_permit,
                     peer_port,
                 ) => {}
             }
@@ -109,7 +108,6 @@ async fn run_stream(
     stream: WebLogicalStream,
     deps: crate::proxy::authenticated::ClientRuntimeDeps,
     replay_checker: Arc<crate::stats::ReplayChecker>,
-    handshake_permit: tokio::sync::OwnedSemaphorePermit,
     peer_port: u16,
 ) {
     use tokio::io::AsyncReadExt;
@@ -122,10 +120,25 @@ async fn run_stream(
     let mut handshake = [0u8; HANDSHAKE_LEN];
     let peer = std::net::SocketAddr::new(session.client_ip, peer_port);
     deps.stats.increment_connects_all();
+
+    // A carrier may publish OPEN before the local MTProto socket writes its
+    // first byte. Session and stream quotas bound this idle phase without
+    // consuming the process-wide active-handshake budget.
+    if reader.read_exact(&mut handshake[..1]).await.is_err() {
+        deps.stats
+            .increment_connects_bad_with_class("web_mtproto_handshake_io");
+        return;
+    }
+    let Some(manager) = session.manager.upgrade() else {
+        return;
+    };
+    let Some(handshake_permit) = manager.try_stream_handshake() else {
+        return;
+    };
     let handshake_result = tokio::time::timeout(
         Duration::from_secs(session.timeouts.stream_handshake_secs),
         async {
-            reader.read_exact(&mut handshake).await?;
+            reader.read_exact(&mut handshake[1..]).await?;
             Ok::<_, io::Error>(
                 handle_mtproto_handshake_for_web_user(
                     &handshake,
@@ -144,12 +157,27 @@ async fn run_stream(
     )
     .await;
     drop(handshake_permit);
-    let Ok(Ok(crate::error::HandshakeResult::Success((reader, writer, success)))) =
-        handshake_result
-    else {
-        deps.stats
-            .increment_connects_bad_with_class("web_mtproto_bad_client");
-        return;
+    let (reader, writer, success) = match handshake_result {
+        Err(_) => {
+            deps.stats
+                .increment_connects_bad_with_class("web_mtproto_handshake_timeout");
+            deps.stats.increment_handshake_timeouts();
+            deps.stats.increment_handshake_failure_class("timeout");
+            return;
+        }
+        Ok(Err(_)) => {
+            deps.stats
+                .increment_connects_bad_with_class("web_mtproto_handshake_io");
+            return;
+        }
+        Ok(Ok(crate::error::HandshakeResult::Success((reader, writer, success)))) => {
+            (reader, writer, success)
+        }
+        Ok(Ok(_)) => {
+            deps.stats
+                .increment_connects_bad_with_class("web_mtproto_bad_client");
+            return;
+        }
     };
     let _ = run_authenticated(
         reader,
