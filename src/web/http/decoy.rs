@@ -17,6 +17,7 @@ use crate::config::{WebRuntimeDecoy, WebRuntimeVhost};
 use crate::web::manager::WebProcessRuntime;
 
 /// Serves the configured ordinary site after optionally removing carrier material.
+/// Transport-sanitized static fallbacks remain uncacheable after query removal.
 pub(super) async fn serve_decoy<B>(
     mut request: Request<B>,
     vhost: Arc<WebRuntimeVhost>,
@@ -41,7 +42,15 @@ where
     };
     let request = Request::from_parts(parts, body);
     match &vhost.decoy {
-        WebRuntimeDecoy::StaticDirectory(site) => serve_static(request, site),
+        WebRuntimeDecoy::StaticDirectory(site) => {
+            let mut response = serve_static(request, site);
+            if sanitize_transport {
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            }
+            response
+        }
         WebRuntimeDecoy::HttpUpstream { addr, authority } => {
             proxy_to_upstream(
                 request,
