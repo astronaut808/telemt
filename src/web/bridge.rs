@@ -54,7 +54,7 @@ const DOCUMENT: &str = r##"<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayOrigin='https://__HOST__',bootstrap='__BOOTSTRAP__',carrier='__CARRIER__';
+const relayOrigin='https://__HOST__',bootstrap="__BOOTSTRAP__",carrier='__CARRIER__';
 const batchLimit=__BATCH_LIMIT__,queueLimit=__QUEUE_LIMIT__,queueItemLimit=__QUEUE_ITEMS__;
 const laneQueueLimit=Math.min(queueLimit,8388608),laneItemLimit=Math.min(queueItemLimit,1024),closedLaneLimit=4096;
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
@@ -329,6 +329,32 @@ mod tests {
         assert!(
             page.content_security_policy
                 .contains("frame-ancestors http://127.0.0.1:*")
+        );
+    }
+
+    #[test]
+    fn rendered_page_is_parseable_by_ios_native_carrier() {
+        let bootstrap = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let page = render(
+            "proxy.example.com",
+            bootstrap,
+            2 * 1024 * 1024,
+            32 * 1024 * 1024,
+            16 * 1024,
+            WebCarrier::Https,
+            &SecureRandom::new(),
+        );
+        let accepted_shapes = [
+            format!("const bootstrap=\"{bootstrap}\""),
+            format!("const bootstrap='{bootstrap}'"),
+            format!("bootstrap=\"{bootstrap}\""),
+        ];
+
+        assert!(
+            accepted_shapes
+                .iter()
+                .any(|shape| page.body.contains(shape)),
+            "the iOS native carrier cannot parse a comma-declared single-quoted bootstrap"
         );
     }
 }

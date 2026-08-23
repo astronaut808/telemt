@@ -131,8 +131,8 @@ async fn https_carrier_bootstraps_and_closes_one_session() {
     assert!(root_headers.starts_with(b"HTTP/1.1 200"));
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
     assert_eq!(bootstrap.len(), 43);
@@ -184,7 +184,7 @@ async fn https_carrier_bootstraps_and_closes_one_session() {
     assert!(
         next_root_body
             .windows(11)
-            .any(|value| value == b"bootstrap='")
+            .any(|value| value == b"bootstrap=\"")
     );
     assert!(
         next_root_body
@@ -226,7 +226,7 @@ async fn rejected_bridge_bootstrap_falls_back_to_uncacheable_static_index() {
 
     let first_response = request(&listener, &runtime, bridge_request()).await;
     let (_, first_body) = split_response(&first_response);
-    assert!(first_body.windows(11).any(|value| value == b"bootstrap='"));
+    assert!(first_body.windows(11).any(|value| value == b"bootstrap=\""));
 
     let fallback_response = request(&listener, &runtime, bridge_request()).await;
     let (fallback_headers, fallback_body) = split_response(&fallback_response);
@@ -255,8 +255,8 @@ async fn bootstrap_survives_client_address_family_change() {
     let (_, root_body) = split_response(&root_response);
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -291,8 +291,8 @@ async fn unused_bootstrap_survives_equivalent_runtime_generation_swap() {
     let (_, root_body) = split_response(&root_response);
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -331,8 +331,8 @@ async fn unused_bootstrap_is_rejected_after_profile_identity_change() {
     let (_, root_body) = split_response(&root_response);
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -373,8 +373,8 @@ async fn https_lanes_is_advertised_and_requires_canonical_lane_headers() {
     let root_body = std::str::from_utf8(root_body).unwrap();
     assert!(root_body.contains("carrier='https-lanes'"));
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -457,8 +457,8 @@ async fn windows_restricted_webview_empty_cookie_preserves_the_carrier_flow() {
         assert!(root_headers.starts_with(b"HTTP/1.1 200"));
         let root_body = std::str::from_utf8(root_body).unwrap();
         let bootstrap = root_body
-            .split_once("bootstrap='")
-            .and_then(|(_, suffix)| suffix.split_once('\''))
+            .split_once("bootstrap=\"")
+            .and_then(|(_, suffix)| suffix.split_once('"'))
             .map(|(token, _)| token)
             .unwrap();
 
