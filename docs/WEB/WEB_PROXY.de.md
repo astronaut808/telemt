@@ -186,7 +186,7 @@ Im Frontend oder im Abschnitt `defaults` muss auch `timeout client` oberhalb der
 | --- | --- |
 | Bestand der WEB-Listener, Bind-Adresse und Vertrauensrichtlinie | Prozesseigen; Telemt neu starten. |
 | Jeder Wert in `[web.limits]` | Prozesseigener Speicher- und Ressourcenvertrag; Telemt neu starten. |
-| `web.enabled`, `web.carrier`, Timeouts, vhosts, Profile und Decoys | Werden vom Config-Watcher oder durch einen Runtime-Generations-Reload angewendet. |
+| `web.enabled`, `web.carrier`, `web.debug`, Timeouts, vhosts, Profile und Decoys | Werden vom Config-Watcher oder durch einen Runtime-Generations-Reload angewendet. |
 | Bestehende HTTP-Verbindungen und WEB-Sitzungen | Behalten Carrier, Grenzen und Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden den aktiven Carrier. Neue logische Streams verwenden die aktive Relay-Generation. |
 | Beenden des Prozesses | Verwendet den zuletzt geladenen Wert von `web.timeouts.shutdown_secs`. |
 
@@ -194,13 +194,14 @@ Jeder logische Stream behält die Client-IP seiner Sitzung und besitzt während 
 
 ## Verwaltung über die API
 
-API-Verwaltung ist verfügbar, aber absichtlich eingeschränkt. Es gibt weder einen eigenen Endpunkt `/v1/web` noch einen WEB-spezifischen Runtime-Statistik-Endpunkt.
+API-Verwaltung ist verfügbar, aber absichtlich eingeschränkt. Es gibt keine veränderbare Ressource `/v1/web`; der API-Listener stellt die schreibgeschützte HTML-Debug-Ansicht unter `/web-status` bereit.
 
 | Operation | API-Unterstützung |
 | --- | --- |
 | `[web]`, vhosts, Profile, Decoys, Timeouts oder Limits lesen oder ändern | Nein. `GET /v1/config` lässt `[web]` aus; `PATCH /v1/config` antwortet für `web` mit `400 section_not_editable`. |
 | `server.listeners` speichern | Ja, über `PATCH /v1/config`; ein geänderter WEB-Listener bleibt jedoch bis zum Prozessneustart zurückgestellt. |
 | Außerhalb der API geänderte WEB-Konfiguration anwenden | Ja, über `POST /v1/system/reload` und anschließende Abfrage des Vorgangsstatus. |
+| Begrenzte serverseitige WEB-Request- und Lifecycle-Details untersuchen | Ja, über ein authentifiziertes `GET /web-status`. |
 | `[access.users]` verwalten | Ja, über `/v1/users`. Das Erstellen eines Benutzers erzeugt kein WEB-Profil. |
 | Einen Benutzer widerrufen | Ja. `/v1/users/{username}/disable` aktualisiert die Admission sofort und beendet die aktiven Sitzungen dieses Benutzers. |
 
@@ -216,6 +217,30 @@ read_only = false
 ```
 
 Die API-Whitelist prüft den direkten TCP-Peer und vertraut `X-Forwarded-For` nicht. Änderungen an `[server.api]` selbst erfordern einen Prozessneustart.
+
+### Serverseitige WEB-Debug-Ansicht
+
+Aktivieren Sie die begrenzte Erfassung in der zuständigen Konfigurationsdatei:
+
+```toml
+[web.debug]
+enabled = true
+capture_lifecycle = true
+capture_headers = true
+capture_timings = true
+capture_frames = true
+body_capture = "metadata"
+body_prefix_bytes = 4096
+decoy_body_prefix_bytes = 4096
+default_window_secs = 180
+max_window_secs = 3600
+```
+
+Öffnen Sie `http://127.0.0.1:9091/web-status` mit derselben Whitelist direkter Peers und demselben exakten `Authorization`-Header wie für die API. Ein abschließender Slash wird akzeptiert. Nur `GET` ist zulässig. Die Seite unterstützt die Filter `window_secs`, kanonische `ip`, numerische `session`, `user_agent` ohne Beachtung der Groß-/Kleinschreibung und `key`. Wiederholen Sie `group_by=ip`, `group_by=session`, `group_by=user_agent` oder `group_by=key`, um gruppierte Zusammenfassungen zu erstellen; `limit` ist auf `1..=1000` beschränkt. Jede Zeile verweist auf eine Ansicht des exakten Datensatzes und lässt sich zu Methode, Pfad, bereinigten Headern, Body-Metadaten oder -Bytes, Zeitpunkten, geparsten Frames und typisierten Lifecycle-Ereignissen aufklappen.
+
+Der prozesseigene Ring übersteht den Austausch einer Runtime-Generation. Änderungen der Erfassungs-Policy löschen inkompatible gespeicherte Datensätze; reine Änderungen des Beobachtungsfensters tun dies nicht. Der Ring ist standardmäßig auf 65536 Datensätze und 64 MiB gespeicherte plus in Verarbeitung befindliche Daten begrenzt, die HTML-Response auf 8 MiB und die Gruppierung auf 1024 Gruppen; gleichzeitig dürfen höchstens zwei Response-Bodys Seiten-Permits halten. Ändern Sie `web.limits.debug_records_capacity` oder `web.limits.debug_bytes_global` nur zusammen mit einem Prozessneustart. Ein hot-reload-fähiger Präfix, der nur in eine gleichzeitig erhöhte neustartpflichtige Kapazität passt, wird bis zu diesem Neustart zurückgestellt.
+
+`body_capture = "off"` lässt Bodys aus, `metadata` speichert Längen und Endzustände, `prefix` die konfigurierten Präfixe und `full` erkannte Carrier-Bodys bis `web.limits.max_body_bytes`. Gewöhnliche Decoy-Bodys bleiben auch in `full` auf `decoy_body_prefix_bytes` begrenzt. Queries und rohe Capabilities werden nie gespeichert; Werte von Credential-Headern werden ausgelassen; bekannte WEB-Capabilities und Bearer-Tokens werden aus erfassten Bodys entfernt; der angezeigte Schlüssel ist ein nicht geheimer, domänengetrennter Fingerprint. Die Zeitmessung endet beim Polling des Hyper-Bodys und behauptet weder einen Kernel-Flush noch eine TCP-Bestätigung.
 
 Nachdem ein Administrator oder Konfigurationssystem die TOML-Datei atomar aktualisiert hat, setzen Sie `TELEMT_API_AUTH` auf den exakten Wert von `auth_header` und starten Sie einen beobachtbaren Generations-Reload:
 
@@ -274,6 +299,7 @@ Der vollständige Vertrag für Requests, Revisionen, Fehler und alle Benutzer-En
 | WEB-Konfiguration ist auf dem Datenträger gültig, aber das Listener-Verhalten hat sich nicht geändert | Prüfen Sie `deferred_process_fields`; Listener- und `[web.limits]`-Änderungen erfordern einen Neustart. |
 | Carrier-Requests erreichen den Decoy | Prüfen Sie den exakten vhost, den Secret-Modus des Links, das CIDR des direkten Proxys und genau einen syntaktisch gültigen `X-Forwarded-For`-Wert. |
 | Long Polls werden nach einem festen Intervall getrennt | Setzen Sie Client-, Server-, Sende- und Lese-Timeouts von NGINX/HAProxy über `web.timeouts.long_poll_secs`. |
+| `/web-status` ist leer | Prüfen Sie, dass `[web.debug].enabled = true` gesetzt ist, wenden Sie die Konfiguration an, wählen Sie ein Fenster innerhalb von `max_window_secs` und erzeugen Sie nach der Policy-Änderung neuen WEB-Datenverkehr. |
 | `https-lanes` funktioniert, Streams blockieren sich aber weiterhin | Prüfen Sie die öffentliche HTTP/2-Aushandlung, die unveränderte Weitergabe von `X-Lane-ID` und genügend TLS-Terminator-Upstream-Verbindungen für parallele private HTTP/1.1-Polls. |
 | Telegram Desktop lehnt den Link ab | Lassen Sie den Port weg und verwenden Sie einen gültigen FQDN, extern Port 443 sowie ausschließlich `plain` oder `dd`. |
 | Ein Knoten funktioniert, ein Load-Balancing-Pool aber nur sporadisch | Konfigurieren Sie Affinität für den gesamten vhost; WEB-Zugangsdatenregister sind prozesslokal. |

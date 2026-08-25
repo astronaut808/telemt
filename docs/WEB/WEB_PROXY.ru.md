@@ -186,7 +186,7 @@ backend telemt_web
 | --- | --- |
 | Состав WEB-listeners, bind address и trust policy | Принадлежат процессу; перезапустите Telemt. |
 | Любое значение `[web.limits]` | Process-owned контракт памяти и ресурсов; перезапустите Telemt. |
-| `web.enabled`, `web.carrier`, timeouts, vhosts, profiles и decoys | Применяются config watcher или runtime generation reload. |
+| `web.enabled`, `web.carrier`, `web.debug`, timeouts, vhosts, profiles и decoys | Применяются config watcher или runtime generation reload. |
 | Существующие HTTP connections и WEB sessions | Сохраняют carrier, лимиты и deadlines своего момента создания; новые bridge sessions получают активный carrier. Новые logical streams используют активное relay generation. |
 | Завершение процесса | Использует последнее применённое значение `web.timeouts.shutdown_secs`. |
 
@@ -194,13 +194,14 @@ backend telemt_web
 
 ## Управление через API
 
-Управление через API доступно, но намеренно ограничено. Отдельных endpoint `/v1/web` и WEB-specific runtime statistics endpoint сейчас нет.
+Управление через API доступно, но намеренно ограничено. Изменяемого ресурса `/v1/web` нет; API-listener предоставляет read-only HTML debug view по адресу `/web-status`.
 
 | Операция | Поддержка API |
 | --- | --- |
 | Чтение или изменение `[web]`, vhosts, profiles, decoys, timeouts или limits | Нет. `GET /v1/config` не возвращает `[web]`; `PATCH /v1/config` отвечает `400 section_not_editable` на ключ `web`. |
 | Сохранение `server.listeners` | Да, через `PATCH /v1/config`, но изменённый WEB-listener остаётся deferred до перезапуска процесса. |
 | Применение WEB-конфигурации, изменённой вне API | Да, через `POST /v1/system/reload` с последующей проверкой статуса операции. |
+| Просмотр bounded серверных WEB request- и lifecycle-деталей | Да, через аутентифицированный `GET /web-status`. |
 | Управление `[access.users]` | Да, через `/v1/users`. Создание пользователя не создаёт WEB-профиль. |
 | Отзыв отдельного пользователя | Да. `/v1/users/{username}/disable` немедленно обновляет admission и завершает активные сессии пользователя. |
 
@@ -216,6 +217,30 @@ read_only = false
 ```
 
 API whitelist проверяет непосредственный TCP peer и не доверяет `X-Forwarded-For`. Изменения самой секции `[server.api]` требуют перезапуска процесса.
+
+### Серверная WEB-отладка
+
+Включите bounded сбор в конфигурационном файле, которому принадлежит эта секция:
+
+```toml
+[web.debug]
+enabled = true
+capture_lifecycle = true
+capture_headers = true
+capture_timings = true
+capture_frames = true
+body_capture = "metadata"
+body_prefix_bytes = 4096
+decoy_body_prefix_bytes = 4096
+default_window_secs = 180
+max_window_secs = 3600
+```
+
+Откройте `http://127.0.0.1:9091/web-status`, используя те же whitelist непосредственных peers и точный header `Authorization`, что и для API. Завершающий slash разрешён. Допускается только `GET`. Страница поддерживает фильтры `window_secs`, канонический `ip`, числовой `session`, регистронезависимый `user_agent` и `key`. Повторяйте `group_by=ip`, `group_by=session`, `group_by=user_agent` или `group_by=key` для построения сгруппированных сводок; `limit` ограничен диапазоном `1..=1000`. Каждая строка ссылается на просмотр точной записи и раскрывает method, path, очищенные headers, метаданные или байты body, timing points, разобранные frames и типизированные lifecycle events.
+
+Process-owned кольцевой буфер переживает замену runtime generation. Изменения capture policy очищают несовместимые сохранённые записи; изменения только окна наблюдения этого не делают. По умолчанию кольцо ограничено 65536 записями и 64 MiB сохранённых плюс находящихся в обработке данных, HTML-response — 8 MiB, grouping — 1024 группами; одновременно page permits могут удерживать не более двух response bodies. Изменяйте `web.limits.debug_records_capacity` или `web.limits.debug_bytes_global` только с перезапуском процесса. Hot prefix, который помещается только в одновременно увеличенную restart-only ёмкость, откладывается до этого перезапуска.
+
+`body_capture = "off"` исключает bodies, `metadata` сохраняет длину и terminal state, `prefix` — настроенные prefixes, а `full` — распознанные carrier bodies до `web.limits.max_body_bytes`. Обычные decoy bodies даже в режиме `full` ограничены `decoy_body_prefix_bytes`. Queries и raw capabilities никогда не сохраняются; значения credential headers исключаются; известные WEB capabilities и bearer tokens удаляются из захваченных bodies; отображаемый ключ является несекретным domain-separated fingerprint. Timing заканчивается на polling Hyper body и не означает kernel flush или TCP acknowledgment.
 
 После атомарного изменения TOML-файла администратором или системой управления конфигурацией задайте в `TELEMT_API_AUTH` точное значение `auth_header` и отправьте наблюдаемый generation reload:
 
@@ -274,6 +299,7 @@ curl -sS -X POST http://127.0.0.1:9091/v1/users/web-user/rotate-secret \
 | WEB-конфигурация валидна на диске, но поведение listener’а не изменилось | Проверьте `deferred_process_fields`; listener и `[web.limits]` требуют перезапуска. |
 | Carrier-запросы попадают в decoy | Проверьте точный vhost, secret mode ссылки, CIDR непосредственного proxy и единственное корректно разбираемое значение `X-Forwarded-For`. |
 | Long polls разрываются через фиксированный интервал | Поднимите client, server, send и read timeouts NGINX/HAProxy выше `web.timeouts.long_poll_secs`. |
+| `/web-status` пуст | Убедитесь, что `[web.debug].enabled = true`, примените конфигурацию, выберите окно в пределах `max_window_secs` и создайте новый WEB-трафик после изменения policy. |
 | `https-lanes` работает, но streams всё ещё блокируют друг друга | Проверьте согласование публичного HTTP/2, сохранение `X-Lane-ID` и достаточное число upstream connections TLS-терминатора для параллельных приватных HTTP/1.1 polls. |
 | Telegram Desktop отклоняет ссылку | Не указывайте порт, используйте валидный FQDN, внешний порт 443 и только `plain` или `dd`. |
 | Один узел работает, но load-balanced pool нестабилен | Настройте affinity всего vhost: WEB credential registries локальны для процесса. |

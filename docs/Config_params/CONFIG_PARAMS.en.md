@@ -25,6 +25,7 @@ This document lists all configuration keys accepted by `config.toml`.
  - [server.api](#serverapi)
  - [server.listeners](#serverlisteners)
  - [web](#web)
+ - [web.debug](#webdebug)
  - [web.limits](#weblimits)
  - [web.timeouts](#webtimeouts)
  - [web.vhosts](#webvhosts)
