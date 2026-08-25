@@ -186,7 +186,7 @@ The frontend or `defaults` section must also set `timeout client` above the long
 | --- | --- |
 | WEB listener inventory, bind address, and trust policy | Process-owned; restart Telemt. |
 | Any `[web.limits]` value | Process-owned memory/resource contract; restart Telemt. |
-| `web.enabled`, `web.carrier`, timeouts, vhosts, profiles, and decoys | Applied by the config watcher or a runtime generation reload. |
+| `web.enabled`, `web.carrier`, `web.debug`, timeouts, vhosts, profiles, and decoys | Applied by the config watcher or a runtime generation reload. |
 | Existing HTTP connections and WEB sessions | Keep their acquisition-time carrier, limits, and deadlines; newly issued bridge sessions use the active carrier. New logical streams use the active relay generation. |
 | Process shutdown | Uses the latest reloaded `web.timeouts.shutdown_secs`. |
 
@@ -194,13 +194,14 @@ Each logical stream keeps its session's creation-time client IP and owns a proce
 
 ## API management
 
-API management is available, but it is intentionally partial. There is no dedicated `/v1/web` endpoint and no WEB-specific runtime statistics endpoint.
+API management is available, but it is intentionally partial. There is no mutable `/v1/web` resource; the API listener exposes the read-only HTML debug view at `/web-status`.
 
 | Operation | API support |
 | --- | --- |
 | Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | No. `GET /v1/config` omits `[web]`; `PATCH /v1/config` returns `400 section_not_editable` for `web`. |
 | Persist `server.listeners` | Yes, through `PATCH /v1/config`, but a changed WEB listener remains deferred until process restart. |
 | Apply an externally edited WEB configuration | Yes, through `POST /v1/system/reload`, then inspect the operation status. |
+| Inspect bounded server-side WEB request and lifecycle details | Yes, through authenticated `GET /web-status`. |
 | Manage `[access.users]` | Yes, through `/v1/users`. User creation does not create a WEB profile. |
 | Revoke one user | Yes. `/v1/users/{username}/disable` updates admission immediately and cancels that user's active sessions. |
 
@@ -216,6 +217,30 @@ read_only = false
 ```
 
 The API whitelist checks the direct TCP peer and does not trust `X-Forwarded-For`. Changes to `[server.api]` itself require a process restart.
+
+### Server-side WEB debug view
+
+Enable bounded collection in the owned configuration file:
+
+```toml
+[web.debug]
+enabled = true
+capture_lifecycle = true
+capture_headers = true
+capture_timings = true
+capture_frames = true
+body_capture = "metadata"
+body_prefix_bytes = 4096
+decoy_body_prefix_bytes = 4096
+default_window_secs = 180
+max_window_secs = 3600
+```
+
+Open `http://127.0.0.1:9091/web-status` with the same direct-peer whitelist and exact `Authorization` header used by the API. A trailing slash is accepted. Only `GET` is allowed. The page supports `window_secs`, canonical `ip`, numeric `session`, case-insensitive `user_agent`, and `key` filters. Repeat `group_by=ip`, `group_by=session`, `group_by=user_agent`, or `group_by=key` to build grouped summaries; `limit` is restricted to `1..=1000`. Each row links to an exact-record view and expands into method, path, sanitized headers, body metadata or bytes, timing points, parsed frames, and typed lifecycle events.
+
+The process-owned ring survives runtime generation replacement. Capture-policy changes clear incompatible retained records; window-only changes do not. The ring defaults to 65536 records and 64 MiB retained plus in-flight bytes, the HTML response is capped at 8 MiB, grouping is capped at 1024 groups, and no more than two response bodies retain page permits concurrently. Change `web.limits.debug_records_capacity` or `web.limits.debug_bytes_global` only with a process restart. A hot prefix that fits only a simultaneously increased restart-only capacity is deferred until that restart.
+
+`body_capture = "off"` omits bodies, `metadata` retains lengths and terminal states, `prefix` retains configured prefixes, and `full` retains recognized carrier bodies up to `web.limits.max_body_bytes`. Ordinary decoy bodies remain limited by `decoy_body_prefix_bytes` even in `full` mode. Queries and raw capabilities are never stored; credential header values are omitted; known WEB capabilities and bearer tokens are scrubbed from captured bodies; the displayed key is a non-secret domain-separated fingerprint. Timing ends at Hyper body polling and does not claim kernel flush or TCP acknowledgment.
 
 After an administrator or configuration system atomically updates the TOML file, set `TELEMT_API_AUTH` to the exact value configured in `auth_header` and submit an observable generation reload:
 
@@ -274,6 +299,7 @@ See the complete [Control API contract](../Architecture/API/API.md) for request 
 | WEB configuration is valid on disk but listener behavior did not change | Inspect reload `deferred_process_fields`; listener and `[web.limits]` changes require restart. |
 | Carrier requests reach the decoy | Verify exact vhost, link secret mode, direct proxy CIDR, and one parseable `X-Forwarded-For` value. |
 | Long polls disconnect near a fixed interval | Raise NGINX/HAProxy client, server, send, and read timeouts above `web.timeouts.long_poll_secs`. |
+| `/web-status` is empty | Confirm `[web.debug].enabled = true`, apply the configuration, select a window within `max_window_secs`, and generate new WEB traffic after the policy change. |
 | `https-lanes` works but streams still block each other | Confirm public HTTP/2 negotiation, preserve `X-Lane-ID`, and provide enough TLS-terminator upstream connections for concurrent private HTTP/1.1 polls. |
 | Telegram Desktop rejects the link | Omit the port, use a valid FQDN, port 443 externally, and only `plain` or `dd` secret mode. |
 | One node works but a load-balanced pool is intermittent | Add complete-vhost affinity; WEB credential registries are process-local. |
