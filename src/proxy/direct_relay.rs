@@ -22,7 +22,8 @@ use crate::proxy::route_mode::{
     RelayRouteMode, RouteCutoverState, affected_cutover_state, cutover_stagger_delay,
 };
 use crate::proxy::shared_state::{
-    ConntrackCloseEvent, ConntrackClosePublishResult, ConntrackCloseReason, ProxySharedState,
+    ConntrackCloseEvent, ConntrackClosePolicy, ConntrackClosePublishResult, ConntrackCloseReason,
+    ProxySharedState,
 };
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
@@ -229,6 +230,7 @@ fn unknown_dc_test_lock() -> &'static Mutex<()> {
 }
 
 #[allow(dead_code)]
+/// Runs Direct relay with standalone cancellation and shared-state defaults.
 pub(crate) async fn handle_via_direct<R, W>(
     client_reader: CryptoReader<R>,
     client_writer: CryptoWriter<W>,
@@ -265,7 +267,49 @@ where
     .await
 }
 
+/// Runs Direct relay for a kernel-backed TCP client tuple.
 pub(crate) async fn handle_via_direct_with_shared<R, W>(
+    client_reader: CryptoReader<R>,
+    client_writer: CryptoWriter<W>,
+    success: HandshakeSuccess,
+    upstream_manager: Arc<UpstreamManager>,
+    stats: Arc<Stats>,
+    config: Arc<ProxyConfig>,
+    buffer_pool: Arc<BufferPool>,
+    rng: Arc<SecureRandom>,
+    route_rx: watch::Receiver<RouteCutoverState>,
+    route_snapshot: RouteCutoverState,
+    session_id: u64,
+    local_addr: SocketAddr,
+    session_cancel: CancellationToken,
+    shared: Arc<ProxySharedState>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    handle_via_direct_with_shared_and_conntrack(
+        client_reader,
+        client_writer,
+        success,
+        upstream_manager,
+        stats,
+        config,
+        buffer_pool,
+        rng,
+        route_rx,
+        route_snapshot,
+        session_id,
+        local_addr,
+        session_cancel,
+        shared,
+        ConntrackClosePolicy::Publish,
+    )
+    .await
+}
+
+/// Runs Direct relay with explicit kernel-conntrack close publication policy.
+pub(crate) async fn handle_via_direct_with_shared_and_conntrack<R, W>(
     client_reader: CryptoReader<R>,
     client_writer: CryptoWriter<W>,
     success: HandshakeSuccess,
@@ -280,6 +324,7 @@ pub(crate) async fn handle_via_direct_with_shared<R, W>(
     local_addr: SocketAddr,
     session_cancel: CancellationToken,
     shared: Arc<ProxySharedState>,
+    conntrack_close_policy: ConntrackClosePolicy,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -407,17 +452,19 @@ where
         pool_snapshot.allocated.saturating_sub(pool_snapshot.pooled),
     );
 
-    let close_reason = classify_conntrack_close_reason(&relay_result);
-    let publish_result = shared.publish_conntrack_close_event(ConntrackCloseEvent {
-        src: success.peer,
-        dst: local_addr,
-        reason: close_reason,
-    });
-    if !matches!(
-        publish_result,
-        ConntrackClosePublishResult::Sent | ConntrackClosePublishResult::Disabled
-    ) {
-        stats.increment_conntrack_close_event_drop_total();
+    if conntrack_close_policy == ConntrackClosePolicy::Publish {
+        let close_reason = classify_conntrack_close_reason(&relay_result);
+        let publish_result = shared.publish_conntrack_close_event(ConntrackCloseEvent {
+            src: success.peer,
+            dst: local_addr,
+            reason: close_reason,
+        });
+        if !matches!(
+            publish_result,
+            ConntrackClosePublishResult::Sent | ConntrackClosePublishResult::Disabled
+        ) {
+            stats.increment_conntrack_close_event_drop_total();
+        }
     }
 
     relay_result

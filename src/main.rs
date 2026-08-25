@@ -34,6 +34,7 @@ mod synlimit_control;
 mod tls_front;
 mod transport;
 mod util;
+mod web;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Install rustls crypto provider early

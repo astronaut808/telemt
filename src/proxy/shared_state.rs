@@ -41,6 +41,15 @@ pub(crate) enum ConntrackClosePublishResult {
     QueueClosed,
 }
 
+/// Controls whether a relay tuple maps to a real kernel conntrack entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConntrackClosePolicy {
+    /// Publish closure for a tuple backed by an accepted kernel TCP flow.
+    Publish,
+    /// Suppress closure for a virtual transport tuple with no kernel flow.
+    Suppress,
+}
+
 pub(crate) struct HandshakeSharedState {
     pub(crate) auth_probe: DashMap<IpAddr, AuthProbeState>,
     pub(crate) auth_probe_saturation: Mutex<Option<AuthProbeSaturationState>>,

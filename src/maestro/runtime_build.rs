@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{RwLock, Semaphore, watch};
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, ServerConfig};
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
 use crate::network::probe::{decide_network_capabilities, run_probe};
@@ -24,6 +24,7 @@ use crate::transport::middle_proxy::MePool;
 
 use super::admission;
 use super::generation::{RuntimeGeneration, RuntimeTaskScope};
+use super::listeners::listener_rebind_supported;
 use super::runtime_tasks::RuntimeLogFilter;
 use super::{me_startup, runtime_tasks, tls_bootstrap};
 
@@ -309,75 +310,155 @@ fn strict_middle_proxy_unavailable(
     use_middle_proxy && !direct_first_startup && !pool_available
 }
 
-pub(crate) fn deferred_process_fields(old: &ProxyConfig, new: &ProxyConfig) -> Vec<String> {
+pub(crate) struct ResolvedReloadConfig {
+    /// Runtime-safe candidate with process-owned values retained from active state.
+    pub(crate) effective: ProxyConfig,
+    /// Stable public labels for desired fields deferred until process restart.
+    pub(crate) deferred_process_fields: Vec<String>,
+    /// Whether activating the effective candidate changes runtime-owned state.
+    pub(crate) runtime_changed: bool,
+}
+
+/// Resolves desired configuration into effective runtime and deferred process state.
+pub(crate) fn resolve_reload_config(
+    old: &ProxyConfig,
+    desired: &ProxyConfig,
+) -> ResolvedReloadConfig {
+    let mut effective = desired.clone();
     let mut fields = Vec::new();
-    if old.server.port != new.server.port
-        || old.server.proxy_protocol != new.server.proxy_protocol
-        || old.server.listen_backlog != new.server.listen_backlog
-        || serde_json::to_value(&old.server.listeners).ok()
-            != serde_json::to_value(&new.server.listeners).ok()
-    {
+    let listener_identity_matches = listeners_have_same_bind_identity(&old.server, &desired.server);
+    let global_listener_policy_changed = old.server.port != desired.server.port
+        || old.server.listen_addr_ipv4 != desired.server.listen_addr_ipv4
+        || old.server.listen_addr_ipv6 != desired.server.listen_addr_ipv6
+        || old.server.listen_tcp != desired.server.listen_tcp
+        || old.server.client_mss != desired.server.client_mss
+        || old.server.client_mss_bulk != desired.server.client_mss_bulk
+        || old.server.proxy_protocol != desired.server.proxy_protocol
+        || old.server.listen_backlog != desired.server.listen_backlog;
+    let listener_policy_changed =
+        listener_identity_matches && !listener_process_fields_equal(&old.server, &desired.server);
+    let unsupported_identity_change =
+        !listener_identity_matches && !listener_rebind_supported(old, desired);
+    if global_listener_policy_changed || listener_policy_changed || unsupported_identity_change {
         fields.push("server.listeners".to_string());
+        effective.server.port = old.server.port;
+        effective.server.listen_addr_ipv4 = old.server.listen_addr_ipv4.clone();
+        effective.server.listen_addr_ipv6 = old.server.listen_addr_ipv6.clone();
+        effective.server.listen_tcp = old.server.listen_tcp;
+        effective.server.client_mss = old.server.client_mss.clone();
+        effective.server.client_mss_bulk = old.server.client_mss_bulk.clone();
+        effective.server.proxy_protocol = old.server.proxy_protocol;
+        effective.server.listen_backlog = old.server.listen_backlog;
+        effective.server.listeners = old.server.listeners.clone();
+        if listener_identity_matches {
+            for (effective_listener, desired_listener) in effective
+                .server
+                .listeners
+                .iter_mut()
+                .zip(&desired.server.listeners)
+            {
+                effective_listener.announce = desired_listener.announce.clone();
+                effective_listener.announce_ip = desired_listener.announce_ip;
+            }
+        }
     }
-    if old.server.listen_unix_sock != new.server.listen_unix_sock
-        || old.server.listen_unix_sock_perm != new.server.listen_unix_sock_perm
+    if old.server.listen_unix_sock != desired.server.listen_unix_sock
+        || old.server.listen_unix_sock_perm != desired.server.listen_unix_sock_perm
     {
         fields.push("server.listen_unix_sock".to_string());
+        effective.server.listen_unix_sock = old.server.listen_unix_sock.clone();
+        effective.server.listen_unix_sock_perm = old.server.listen_unix_sock_perm.clone();
     }
-    if old.server.api.listen != new.server.api.listen
-        || old.server.api.enabled != new.server.api.enabled
+    if old.server.api.listen != desired.server.api.listen
+        || old.server.api.enabled != desired.server.api.enabled
     {
         fields.push("server.api.listen".to_string());
+        effective.server.api.listen = old.server.api.listen.clone();
+        effective.server.api.enabled = old.server.api.enabled;
     }
-    if old.server.metrics_listen != new.server.metrics_listen
-        || old.server.metrics_port != new.server.metrics_port
+    if old.server.api.runtime_edge_events_capacity
+        != desired.server.api.runtime_edge_events_capacity
+    {
+        fields.push("server.api.runtime_edge_events_capacity".to_string());
+        effective.server.api.runtime_edge_events_capacity =
+            old.server.api.runtime_edge_events_capacity;
+    }
+    if old.server.metrics_listen != desired.server.metrics_listen
+        || old.server.metrics_port != desired.server.metrics_port
     {
         fields.push("server.metrics_listen".to_string());
+        effective.server.metrics_listen = old.server.metrics_listen.clone();
+        effective.server.metrics_port = old.server.metrics_port;
     }
-    if old.general.quota_state_path != new.general.quota_state_path {
+    if old.general.quota_state_path != desired.general.quota_state_path {
         fields.push("general.quota_state_path".to_string());
+        effective.general.quota_state_path = old.general.quota_state_path.clone();
     }
-    if old.general.disable_colors != new.general.disable_colors {
+    if old.general.disable_colors != desired.general.disable_colors {
         fields.push("general.disable_colors".to_string());
+        effective.general.disable_colors = old.general.disable_colors;
     }
-    if old.general.data_path != new.general.data_path {
+    if old.general.data_path != desired.general.data_path {
         fields.push("general.data_path".to_string());
+        effective.general.data_path = old.general.data_path.clone();
     }
-    if serde_json::to_value(&old.logging).ok() != serde_json::to_value(&new.logging).ok() {
+    if serde_json::to_value(&old.logging).ok() != serde_json::to_value(&desired.logging).ok() {
         fields.push("logging".to_string());
+        effective.logging = old.logging.clone();
     }
-    fields
+    if serde_json::to_value(&old.web.limits).ok() != serde_json::to_value(&desired.web.limits).ok()
+    {
+        fields.push("web.limits".to_string());
+        effective.web.limits = old.web.limits.clone();
+        if effective.rebuild_runtime_web().is_err() {
+            fields.push("web".to_string());
+            effective.web = old.web.clone();
+        }
+    }
+    let runtime_changed = !configs_equal(old, &effective);
+    ResolvedReloadConfig {
+        effective,
+        deferred_process_fields: fields,
+        runtime_changed,
+    }
+}
+
+fn listeners_have_same_bind_identity(old: &ServerConfig, desired: &ServerConfig) -> bool {
+    old.listeners.len() == desired.listeners.len()
+        && old
+            .listeners
+            .iter()
+            .zip(&desired.listeners)
+            .all(|(old_listener, desired_listener)| {
+                old_listener.ip == desired_listener.ip
+                    && old_listener.port.unwrap_or(old.port)
+                        == desired_listener.port.unwrap_or(desired.port)
+            })
+}
+
+fn listener_process_fields_equal(old: &ServerConfig, desired: &ServerConfig) -> bool {
+    let mut old_listeners = old.listeners.clone();
+    let mut desired_listeners = desired.listeners.clone();
+    for listener in &mut old_listeners {
+        listener.announce = None;
+        listener.announce_ip = None;
+    }
+    for listener in &mut desired_listeners {
+        listener.announce = None;
+        listener.announce_ip = None;
+    }
+    serde_json::to_value(old_listeners).ok() == serde_json::to_value(desired_listeners).ok()
+}
+
+/// Returns process-owned fields that cannot change in the current generation.
+pub(crate) fn deferred_process_fields(old: &ProxyConfig, new: &ProxyConfig) -> Vec<String> {
+    resolve_reload_config(old, new).deferred_process_fields
+}
+
+fn configs_equal(old: &ProxyConfig, new: &ProxyConfig) -> bool {
+    serde_json::to_value(old).ok() == serde_json::to_value(new).ok()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn process_socket_and_logging_changes_are_deferred() {
-        let old = ProxyConfig::default();
-        let mut new = old.clone();
-        new.server.listen_backlog = new.server.listen_backlog.saturating_add(1);
-        new.general.disable_colors = !new.general.disable_colors;
-
-        let fields = deferred_process_fields(&old, &new);
-        assert!(fields.contains(&"server.listeners".to_string()));
-        assert!(fields.contains(&"general.disable_colors".to_string()));
-    }
-
-    #[test]
-    fn runtime_only_change_does_not_require_process_rebind() {
-        let old = ProxyConfig::default();
-        let mut new = old.clone();
-        new.censorship.tls_domain = "reload.example".to_string();
-        assert!(deferred_process_fields(&old, &new).is_empty());
-    }
-
-    #[test]
-    fn strict_middle_proxy_requires_a_prepared_pool() {
-        assert!(strict_middle_proxy_unavailable(true, false, false));
-        assert!(!strict_middle_proxy_unavailable(true, false, true));
-        assert!(!strict_middle_proxy_unavailable(true, true, false));
-        assert!(!strict_middle_proxy_unavailable(false, false, false));
-    }
-}
+#[path = "runtime_build_tests.rs"]
+mod tests;

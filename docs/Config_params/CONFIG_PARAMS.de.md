@@ -24,6 +24,12 @@ Dieses Dokument listet alle Konfigurationsschlüssel auf, die `config.toml` akze
  - [server.conntrack_control](#serverconntrack_control)
  - [server.api](#serverapi)
  - [server.listeners](#serverlisteners)
+ - [web](#web)
+ - [web.limits](#weblimits)
+ - [web.timeouts](#webtimeouts)
+ - [web.vhosts](#webvhosts)
+ - [web.vhosts.decoy](#webvhostsdecoy)
+ - [web.vhosts.profiles](#webvhostsprofiles)
  - [timeouts](#timeouts)
  - [censorship](#censorship)
  - [censorship.tls_fetch](#censorshiptls_fetch)
@@ -1971,7 +1977,7 @@ Dieses Dokument listet alle Konfigurationsschlüssel auf, die `config.toml` akze
     ```
 ## client_mss
   - **Einschränkungen / Validierung**: `String`. Leer oder ausgelassen bedeutet: Kernel-MSS nicht verändern. Presets: `"extreme-low"` = `88`, `"tspu"` = `92`, `"2in8"` = `256`. Benutzerdefinierte Dezimalwerte müssen im Bereich `88..=4096` liegen.
-  - **Beschreibung**: Client-facing TCP-MSS, das vor `listen(2)` auf TCP-Listener-Sockets gesetzt wird, damit Linux den Wert im SYN/ACK annoncieren kann. Betrifft nur die clientseitigen Proxy-TCP-Listener, nicht API, Metriken, Unix-Sockets, Telegram-Upstreams, ME-Sockets oder Mask-Backend-Verbindungen. Änderungen erfordern Listener-Neustart/Rebind.
+  - **Beschreibung**: Steuert die Segmentgröße für Client-Verbindungen. Standardmäßig wird der Wert auf den TCP-Listener angewendet und bleibt für die gesamte Verbindung aktiv. Wenn unter Linux zusätzlich `client_mss_bulk` gesetzt ist, begrenzt Telemt `TCP_MAXSEG` des akzeptierten Sockets während der ersten authentifizierten FakeTLS-Antwort (`ServerHello`) vorübergehend auf `client_mss` und stellt danach bei Erfolg, Schreibfehler oder Task-Abbruch die Bulk-MSS wieder her. Die Einstellung betrifft weder API, Metriken, Unix-Sockets, Telegram-Upstreams, ME-Sockets noch Mask-Backend-Verbindungen. Änderungen erfordern Listener-Neustart/Rebind.
   - **Betreiberhinweis**: Das zweistufige `synlimit`-Profil verlangt nicht, dass Telemt MSS automatisch deaktiviert. Betreiber, die externe Host-Tuning-Rezepte übernehmen, sollten bewusst entscheiden, ob MSS-Shaping für Handshake-Fragmentierung aktiv bleibt oder zugunsten höheren Medien-Durchsatzes deaktiviert wird.
   - **Performance-Hinweis**: Niedriges MSS erhöht die Paketanzahl vorhersehbar. Der ungefähre Segmentmultiplikator ist `ceil(1460 / client_mss)`.
   - **Beispiel**:
@@ -1981,8 +1987,8 @@ Dieses Dokument listet alle Konfigurationsschlüssel auf, die `config.toml` akze
     client_mss = "tspu"
     ```
 ## client_mss_bulk
-  - **Einschränkungen / Validierung**: `String`. Gleiche Grammatik wie [`client_mss`](#client_mss): leer/ausgelassen, Presets `"extreme-low"`/`"tspu"`/`"2in8"` oder ein Dezimalwert in `88..=4096`.
-  - **Beschreibung**: Optionale MSS für die Bulk-Phase. Wenn gesetzt, gilt das niedrige `client_mss` nur während der TLS-Handshake gesendet wird, einschließlich des von DPI inspizierten ServerHello. Sobald die Verbindung in den Relay-Betrieb wechselt, wird das MSS des Client-Sockets für die Bulk-Datenphase auf `client_mss_bulk` erhöht. So bleibt die Anti-DPI-Handshake-Fragmentierung erhalten, während Payload wieder in normal großen Paketen läuft; die ausgehende Paketanzahl sinkt ungefähr um den `client_mss`-Segmentmultiplikator (z. B. ~10x mit `"tspu"`). Nützlich auf Hosts, deren Abuse-Erkennung Pakete pro Sekunde statt Bandbreite zählt. Leer/ausgelassen bedeutet: Handshake-MSS für die gesamte Verbindung beibehalten (bisheriges Verhalten). Nur Linux; auf anderen Plattformen ein No-Op.
+  - **Einschränkungen / Validierung**: Nur Linux, Typ `String`. Gleiche Grammatik wie [`client_mss`](#client_mss): leer/ausgelassen, Presets `"extreme-low"`/`"tspu"`/`"2in8"` oder ein Dezimalwert in `88..=4096`. Ein nicht leerer Wert erfordert mindestens einen Listener mit effektivem `client_mss` und muss größer als der Handshake-Wert jedes teilnehmenden Listeners sein. Ein Listener kann mit `client_mss = ""` ausdrücklich aus dem Profil ausgenommen werden.
+  - **Beschreibung**: Aktiviert ein experimentelles Profil mit zwei Größen. Der Listener verwendet `client_mss_bulk` ab dem Beginn der Verbindung, einschließlich des Empfangs von `ClientHello`. Während der ersten authentifizierten FakeTLS-Antwort (`ServerHello`) begrenzt Telemt `TCP_MAXSEG` des akzeptierten Sockets vorübergehend auf `client_mss` und verwendet Schreibvorgänge, die nicht größer als dieser Wert sind; vor normalem MTProto-Verkehr wird die vorherige MSS wiederhergestellt. Die Wiederherstellung wird bei Erfolg, Schreibfehler und Task-Abbruch versucht. TCP ist ein Bytestrom: `MSG_EOR`, TCP-Offloads, Verluste und Neuübertragungen können beobachtete Capture-Grenzen verändern; deshalb bleibt das Packet-Capture-Release-Gate maßgeblich. Wenn die Option leer ist oder fehlt, bleibt `client_mss` die Kernel-MSS für die gesamte Verbindung. Änderungen erfordern Listener-Neustart/Rebind.
   - **Beispiel**:
 
     ```toml
@@ -2011,7 +2017,7 @@ Dieses Dokument listet alle Konfigurationsschlüssel auf, die `config.toml` akze
     ```
 ## proxy_protocol_trusted_cidrs
   - **Einschränkungen / Validierung**: `IpNetwork[]`.
- – Wenn ausgelassen, werden standardmäßig „All Trust-CIDRs“ (`0.0.0.0/0` und `::/0`) verwendet. 
+ – Wenn ausgelassen, werden standardmäßig „All Trust-CIDRs“ (`0.0.0.0/0` und `::/0`) verwendet.
  > In der Produktion hinter HAProxy/nginx sollten Sie lieber explizite vertrauenswürdige CIDRs festlegen, anstatt sich auf diesen Fallback zu verlassen.
  – Wenn explizit auf ein leeres Array festgelegt, werden alle PROXY-Header abgelehnt.
   - **Beschreibung**: Vertrauenswürdige Quell-CIDRs dürfen PROXY Protokollheader bereitstellen (Sicherheitskontrolle).
@@ -2311,19 +2317,22 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
 | [`ip`](#ip) | `IpAddr` | — | `✘` |
 | [`port`](#port-serverlisteners) | `u16` | `server.port` | `✘` |
 | [`client_mss`](#client_mss-serverlisteners) | `String` | `[server].client_mss` | `✘` |
-| [`synlimit`](#synlimit-serverlisteners) | `false`, `"iptables"` oder `"nftables"` | `false` | `✔` |
-| [`synlimit_seconds`](#synlimit_seconds-serverlisteners) | `u32` | `60` | `✔` |
-| [`synlimit_hitcount`](#synlimit_hitcount-serverlisteners) | `u32` | `48` | `✔` |
-| [`synlimit_burst`](#synlimit_burst-serverlisteners) | `u32` | `1` | `✔` |
-| [`synlimit_ios_seconds`](#synlimit_ios_seconds-serverlisteners) | `u32` | `1` | `✔` |
-| [`synlimit_ios_hitcount`](#synlimit_ios_hitcount-serverlisteners) | `u32` | `12` | `✔` |
-| [`synlimit_ios_burst`](#synlimit_ios_burst-serverlisteners) | `u32` | `24` | `✔` |
-| [`synlimit_hashlimit_expire_ms`](#synlimit_hashlimit_expire_ms-serverlisteners) | `u32` | `60000` | `✔` |
-| [`synlimit_hashlimit_size`](#synlimit_hashlimit_size-serverlisteners) | `u32` | `32768` | `✔` |
+| [`synlimit`](#synlimit-serverlisteners) | `false`, `"iptables"`, `"nftables"` oder `"pf"` | `false` | `✘` |
+| [`synlimit_seconds`](#synlimit_seconds-serverlisteners) | `u32` | `60` | `✘` |
+| [`synlimit_hitcount`](#synlimit_hitcount-serverlisteners) | `u32` | `48` | `✘` |
+| [`synlimit_burst`](#synlimit_burst-serverlisteners) | `u32` | `24` | `✘` |
+| [`synlimit_ios_seconds`](#synlimit_ios_seconds-serverlisteners) | `u32` | `1` | `✘` |
+| [`synlimit_ios_hitcount`](#synlimit_ios_hitcount-serverlisteners) | `u32` | `12` | `✘` |
+| [`synlimit_ios_burst`](#synlimit_ios_burst-serverlisteners) | `u32` | `24` | `✘` |
+| [`synlimit_hashlimit_expire_ms`](#synlimit_hashlimit_expire_ms-serverlisteners) | `u32` | `60000` | `✘` |
+| [`synlimit_hashlimit_size`](#synlimit_hashlimit_size-serverlisteners) | `u32` | `32768` | `✘` |
 | [`announce`](#announce) | `String` | — | `✘` |
 | [`announce_ip`](#announce_ip) | `IpAddr` | — | `✘` |
 | [`proxy_protocol`](#proxy_protocol) | `bool` | — | `✘` |
 | [`reuse_allow`](#reuse_allow) | `bool` | `false` | `✘` |
+| [`transport`](#transport-serverlisteners) | `"mtproxy"` oder `"web"` | `"mtproxy"` | `✘` |
+| [`web_client_ip_source`](#web_client_ip_source-serverlisteners) | `"x_forwarded_for"` | `"x_forwarded_for"` | `✘` |
+| [`web_trusted_proxy_cidrs`](#web_trusted_proxy_cidrs-serverlisteners) | `IpNetwork[]` | `[]` | `✘` |
 
 ## ip
   - **Einschränkungen / Validierung**: Erforderliches Feld. Muss ein `IpAddr` sein.
@@ -2356,8 +2365,8 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     client_mss = "256"
     ```
 ## synlimit (server.listeners)
-  - **Einschränkungen / Validierung**: `false`, `"iptables"` oder `"nftables"`. Ausgelassen oder `false` deaktiviert SYN-Limiting für diesen Listener.
-  - **Beschreibung**: Installiert pro Listener zweistufige Linux-netfilter-SYN-Fix-Regeln für den Listener-Port. `"iptables"` nutzt `iptables`/`ip6tables`-Filterregeln mit `hashlimit`, `length` und TTL/hop-limit Matches. `"nftables"` nutzt Telemt-eigene Tabellen mit per-source `meter`-Regeln und äquivalenten IPv4/IPv6-Classifieren. Die Regeln werden früh in `INPUT` eingefügt, akzeptieren SYN-Pakete unterhalb des Limits und lehnen SYN-Pakete oberhalb des Limits mit TCP RST ab, damit Clients zügig retryen statt auf ein stilles DROP-Timeout zu warten. Der generische Bucket wird über `synlimit_seconds`, `synlimit_hitcount` und `synlimit_burst` gesteuert; der iOS-ähnliche TTL/length-Bucket über `synlimit_ios_*`. Regeln werden zur Runtime reconciled und beim graceful Telemt-Shutdown entfernt; nach `SIGKILL` kann der Prozess sie nicht mehr bereinigen. Erfordert CAP_NET_ADMIN. `synlimit*` ist für vorhandene Listener-Endpunkte hot-reloadfähig; Änderungen an Listener-`ip` oder `port` erfordern weiterhin Restart/Rebind.
+  - **Einschränkungen / Validierung**: `false`, `"iptables"`, `"nftables"` oder `"pf"`. Fehlt der Wert oder ist er `false`, ist die SYN-Begrenzung für diesen Listener deaktiviert.
+  - **Beschreibung**: Installiert beim Start prozessverwaltete Firewall-Regeln pro Listener-Port. Linux akzeptiert nur `"iptables"` oder `"nftables"`, FreeBSD nur `"pf"`; andere Plattformen akzeptieren nur `false`. Linux-Netfilter akzeptiert SYN-Pakete unterhalb des Limits und weist überschüssige Pakete mit TCP RST ab. PF erzeugt getrennte `inet`-/`inet6`-Regeln und verwendet das native `max-src-conn-rate`; überschüssige zustandserzeugende Pakete werden still verworfen. Bei fehlenden Berechtigungen, fehlgeschlagener Backend-Validierung, Bereinigung veralteter Kandidaten oder Regelanwendung bricht der Start vor den Accept-Schleifen ab. Jede Änderung an `synlimit*` erfordert einen Prozessneustart. Die Kombination aktivierter SYN-Begrenzung mit `--run-as-user` oder `--run-as-group` wird abgelehnt, bis ein separater privilegierter Firewall-Helfer vorhanden ist. Die Regeln werden beim geordneten Herunterfahren entfernt; nach `SIGKILL` kann der Prozess sie nicht bereinigen. Linux benötigt CAP_NET_ADMIN. FreeBSD benötigt root und einen Hook im PF-Hauptregelsatz, z. B. `anchor "telemt_synlimit/*"`.
   - **Betreiberhinweis**: Telemt persistiert keine Regeln mit `iptables-persistent`, schreibt nicht nach `/etc/sysctl.d`, ändert keine systemd-Limits und modifiziert `client_mss` nicht. Host-Level-Tuning muss manuell angewendet werden, falls die Deployment-Policy es verlangt.
   - **Beispiel**:
 
@@ -2371,10 +2380,15 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     ip = "::"
     port = 443
     synlimit = "nftables"
+
+    [[server.listeners]]
+    ip = "0.0.0.0"
+    port = 443
+    synlimit = "pf"
     ```
 ## synlimit_seconds (server.listeners)
   - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `60`.
-  - **Beschreibung**: Generisches SYN-Fix-Token-Bucket-Intervall. Die Rate beträgt `synlimit_hitcount / synlimit_seconds` und wird in native netfilter-Rateneinheiten (`second`, `minute`, `hour` oder `day` gerendert. Dieser Bucket verarbeitet SYN-Pakete, die nicht mit dem iOS-ähnlichen Klassifizierer TTL/length übereinstimmen.
+  - **Beschreibung**: Generisches SYN-Fix-Token-Bucket-Intervall. Unter Linux beträgt die Rate `synlimit_hitcount / synlimit_seconds` und wird in native Netfilter-Rateneinheiten (`second`, `minute`, `hour` oder `day`) gerendert. Dieser Bucket verarbeitet SYN-Pakete, die nicht mit dem iOS-ähnlichen TTL-/Length-Klassifizierer übereinstimmen. PF rendert dasselbe Paar als `max-src-conn-rate hitcount/seconds`.
   - **Beispiel**:
 
     ```toml
@@ -2386,7 +2400,7 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     ```
 ## synlimit_hitcount (server.listeners)
   - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `48`.
-  - **Beschreibung**: Generischer SYN-Fix-Token-Bucket-Ratenbetrag. Zusammen mit `synlimit_seconds` definiert es die zulässige Source-IP-SYN-Rate, bevor überschüssige SYN-Pakete TCP RST empfangen.
+  - **Beschreibung**: Generischer SYN-Fix-Token-Bucket-Ratenbetrag. Zusammen mit `synlimit_seconds` definiert er die zulässige Source-IP-SYN-Rate. Linux-Netfilter weist Überschreitungen mit TCP RST ab; PF verwirft überschüssige zustandserzeugende Pakete still.
   - **Beispiel**:
 
     ```toml
@@ -2397,7 +2411,7 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     synlimit_hitcount = 48
     ```
 ## synlimit_burst (server.listeners)
-  - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `1`.
+  - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `24`.
   - **Beschreibung**: Generische SYN-Fix-Token-Bucket-Burst-Größe. Höhere Werte ermöglichen kurze Verbindungsstöße von derselben Source-IP, bevor die stabile `synlimit_hitcount / synlimit_seconds`-Rate durchgesetzt wird.
   - **Beispiel**:
 
@@ -2406,7 +2420,7 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     ip = "0.0.0.0"
     port = 443
     synlimit = "iptables"
-    synlimit_burst = 1
+    synlimit_burst = 24
     ```
 ## synlimit_ios_seconds (server.listeners)
   - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `1`.
@@ -2446,7 +2460,7 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     ```
 ## synlimit_hashlimit_expire_ms (server.listeners)
   - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `60000`.
-  - **Beschreibung**: Eintragsablauf in Millisekunden für iptables/ip6tables Hashlimit-Buckets. nftables-Messgeräte verwenden den vom Kernel verwalteten Zustand und machen diesen genauen Knopf nicht verfügbar.
+  - **Beschreibung**: Eintragsablauf in Millisekunden für iptables/ip6tables Hashlimit-Buckets. nftables-Meter und PF-Source-Tracking verwenden kernelverwalteten Zustand und stellen diesen genauen Parameter nicht bereit.
   - **Beispiel**:
 
     ```toml
@@ -2458,7 +2472,7 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     ```
 ## synlimit_hashlimit_size (server.listeners)
   - **Einschränkungen / Validierung**: `u32`, muss `> 0` sein. Der Default ist `32768`.
-  - **Beschreibung**: Hash-Tabellengröße für iptables/ip6tables Hashlimit-Buckets. nftables-Messgeräte verwenden den vom Kernel verwalteten Zustand und machen diesen genauen Knopf nicht verfügbar.
+  - **Beschreibung**: Hash-Tabellengröße für iptables/ip6tables Hashlimit-Buckets. nftables-Meter und PF-Source-Tracking verwenden kernelverwalteten Zustand und stellen diesen genauen Parameter nicht bereit.
   - **Beispiel**:
 
     ```toml
@@ -2511,6 +2525,142 @@ Hinweis: Dieser Abschnitt akzeptiert auch den Legacy-Alias `[server.admin_api]` 
     ip = "0.0.0.0"
     reuse_allow = false
     ```
+
+## transport (server.listeners)
+  - **Einschränkungen / Validierung**: `"mtproxy"` oder `"web"`.
+  - **Beschreibung**: Wählt das vom Listener akzeptierte Protokoll. Ein WEB-Listener empfängt unverschlüsseltes HTTP/1.1 von einem vertrauenswürdigen TLS-Terminator und erfordert einen Prozessneustart. Er muss `proxy_protocol = false` und `reuse_allow = false` verwenden; `client_mss`, `synlimit`, `announce` und `announce_ip` sind nicht zulässig.
+  - **Beispiel**:
+
+    ```toml
+    [[server.listeners]]
+    ip = "127.0.0.1"
+    port = 18080
+    transport = "web"
+    proxy_protocol = false
+    web_trusted_proxy_cidrs = ["127.0.0.1/32"]
+    ```
+
+## web_client_ip_source (server.listeners)
+  - **Einschränkungen / Validierung**: Die erste WEB-Implementierung unterstützt ausschließlich `"x_forwarded_for"`.
+  - **Beschreibung**: Wählt die L7-Quelle der ursprünglichen Client-IP. Von einem direkten TCP-Peer in `web_trusted_proxy_cidrs` akzeptiert Telemt genau eine syntaktisch gültige `X-Forwarded-For`-Adresse. Fehlt der Header bei einem vertrauenswürdigen Peer, verwendet Telemt dessen Adresse; konfigurieren Sie den TLS-Terminator so, dass der Header gesetzt wird, damit clientbezogene Limits und Quellrichtlinien die echte Client-Adresse verwenden.
+
+## web_trusted_proxy_cidrs (server.listeners)
+  - **Einschränkungen / Validierung**: Nicht leeres CIDR-Array nur für WEB; ein `/0`-Netz wird abgelehnt. Für einen MTProxy-Listener ist das Feld ungültig.
+  - **Beschreibung**: Vertrauensgrenze für den unmittelbar vorgeschalteten NGINX- oder HAProxy-Peer. Tragen Sie nur Adressen ein, die diesen Listener direkt erreichen können, und veröffentlichen Sie den unverschlüsselten Listener niemals in einem nicht vertrauenswürdigen Netz.
+
+
+# [web]
+
+Der WEB-Modus transportiert MTProxy-Datenverkehr von Telegram Desktop über HTTPS, dessen TLS-Verbindung von einem externen NGINX oder HAProxy terminiert wird. Telemt empfängt unverschlüsseltes HTTP/1.1 auf einem privaten Listener mit `transport = "web"`. Lesen Sie vor der Aktivierung die [vollständige WEB-Bereitstellungsanleitung](../WEB/WEB_PROXY.de.md).
+
+| Schlüssel | Typ | Default | Hot-Reload |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | `✔` |
+| `carrier` | `"https"` oder `"https-lanes"` | `"https"` | `✔` |
+| `limits` | Tabelle | begrenzte Defaults | `✘` |
+| `timeouts` | Tabelle | begrenzte Defaults | `✔` |
+| `vhosts` | Tabellen-Array | `[]` | `✔` |
+
+`enabled = true` erfordert mindestens einen durch die Netzwerkrichtlinie zugelassenen WEB-Listener, einen vhost und mindestens ein Profil in jedem vhost. `carrier = "https"` behält den serialisierten HTTPS-Transport bei. Mit `carrier = "https-lanes"` erhalten Stream null und jeder logische Stream eigene Uplink-Sequenzen, Downlink-Cursor, Wiederholungen und Long Polls; dieser Carrier erfordert `max_http_handlers >= 2` und öffentliches HTTP/2 am TLS-Terminator, um anwendungsseitiges Head-of-Line-Blocking zwischen Streams zu entfernen. Ein Reload wendet `carrier` nur auf neu ausgegebene Bridge-Sitzungen an. Das Deaktivieren von WEB beendet nach dem Reload die Ausgabe neuer Bridge- und Session-Zugangsdaten; zum Widerrufen aktiver Sitzungen eines einzelnen Benutzers verwenden Sie die Users-API.
+
+# [web.limits]
+
+Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Request-Bodys, statischen Snapshots und Admission-Pfade. Alle Werte werden gemeinsam validiert: Eigentümerbezogene Grenzen dürfen die globalen Grenzen nicht überschreiten, Queue-Reserven müssen den Fortschritt von Control Frames gewährleisten, Body-Reservierungen müssen in ihr globales Budget passen und alle deklarierten Byte-Grenzen müssen in `memory_envelope_bytes` passen. Jede Änderung in dieser Tabelle erfordert einen Prozessneustart.
+
+| Schlüssel | Typ | Default | Beschreibung |
+| --- | --- | --- | --- |
+| `max_header_bytes` | `usize` | `16384` | Maximale Bytes in einem HTTP-Request-Head. |
+| `max_body_bytes` | `usize` | `2097152` | Maximale Größe eines gesammelten Carrier-Request-Bodys. |
+| `max_frame_payload_bytes` | `usize` | `1048576` | Maximale Nutzlast eines WEB-Frames. |
+| `carrier_batch_bytes` | `usize` | `2097152` | Maximale Größe eines kodierten Downlink-Batches. |
+| `max_frames_per_body` | `usize` | `4096` | Maximale Zahl geparster oder ausgegebener Frames pro Carrier-Body. |
+| `max_http_connections` | `usize` | `1024` | Prozessweit akzeptierte WEB-HTTP-Verbindungen. |
+| `max_http_handlers` | `usize` | `512` | Prozessweit gleichzeitig ausgeführte HTTP-Handler; HTTPS-Lanes dürfen höchstens die Hälfte mit Long Polls belegen, der Rest bleibt für Session-, Uplink- und Steuerarbeit verfügbar. |
+| `max_body_readers` | `usize` | `32` | Prozessweit gleichzeitig gesammelte Request-Bodys. |
+| `max_body_bytes_global` | `usize` | `67108864` | Globales Byte-Budget für gesammelte Bodys. |
+| `max_sessions_global` | `usize` | `128` | Prozessweit aktive WEB-Sitzungen. |
+| `max_sessions_per_ip` | `usize` | `16` | Aktive Sitzungen pro weitergeleiteter Client-IP. |
+| `max_streams_per_session` | `usize` | `128` | Standardgrenze aktiver logischer Streams pro Sitzung. |
+| `max_streams_global` | `usize` | `4096` | Prozessweit aktive logische Streams. |
+| `max_stream_handshakes` | `usize` | `256` | Gleichzeitig ausgeführte innere MTProxy-Handshakes. |
+| `max_tombstones_per_session` | `usize` | `4096` | Pro Sitzung gespeicherte IDs geschlossener Streams. |
+| `pending_bytes_per_session` | `usize` | `33554432` | Eingereihte Daten- und Steuerbytes pro Sitzung. |
+| `pending_bytes_global` | `usize` | `536870912` | Prozessweit eingereihte Daten- und Steuerbytes. |
+| `pending_items_per_session` | `usize` | `16384` | Eingereihte Daten- und Steuerelemente pro Sitzung. |
+| `pending_items_global` | `usize` | `262144` | Prozessweit eingereihte Daten- und Steuerelemente. |
+| `control_bytes_per_session` | `usize` | `262144` | Nur für Control Frames verfügbares Byte-Budget pro Sitzung. |
+| `control_bytes_global` | `usize` | `16777216` | Prozessweites, nur für Control Frames verfügbares Byte-Budget. |
+| `max_bootstraps_global` | `usize` | `512` | Prozessweit aktive Bootstrap-Zugangsdaten. |
+| `max_bootstraps_per_ip` | `usize` | `64` | Aktive Bootstrap-Zugangsdaten pro Client-IP. |
+| `max_vhosts` | `usize` | `8` | Konfigurierte virtuelle WEB-Hosts. |
+| `max_profiles` | `usize` | `32` | WEB-Profile über alle vhosts. |
+| `max_static_files` | `usize` | `4096` | Einträge statischer Snapshots über alle vhosts. |
+| `max_static_file_bytes` | `usize` | `8388608` | Maximale Größe einer statischen Datei. |
+| `max_static_bytes` | `usize` | `67108864` | Bytes statischer Snapshots über alle vhosts. |
+| `memory_envelope_bytes` | `usize` | `805306368` | Deklarierter Rahmen für HTTP-Heads, Bodys, Queues und statische Snapshots; maximal 4 GiB. |
+| `new_bootstraps_per_minute` | `u32` | `1200` | Nachhaltige prozessweite Ausgaberate für Bootstraps. |
+| `new_bootstraps_burst` | `u32` | `256` | Prozessweiter Burst für die Bootstrap-Ausgabe. |
+| `new_sessions_per_minute` | `u32` | `600` | Nachhaltige prozessweite Erstellungsrate für Sitzungen. |
+| `new_sessions_burst` | `u32` | `128` | Prozessweiter Burst für die Sitzungserstellung. |
+| `new_streams_per_minute` | `u32` | `6000` | Nachhaltige Erstellungsrate für logische Streams. |
+| `new_streams_burst` | `u32` | `512` | Prozessweiter Burst für die Stream-Erstellung. |
+
+# [web.timeouts]
+
+Alle Timeouts werden in Sekunden angegeben und müssen im Bereich `1..=3600` liegen. Die längste Request-Deadline muss kleiner als `http_idle_secs` sein.
+
+| Schlüssel | Typ | Default | Hot-Reload | Beschreibung |
+| --- | --- | --- | --- | --- |
+| `header_secs` | `u64` | `10` | `✔` | Empfang eines vollständigen HTTP-Request-Heads. |
+| `body_secs` | `u64` | `30` | `✔` | Sammeln eines authentifizierten Carrier-Bodys. |
+| `stream_handshake_secs` | `u64` | `10` | `✔` | Abschluss eines inneren MTProxy-Handshakes. |
+| `long_poll_secs` | `u64` | `25` | `✔` | Maximale Dauer eines leeren Downlink-Long-Polls. |
+| `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Lebensdauer ungenutzter Bootstraps und geschlossener Token-Replay-Marker. |
+| `reconnect_grace_secs` | `u64` | `120` | `✔` | Maximale Carrier-Inaktivität bis zum Schließen der Sitzung. |
+| `http_idle_secs` | `u64` | `75` | `✔` | Idle-Lebensdauer einer WEB-HTTP-Keep-Alive-Verbindung. |
+| `shutdown_secs` | `u64` | `15` | `✔` | Deadline für das kontrollierte Beenden von WEB. |
+| `decoy_header_secs` | `u64` | `30` | `✔` | Deadline für Verbindung und Response-Head eines HTTP-Decoys. |
+
+# [[web.vhosts]]
+
+| Schlüssel | Typ | Erforderlich | Hot-Reload | Beschreibung |
+| --- | --- | --- | --- | --- |
+| `host` | `String` | ja | `✔` | Eindeutiger, kanonischer ACE-FQDN in Kleinbuchstaben ohne Port, Pfad, Zugangsdaten oder abschließenden Punkt. |
+| `public_addr` | `SocketAddr` | ja | `✔` | Konkrete öffentliche IP auf Port `443`; wird im Ziel-Tupel des inneren Relays verwendet. |
+| `decoy` | Tabelle | ja | `✔` | Gewöhnlicher Site-Fallback für nicht authentifizierten oder ungültigen Datenverkehr. |
+| `profiles` | Tabellen-Array | bei aktiviertem WEB | `✔` | Explizite Benutzer und Client-Secret-Modi für diesen Hostnamen. |
+
+Der Hostname wird bei der Validierung normalisiert und muss von Telegram Desktop akzeptiert werden. Ein Bootstrap ist ein Bearer-Token: Client-Adresse und IP-Familie dürfen sich vor der Sitzungserstellung ändern. Ein ungenutzter Bootstrap bleibt über einen Konfigurations-Reload hinweg nur gültig, solange dieselbe Profilidentität aktiv bleibt.
+
+# [web.vhosts.decoy]
+
+Genau ein Decoy-Modus ist erforderlich:
+
+| Modus | Erforderliche Schlüssel | Validierung |
+| --- | --- | --- |
+| `http_upstream` | `upstream` | Ein `http://`-Origin mit Loopback-, Link-Local- oder privater IP-Adresse als Literal; keine Zugangsdaten, kein Pfad, Query oder Fragment. |
+| `static_directory` | `directory`; optional `index = "index.html"` | Absolutes reales Verzeichnis und ein sicherer Index-Dateiname. Symlinks und Pfade außerhalb des Verzeichnisses werden abgelehnt; der unveränderliche Snapshot wird innerhalb von `[web.limits]` geladen. |
+
+# [[web.vhosts.profiles]]
+
+| Schlüssel | Typ | Erforderlich | Default | Beschreibung |
+| --- | --- | --- | --- | --- |
+| `user` | `String` | ja | — | Vorhandener Schlüssel aus `[access.users]`. |
+| `secret_mode` | `"plain"` oder `"dd"` | ja | — | Exakte Secret-Darstellung für Telegram Desktop. `ee` wird nicht unterstützt. |
+| `max_sessions` | `usize` | nein | `web.limits.max_sessions_global` | Aktive Sitzungen für dieses Profil. |
+| `max_streams` | `usize` | nein | `web.limits.max_streams_global` | Aktive logische Streams für dieses Profil. |
+| `max_streams_per_session` | `usize` | nein | `web.limits.max_streams_per_session` | Aktive logische Streams in einer Profilsitzung. |
+
+Profilgrenzen müssen ungleich null sein und dürfen die zugehörigen globalen Grenzen nicht überschreiten. Doppelte `(user, secret_mode)`-Profile in einem vhost werden abgelehnt.
+
+## WEB-Lebenszyklus und API-Verwaltung
+
+- Config-Watcher und Generations-Reload wenden `web.enabled`, `web.carrier`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Bestehende Sitzungen behalten Carrier, Grenzen und Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden die aktive Generation.
+- Bestand und Vertrauensrichtlinie der WEB-Listener unter `server.listeners` sowie alle Werte in `web.limits` sind prozesseigen und erfordern einen Neustart.
+- Es gibt keinen eigenen Endpunkt `/v1/web`. `GET /v1/config` lässt `[web]` aus und `PATCH /v1/config` lehnt einen Schlüssel `web` mit `400 section_not_editable` ab.
+- Zum entfernten Anwenden einer WEB-Richtlinie ändern Sie die zuständige TOML-Datei und rufen `POST /v1/system/reload` auf. Prüfen Sie anschließend `GET /v1/system/reload/{id}` und dessen `deferred_process_fields`. Starten Sie Telemt neu, wenn das Feld `server.listeners` oder `web.limits` enthält.
+- Vorhandene Access-Benutzer können über `/v1/users` erstellt, geändert, rotiert, aktiviert, deaktiviert und gelöscht werden. Das Erstellen eines Benutzers fügt kein WEB-Profil hinzu. Das Deaktivieren aktualisiert die Admission sofort und beendet die aktiven Sitzungen dieses Benutzers.
+- `PATCH /v1/config` kann `server.listeners` einschließlich der WEB-Listener-Felder speichern; ein geänderter WEB-Listener wird jedoch erst nach einem Prozessneustart aktiv.
 
 
 # [timeouts]

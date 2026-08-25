@@ -1,21 +1,23 @@
 //! Config-editing API: read managed sections and apply sparse field patches.
 //! `access.*` is intentionally not editable here (owned by the users API).
+//! `[server]` is only partially editable — see [`EDITABLE_SERVER_FIELDS`].
 
 use serde_json::Value as Json;
 use toml::Value as Toml;
 
 use super::ApiShared;
 use super::config_store::{
-    EDITABLE_SECTIONS, compute_revision, current_revision, load_config_from_disk,
-    save_sections_to_disk,
+    EDITABLE_SECTIONS, EDITABLE_SERVER_FIELDS, compute_snapshot_revision, is_editable_section,
+    load_candidate_snapshot, load_config_snapshot, render_server_listeners,
+    render_top_level_section, resolve_single_source_owner, upsert_toml_table, write_atomic,
 };
 use super::model::ApiFailure;
 use crate::config::ProxyConfig;
 use crate::config::hot_reload::classify_config_changes;
 use crate::maestro::reload::{ReloadAccepted, ReloadRequest, ReloadSubmitError};
-use crate::maestro::runtime_build::deferred_process_fields;
+use crate::maestro::runtime_build::{deferred_process_fields, resolve_reload_config};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
@@ -30,9 +32,15 @@ pub(super) struct PatchConfigResponse {
     pub reload: Option<ReloadAccepted>,
 }
 
-/// Shared-state wrapper around [`apply_patch_to_path`]: serializes config
-/// mutations behind `mutation_lock`, then records a runtime event. The route
-/// handler calls this; the core logic stays decoupled for unit tests.
+struct PreparedConfigPatch {
+    owner_path: PathBuf,
+    owner_contents: String,
+    desired_config: Arc<ProxyConfig>,
+    response: PatchConfigResponse,
+}
+
+/// Serializes config mutations behind `mutation_lock`, commits them, and records
+/// a runtime event. The route handler calls this shared-state wrapper.
 pub(super) async fn patch_config(
     patch_json: Json,
     expected_revision: Option<String>,
@@ -40,36 +48,29 @@ pub(super) async fn patch_config(
     shared: &ApiShared,
 ) -> Result<PatchConfigResponse, ApiFailure> {
     let _guard = shared.mutation_lock.lock().await;
-    if reload_request.is_some()
-        && let Some(reload_id) = shared.reload_control.in_progress().await
-    {
-        return Err(ApiFailure::new(
-            hyper::StatusCode::CONFLICT,
-            "reload_in_progress",
-            format!("Reload {} is already in progress", reload_id),
-        ));
+    let active_config = shared.active_runtime.load_full().config();
+    let mut prepared =
+        prepare_patch_to_path(&shared.config_path, &patch_json, expected_revision).await?;
+    let resolved = resolve_reload_config(&active_config, &prepared.desired_config);
+    prepared.response.runtime_reload_required = resolved.runtime_changed;
+    prepared.response.process_restart_required = !resolved.deferred_process_fields.is_empty();
+    prepared.response.deferred_process_fields = resolved.deferred_process_fields;
+    let reservation = if let Some(request) = reload_request.filter(|_| resolved.runtime_changed) {
+        Some(
+            shared
+                .reload_control
+                .reserve(prepared.response.revision.clone(), request)
+                .await
+                .map_err(reload_submit_failure)?,
+        )
+    } else {
+        None
+    };
+    write_atomic(prepared.owner_path, prepared.owner_contents).await?;
+    if let Some(reservation) = reservation {
+        prepared.response.reload = Some(reservation.enqueue(prepared.desired_config));
     }
-    let mut resp = apply_patch_to_path(&shared.config_path, &patch_json, expected_revision).await?;
-    if let Some(request) = reload_request {
-        let config = Arc::new(load_config_from_disk(&shared.config_path).await?);
-        let accepted = shared
-            .reload_control
-            .submit(config, resp.revision.clone(), request)
-            .await
-            .map_err(|error| match error {
-                ReloadSubmitError::InProgress(reload_id) => ApiFailure::new(
-                    hyper::StatusCode::CONFLICT,
-                    "reload_in_progress",
-                    format!("Reload {} is already in progress", reload_id),
-                ),
-                ReloadSubmitError::MaestroUnavailable => ApiFailure::new(
-                    hyper::StatusCode::SERVICE_UNAVAILABLE,
-                    "maestro_unavailable",
-                    "Maestro reload coordinator is unavailable",
-                ),
-            })?;
-        resp.reload = Some(accepted);
-    }
+    let resp = prepared.response;
     drop(_guard);
     shared
         .runtime_events
@@ -79,13 +80,25 @@ pub(super) async fn patch_config(
 
 /// Core patch logic, decoupled from hyper/shared-state so it is unit-testable
 /// against a temp file. The route handler holds `mutation_lock` while calling this.
+#[cfg(test)]
 pub(super) async fn apply_patch_to_path(
     config_path: &Path,
     patch_json: &Json,
     expected_revision: Option<String>,
 ) -> Result<PatchConfigResponse, ApiFailure> {
+    let prepared = prepare_patch_to_path(config_path, patch_json, expected_revision).await?;
+    write_atomic(prepared.owner_path, prepared.owner_contents).await?;
+    Ok(prepared.response)
+}
+
+async fn prepare_patch_to_path(
+    config_path: &Path,
+    patch_json: &Json,
+    expected_revision: Option<String>,
+) -> Result<PreparedConfigPatch, ApiFailure> {
     // 1. optimistic concurrency
-    let current = current_revision(config_path).await?;
+    let loaded = load_config_snapshot(config_path, false).await?;
+    let current = compute_snapshot_revision(&loaded);
     if expected_revision.is_some_and(|expected| expected != current) {
         return Err(ApiFailure::new(
             hyper::StatusCode::CONFLICT,
@@ -94,7 +107,7 @@ pub(super) async fn apply_patch_to_path(
         ));
     }
 
-    // 2. convert + reject access / unknown sections
+    // 2. convert + reject access / unknown sections / forbidden server fields
     let patch_toml = json_to_toml(patch_json)
         .map_err(|e| ApiFailure::bad_request(format!("invalid patch: {}", e)))?;
     let patch_table = patch_toml
@@ -107,92 +120,210 @@ pub(super) async fn apply_patch_to_path(
             "access.* is managed via the users API, not editable here",
         ));
     }
-    for key in patch_table.keys() {
-        if !EDITABLE_SECTIONS.contains(&key.as_str()) {
+    for (key, value) in patch_table {
+        if !is_editable_section(key.as_str()) {
             return Err(ApiFailure::new(
                 hyper::StatusCode::BAD_REQUEST,
                 "section_not_editable",
                 format!("section not editable: {}", key),
             ));
         }
+        if key == "server" {
+            validate_server_patch(value)?;
+        }
     }
     let touched: Vec<&str> = patch_table
         .keys()
         .map(|k| k.as_str())
-        .filter(|k| EDITABLE_SECTIONS.contains(k))
+        .filter(|k| is_editable_section(k))
         .collect();
     if touched.is_empty() {
         return Err(ApiFailure::bad_request("empty patch: no editable sections"));
     }
 
-    // 3. Parse old + merged from the SAME deserialize path so the classifier
-    //    sees only the delta this patch introduces. `ProxyConfig::load` applies
-    //    include-expansion / legacy-compat / normalization that a bare
-    //    `try_into` does not; mixing the two paths would make unrelated fields
-    //    compare unequal and spuriously force `restart_required`.
-    let original = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|e| ApiFailure::internal(format!("failed to read config: {}", e)))?;
-    let original_toml: Toml = toml::from_str(&original)
-        .map_err(|e| ApiFailure::internal(format!("failed to parse config: {}", e)))?;
-    let old_cfg: ProxyConfig = original_toml
-        .clone()
-        .try_into()
-        .map_err(|e| ApiFailure::internal(format!("config does not deserialize: {}", e)))?;
-
-    let mut merged = original_toml;
+    // 3. Merge against the fully expanded and normalized desired config. The
+    // source owner is resolved separately so included sections stay in their
+    // original file and unrelated source files remain byte-identical.
+    let old_cfg = loaded.config.clone();
+    let mut merged = Toml::try_from(&old_cfg)
+        .map_err(|e| ApiFailure::internal(format!("failed to serialize config: {}", e)))?;
     deep_merge(&mut merged, &patch_toml);
 
-    let new_cfg: ProxyConfig = merged
+    let requested_cfg: ProxyConfig = merged
         .clone()
         .try_into()
         .map_err(|e| ApiFailure::bad_request(format!("config does not deserialize: {}", e)))?;
-    new_cfg
+    requested_cfg
         .validate()
         .map_err(|e| ApiFailure::bad_request(format!("config validation failed: {}", e)))?;
 
-    // 4. classify changes (Telemt's own hot/restart rule)
+    let ownership_targets: Vec<&str> = touched
+        .iter()
+        .map(|section| {
+            if *section == "server" {
+                "server.listeners"
+            } else {
+                *section
+            }
+        })
+        .collect();
+    let owner_path = resolve_single_source_owner(&loaded, config_path, &ownership_targets)?;
+    let mut owner_contents = loaded
+        .source_contents
+        .get(&owner_path)
+        .cloned()
+        .ok_or_else(|| ApiFailure::internal("config source owner is missing from snapshot"))?;
+    for section in &touched {
+        if *section == "server" {
+            let rendered = render_server_listeners(&requested_cfg)?;
+            owner_contents = upsert_toml_table(&owner_contents, "server.listeners", &rendered);
+        } else {
+            let rendered = render_top_level_section(&requested_cfg, section)?;
+            owner_contents = upsert_toml_table(&owner_contents, section, &rendered);
+        }
+    }
+
+    let candidate = load_candidate_snapshot(
+        config_path,
+        &loaded.source_contents,
+        owner_path.clone(),
+        owner_contents.clone(),
+    )
+    .await?;
+    if touched.contains(&"server")
+        && serde_json::to_value(&candidate.config.server.listeners).ok()
+            != serde_json::to_value(&requested_cfg.server.listeners).ok()
+    {
+        return Err(ApiFailure::new(
+            hyper::StatusCode::BAD_REQUEST,
+            "ambiguous_listeners",
+            "server.listeners normalizes to a different effective listener set",
+        ));
+    }
+
+    // 4. classify the validated, normalized candidate.
+    let revision = compute_snapshot_revision(&candidate);
+    let new_cfg = candidate.config;
     let class = classify_config_changes(&old_cfg, &new_cfg);
     let deferred_process_fields = deferred_process_fields(&old_cfg, &new_cfg);
 
-    // 5. write only the touched top-level sections
-    let revision = save_sections_to_disk(config_path, &new_cfg, &touched).await?;
-
-    Ok(PatchConfigResponse {
-        revision,
-        restart_required: class.restart_required,
-        runtime_reload_required: class.restart_required,
-        process_restart_required: !deferred_process_fields.is_empty(),
-        deferred_process_fields,
-        changed: class.changed,
-        reload: None,
+    Ok(PreparedConfigPatch {
+        owner_path,
+        owner_contents,
+        desired_config: Arc::new(new_cfg),
+        response: PatchConfigResponse {
+            revision,
+            restart_required: class.restart_required,
+            runtime_reload_required: class.restart_required,
+            process_restart_required: !deferred_process_fields.is_empty(),
+            deferred_process_fields,
+            changed: class.changed,
+            reload: None,
+        },
     })
+}
+
+fn reload_submit_failure(error: ReloadSubmitError) -> ApiFailure {
+    match error {
+        ReloadSubmitError::InProgress(reload_id) => ApiFailure::new(
+            hyper::StatusCode::CONFLICT,
+            "reload_in_progress",
+            format!("Reload {} is already in progress", reload_id),
+        ),
+        ReloadSubmitError::MaestroUnavailable => ApiFailure::new(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            "maestro_unavailable",
+            "Maestro reload coordinator is unavailable",
+        ),
+    }
 }
 
 /// Return only the editable config sections + current revision.
 pub(super) async fn read_managed_config(config_path: &Path) -> Result<(Toml, String), ApiFailure> {
-    let original = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|e| ApiFailure::internal(format!("failed to read config: {}", e)))?;
-    let parsed: Toml = toml::from_str(&original)
-        .map_err(|e| ApiFailure::internal(format!("failed to parse config: {}", e)))?;
+    let loaded = load_config_snapshot(config_path, false).await?;
+    let revision = compute_snapshot_revision(&loaded);
+    let parsed = Toml::try_from(&loaded.config)
+        .map_err(|error| ApiFailure::internal(format!("failed to serialize config: {error}")))?;
 
     let parsed_table = parsed
         .as_table()
         .cloned()
         .unwrap_or_else(toml::value::Table::new);
     // Whitelist: return ONLY the editable sections. A blacklist (just removing
-    // `access`) would leak `server` (carries the API `auth_header` + per-node
-    // identity) and `network` (per-node addresses). Mirror the PATCH contract.
+    // `access`) would leak `server.api` (auth_header) and `network` (per-node
+    // addresses). Mirror the PATCH contract, including the nested server
+    // field-level allowlist.
     let mut table = toml::value::Table::new();
     for section in EDITABLE_SECTIONS {
         if let Some(value) = parsed_table.get(*section) {
             table.insert((*section).to_string(), value.clone());
         }
     }
+    if let Some(server) = parsed_table.get("server") {
+        if let Some(filtered) = filter_server_for_read(server) {
+            table.insert("server".to_string(), filtered);
+        }
+    }
 
-    let revision = compute_revision(&original);
     Ok((Toml::Table(table), revision))
+}
+
+/// Keep only [`EDITABLE_SERVER_FIELDS`] from a `[server]` table for GET.
+fn filter_server_for_read(server: &Toml) -> Option<Toml> {
+    let Some(src) = server.as_table() else {
+        return None;
+    };
+    let mut out = toml::value::Table::new();
+    for field in EDITABLE_SERVER_FIELDS {
+        if let Some(value) = src.get(*field) {
+            // Skip empty listeners arrays so absent-vs-empty stays consistent
+            // with other optional sections.
+            if *field == "listeners" {
+                if let Some(arr) = value.as_array() {
+                    if arr.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            out.insert((*field).to_string(), value.clone());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Toml::Table(out))
+    }
+}
+
+/// Reject any `[server]` patch keys outside [`EDITABLE_SERVER_FIELDS`].
+fn validate_server_patch(server: &Toml) -> Result<(), ApiFailure> {
+    let Some(table) = server.as_table() else {
+        return Err(ApiFailure::new(
+            hyper::StatusCode::BAD_REQUEST,
+            "section_not_editable",
+            "server patch must be a JSON object",
+        ));
+    };
+    if table.is_empty() {
+        return Err(ApiFailure::bad_request(
+            "empty server patch: provide at least one editable field \
+             (currently: listeners)",
+        ));
+    }
+    for key in table.keys() {
+        if !EDITABLE_SERVER_FIELDS.contains(&key.as_str()) {
+            return Err(ApiFailure::new(
+                hyper::StatusCode::BAD_REQUEST,
+                "field_not_editable",
+                format!(
+                    "server.{} is not editable via the config API; allowed server fields: {}",
+                    key,
+                    EDITABLE_SERVER_FIELDS.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Convert a serde_json value to a toml value. `null` is dropped from objects
@@ -223,7 +354,8 @@ fn json_to_toml(j: &Json) -> Result<Toml, String> {
             let mut table = toml::value::Table::new();
             for (k, v) in map {
                 if v.is_null() {
-                    continue; // skip nulls instead of erroring at object level
+                    // TOML has no null value, so sparse object nulls are omitted.
+                    continue;
                 }
                 table.insert(k.clone(), json_to_toml(v)?);
             }
@@ -251,210 +383,5 @@ fn deep_merge(base: &mut Toml, patch: &Toml) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn json_object_converts_to_toml_table() {
-        let j: Json = serde_json::json!({"censorship": {"tls_domain": "a.com"}, "default_dc": 2});
-        let t = json_to_toml(&j).expect("convertible");
-        let table = t.as_table().unwrap();
-        assert_eq!(table["censorship"]["tls_domain"].as_str(), Some("a.com"));
-        assert_eq!(table["default_dc"].as_integer(), Some(2));
-    }
-
-    #[test]
-    fn deep_merge_overlays_tables_and_replaces_scalars() {
-        let mut base: Toml =
-            toml::from_str("[censorship]\ntls_domain = \"old\"\nfake_cert_len = 100\n").unwrap();
-        let patch: Toml = toml::from_str("[censorship]\ntls_domain = \"new\"\n").unwrap();
-
-        deep_merge(&mut base, &patch);
-
-        let cens = base["censorship"].as_table().unwrap();
-        assert_eq!(cens["tls_domain"].as_str(), Some("new")); // overlaid
-        assert_eq!(cens["fake_cert_len"].as_integer(), Some(100)); // preserved
-    }
-
-    use std::path::PathBuf;
-
-    fn temp_config(body: &str) -> (PathBuf, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, body).unwrap();
-        (path, dir)
-    }
-
-    #[tokio::test]
-    async fn patch_rejects_access_section() {
-        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
-        let patch: Json = serde_json::json!({"access": {"users": {"x": "y"}}});
-        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
-        assert_eq!(err.code, "access_not_editable");
-    }
-
-    #[tokio::test]
-    async fn patch_revision_conflict() {
-        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
-        let patch: Json = serde_json::json!({"censorship": {"tls_domain": "b"}});
-        let err = apply_patch_to_path(&path, &patch, Some("deadbeef".into()))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, "revision_conflict");
-    }
-
-    #[tokio::test]
-    async fn patch_sni_reports_restart_required() {
-        let (path, _d) =
-            temp_config("[censorship]\ntls_domain = \"a.com\"\n[server]\nport = 443\n");
-        let patch: Json = serde_json::json!({"censorship": {"tls_domain": "b.com"}});
-        let resp = apply_patch_to_path(&path, &patch, None).await.unwrap();
-        assert!(resp.restart_required);
-        assert!(resp.runtime_reload_required);
-        assert!(!resp.process_restart_required);
-        assert!(resp.deferred_process_fields.is_empty());
-        assert!(resp.changed.iter().any(|c| c == "censorship"));
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("tls_domain = \"b.com\""));
-        assert_eq!(
-            resp.revision,
-            crate::api::config_store::compute_revision(&written)
-        );
-    }
-
-    #[tokio::test]
-    async fn read_managed_config_strips_access() {
-        let (path, _d) = temp_config(
-            "[censorship]\ntls_domain = \"a.com\"\n[access.users]\nbob = \"deadbeef\"\n",
-        );
-        let (value, revision) = read_managed_config(&path).await.unwrap();
-        let table = value.as_table().unwrap();
-        assert!(table.contains_key("censorship"));
-        assert!(!table.contains_key("access")); // secrets never leave the box here
-        assert_eq!(revision, current_revision(&path).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn read_managed_config_returns_only_editable_sections() {
-        // server carries the API auth_header + per-node identity; network carries
-        // per-node addresses. Neither must be exposed by GET /v1/config.
-        let (path, _d) = temp_config(concat!(
-            "[censorship]\ntls_domain = \"a\"\n",
-            "[server]\nport = 443\n[server.api]\nauth_header = \"SECRET\"\n",
-            "[network]\nipv4 = \"1.2.3.4\"\n",
-            "[access.users]\nbob = \"deadbeef\"\n",
-        ));
-        let (value, _rev) = read_managed_config(&path).await.unwrap();
-        let table = value.as_table().unwrap();
-        assert!(table.contains_key("censorship"));
-        assert!(!table.contains_key("server")); // no API auth_header / identity leak
-        assert!(!table.contains_key("network")); // no per-node identity leak
-        assert!(!table.contains_key("access")); // no users/secrets
-    }
-
-    #[tokio::test]
-    async fn patch_rejects_server_section() {
-        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
-        let patch: Json = serde_json::json!({"server": {"port": 1}});
-        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
-        assert_eq!(err.code, "section_not_editable");
-    }
-
-    #[tokio::test]
-    async fn patch_rejects_show_link_section() {
-        // show_link is a legacy top-level scalar/array (not a [table]); it cannot
-        // be upserted safely and is superseded by the editable general.links.show.
-        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
-        let patch: Json = serde_json::json!({"show_link": "*"});
-        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
-        assert_eq!(err.code, "section_not_editable");
-    }
-
-    #[tokio::test]
-    async fn patch_general_links_show_is_editable() {
-        // The supported replacement path: edit show via the general.links sub-table.
-        let (path, _d) = temp_config(
-            "[general]\nprefer_ipv6 = false\n[general.links]\nshow = \"*\"\n\
-             [censorship]\ntls_domain = \"a\"\n",
-        );
-        let patch: Json = serde_json::json!({"general": {"links": {"show": ["alice"]}}});
-        let resp = apply_patch_to_path(&path, &patch, None).await.unwrap();
-        assert!(resp.changed.iter().any(|c| c == "general"));
-        let written = tokio::fs::read_to_string(&path).await.unwrap();
-        let parsed: toml::Value = toml::from_str(&written).unwrap();
-        assert_eq!(
-            parsed["general"]["links"]["show"][0].as_str(),
-            Some("alice"),
-            "{written}"
-        );
-        // No leaked top-level [links]/[modes] and no duplicate sub-tables.
-        assert_eq!(written.matches("[general.links]").count(), 1, "{written}");
-    }
-
-    #[tokio::test]
-    async fn patch_links_public_port_written_as_integer_not_float_or_string() {
-        // A JSON integer must land on disk as a bare TOML integer (443), never
-        // 443.0 nor "443". The write re-renders from the typed config, so the
-        // u16 field dictates the output format regardless of JSON quirks.
-        let (path, _d) = temp_config("[general]\nprefer_ipv6 = false\n");
-        let patch: Json = serde_json::json!({"general": {"links": {"public_port": 443}}});
-        apply_patch_to_path(&path, &patch, None).await.unwrap();
-
-        let written = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(written.contains("public_port = 443"), "{written}");
-        assert!(
-            !written.contains("443.0"),
-            "must not be a float:\n{written}"
-        );
-        assert!(
-            !written.contains("\"443\""),
-            "must not be a string:\n{written}"
-        );
-
-        let parsed: toml::Value = toml::from_str(&written).unwrap();
-        assert_eq!(
-            parsed["general"]["links"]["public_port"].as_integer(),
-            Some(443),
-            "{written}"
-        );
-    }
-
-    #[tokio::test]
-    async fn patch_links_public_port_rejects_float() {
-        // 443.0 cannot deserialize into u16 -> rejected, not silently coerced.
-        let (path, _d) = temp_config("[general]\nprefer_ipv6 = false\n");
-        let patch: Json = serde_json::json!({"general": {"links": {"public_port": 443.0}}});
-        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
-        assert_eq!(err.status, hyper::StatusCode::BAD_REQUEST, "{:?}", err);
-    }
-
-    #[tokio::test]
-    async fn patch_links_public_port_rejects_string() {
-        // "443" is a string, not a u16 -> rejected.
-        let (path, _d) = temp_config("[general]\nprefer_ipv6 = false\n");
-        let patch: Json = serde_json::json!({"general": {"links": {"public_port": "443"}}});
-        let err = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
-        assert_eq!(err.status, hyper::StatusCode::BAD_REQUEST, "{:?}", err);
-    }
-
-    #[tokio::test]
-    async fn patch_empty_is_rejected() {
-        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
-        let patch: Json = serde_json::json!({});
-        assert!(apply_patch_to_path(&path, &patch, None).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn patch_log_level_is_hot() {
-        // general.log_level is hot-reloadable -> a patch changing only it must
-        // report restart_required = false (exercises the full apply path, not
-        // just the classifier). Default LogLevel is Normal; patch to "debug".
-        let (path, _d) = temp_config("[censorship]\ntls_domain = \"a\"\n");
-        let patch: Json = serde_json::json!({"general": {"log_level": "debug"}});
-        let resp = apply_patch_to_path(&path, &patch, None).await.unwrap();
-        assert!(!resp.restart_required);
-        assert!(!resp.runtime_reload_required);
-        assert!(!resp.process_restart_required);
-        assert!(resp.changed.iter().any(|c| c == "general"));
-    }
-}
+#[path = "config_edit/tests.rs"]
+mod tests;

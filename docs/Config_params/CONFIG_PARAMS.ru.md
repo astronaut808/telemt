@@ -23,6 +23,12 @@
  - [server.conntrack_control](#serverconntrack_control)
  - [server.api](#serverapi)
  - [server.listeners](#serverlisteners)
+ - [web](#web)
+ - [web.limits](#weblimits)
+ - [web.timeouts](#webtimeouts)
+ - [web.vhosts](#webvhosts)
+ - [web.vhosts.decoy](#webvhostsdecoy)
+ - [web.vhosts.profiles](#webvhostsprofiles)
  - [timeouts](#timeouts)
  - [censorship](#censorship)
  - [censorship.tls_fetch](#censorshiptls_fetch)
@@ -317,7 +323,7 @@
   - **Ограничения / валидация**: `String`. Если не указан, используется `"https://core.telegram.org/getProxyConfig"`.
   - **Описание**: Необязательный URL для получения `getProxyConfig` (IPv4). Telemt при всегда пытается выполнить новую загрузку с этого URL (и если не задан, использует `https://core.telegram.org/getProxyConfig`).
   - **Example**:
-  
+
     ```toml
     [general]
     proxy_config_v4_url = "https://core.telegram.org/getProxyConfig"
@@ -1893,7 +1899,7 @@
     ```
 ## client_mss
   - **Ограничения / валидация**: `String`. Пустое значение или отсутствие параметра означает, что Telemt не изменяет MSS, выбранный ядром. Поддерживаемые presets: `"extreme-low"` = `88`, `"tspu"` = `92`, `"2in8"` = `256`. Пользовательское десятичное значение должно быть строкой в диапазоне `88..=4096`.
-  - **Описание**: MSS для входящих TCP-соединений клиентов. Значение применяется к TCP listener-сокетам до `listen(2)`, чтобы Linux мог объявить его в SYN/ACK. Параметр влияет только на proxy client TCP listeners и не применяется к API, metrics, Unix sockets, Telegram upstreams, ME sockets или mask backend connections. Изменение требует restart/rebind listener’ов.
+  - **Описание**: Управляет размером сегментов в клиентских соединениях. По умолчанию значение применяется к TCP listener и действует в течение всего соединения. Если в Linux также задан `client_mss_bulk`, Telemt временно ограничивает `TCP_MAXSEG` принятого socket значением `client_mss` на время отправки начального аутентифицированного FakeTLS-ответа (`ServerHello`), а затем восстанавливает bulk MSS при успехе, ошибке записи или отмене задачи. Настройка не влияет на API, metrics, Unix sockets, Telegram upstreams, ME sockets и mask backend connections. Изменение требует перезапуска или повторного создания listener.
   - **Operator note**: Two-tier `synlimit` profile больше не требует автоматического отключения MSS внутри Telemt. Оператор должен сам решить, оставлять MSS shaping для handshake fragmentation или отключать его ради более высокой скорости media.
   - **Performance note**: Низкий MSS предсказуемо увеличивает количество TCP-сегментов. Приблизительный multiplier: `ceil(1460 / client_mss)`.
   - **Пример**:
@@ -1903,8 +1909,8 @@
     client_mss = "tspu"
     ```
 ## client_mss_bulk
-  - **Ограничения / валидация**: `String`. Грамматика та же, что у [`client_mss`](#client_mss) (пусто/не задано, пресеты `"extreme-low"`/`"tspu"`/`"2in8"` либо десятичное число в диапазоне `88..=4096`).
-  - **Описание**: Необязательный MSS для bulk-фазы. Если задан, низкий `client_mss` применяется только на время TLS-handshake (включая инспектируемый DPI ServerHello); как только соединение переходит в фазу relay, MSS клиентского сокета поднимается до `client_mss_bulk` для передачи полезной нагрузки. Так сохраняется anti-DPI фрагментация handshake, но для данных возвращаются пакеты нормального размера — это снижает исходящий packets-per-second примерно во столько раз, каков segment multiplier у `client_mss` (например, ~10x для `"tspu"`). Полезно на хостингах, где abuse-детекция считает packets-per-second, а не полосу. Если пусто/не задано — MSS handshake сохраняется на всё соединение (прежнее поведение). Только Linux; на прочих платформах — no-op.
+  - **Ограничения / валидация**: Только Linux, тип `String`. Грамматика совпадает с [`client_mss`](#client_mss): пустое/отсутствующее значение, пресеты `"extreme-low"`/`"tspu"`/`"2in8"` или десятичное число в диапазоне `88..=4096`. Непустое значение требует хотя бы одного listener с эффективным `client_mss` и должно быть больше handshake-значения каждого участвующего listener. Listener может задать `client_mss = ""` для явного отказа от профиля.
+  - **Описание**: Включает экспериментальный профиль с двумя размерами. Listener использует `client_mss_bulk` с самого начала соединения, включая получение `ClientHello`. При отправке начального аутентифицированного FakeTLS-ответа (`ServerHello`) Telemt временно ограничивает `TCP_MAXSEG` принятого socket значением `client_mss` и использует записи не больше этого значения, затем восстанавливает прежний MSS до обычного MTProto-трафика. Восстановление выполняется при успехе, ошибке записи и отмене задачи. TCP является потоком байтов: `MSG_EOR`, TCP offloads, потери и ретрансляции могут менять наблюдаемые границы capture, поэтому packet-capture release gate остаётся определяющим. Если параметр пуст или отсутствует, `client_mss` остаётся kernel MSS для всего соединения. Изменение требует restart/rebind listener.
   - **Пример**:
 
     ```toml
@@ -2020,7 +2026,7 @@
     ```
 ## mode
   - **Ограничения / валидация**: `tracked`, `notrack` или `hybrid` (чувствителен к регистру, используется нижний регистр).
-  - **Описание**: 
+  - **Описание**:
     - **`tracked`**: не устанавливать notrack-правила, соединения полностью отслеживаются conntrack.
     - **`notrack`**: помечает входящий TCP-трафик к server.port как notrack; цели берутся из `[server.listeners]`, либо из `server.listen_addr_ipv4 / server.listen_addr_ipv6` (неуказанные адреса означают «любой» для этого семейства).
     - **`hybrid`**: notrack применяется только к адресам из `hybrid_listener_ips` (не должно быть пустым, проверяется при загрузке), остальные соединения отслеживаются обычным образом.
@@ -2032,7 +2038,7 @@
     ```
 ## backend
   - **Ограничения / валидация**: `auto`, `nftables`или `iptables` (чувствителен к регистру, используется нижний регистр).
-  - **Описание**: Выбор набора инструментов для применения notrack-правил. 
+  - **Описание**: Выбор набора инструментов для применения notrack-правил.
     - **`auto`**: использует `nft`, если доступен, иначе - `iptables`/`ip6tables`.
     - **`nftables / iptables`**: принудительно выбирает соответствующий backend; при отсутствии бинарника правила не применяются. В nft-режиме используется таблица `inet telemt_conntrack`, в `iptables` — цепочка TELEMT_NOTRACK в таблице raw.
   - **Пример**:
@@ -2237,19 +2243,22 @@
 | [`ip`](#ip) | `IpAddr` | — | `✘` |
 | [`port`](#port-serverlisteners) | `u16` | `server.port` | `✘` |
 | [`client_mss`](#client_mss-serverlisteners) | `String` | `[server].client_mss` | `✘` |
-| [`synlimit`](#synlimit-serverlisteners) | `false`, `"iptables"` или `"nftables"` | `false` | `✔` |
-| [`synlimit_seconds`](#synlimit_seconds-serverlisteners) | `u32` | `60` | `✔` |
-| [`synlimit_hitcount`](#synlimit_hitcount-serverlisteners) | `u32` | `48` | `✔` |
-| [`synlimit_burst`](#synlimit_burst-serverlisteners) | `u32` | `1` | `✔` |
-| [`synlimit_ios_seconds`](#synlimit_ios_seconds-serverlisteners) | `u32` | `1` | `✔` |
-| [`synlimit_ios_hitcount`](#synlimit_ios_hitcount-serverlisteners) | `u32` | `12` | `✔` |
-| [`synlimit_ios_burst`](#synlimit_ios_burst-serverlisteners) | `u32` | `24` | `✔` |
-| [`synlimit_hashlimit_expire_ms`](#synlimit_hashlimit_expire_ms-serverlisteners) | `u32` | `60000` | `✔` |
-| [`synlimit_hashlimit_size`](#synlimit_hashlimit_size-serverlisteners) | `u32` | `32768` | `✔` |
+| [`synlimit`](#synlimit-serverlisteners) | `false`, `"iptables"`, `"nftables"` или `"pf"` | `false` | `✘` |
+| [`synlimit_seconds`](#synlimit_seconds-serverlisteners) | `u32` | `60` | `✘` |
+| [`synlimit_hitcount`](#synlimit_hitcount-serverlisteners) | `u32` | `48` | `✘` |
+| [`synlimit_burst`](#synlimit_burst-serverlisteners) | `u32` | `24` | `✘` |
+| [`synlimit_ios_seconds`](#synlimit_ios_seconds-serverlisteners) | `u32` | `1` | `✘` |
+| [`synlimit_ios_hitcount`](#synlimit_ios_hitcount-serverlisteners) | `u32` | `12` | `✘` |
+| [`synlimit_ios_burst`](#synlimit_ios_burst-serverlisteners) | `u32` | `24` | `✘` |
+| [`synlimit_hashlimit_expire_ms`](#synlimit_hashlimit_expire_ms-serverlisteners) | `u32` | `60000` | `✘` |
+| [`synlimit_hashlimit_size`](#synlimit_hashlimit_size-serverlisteners) | `u32` | `32768` | `✘` |
 | [`announce`](#announce) | `String` | — | `✘` |
 | [`announce_ip`](#announce_ip) | `IpAddr` | — | `✘` |
 | [`proxy_protocol`](#proxy_protocol) | `bool` | — | `✘` |
 | [`reuse_allow`](#reuse_allow) | `bool` | `false` | `✘` |
+| [`transport`](#transport-serverlisteners) | `"mtproxy"` или `"web"` | `"mtproxy"` | `✘` |
+| [`web_client_ip_source`](#web_client_ip_source-serverlisteners) | `"x_forwarded_for"` | `"x_forwarded_for"` | `✘` |
+| [`web_trusted_proxy_cidrs`](#web_trusted_proxy_cidrs-serverlisteners) | `IpNetwork[]` | `[]` | `✘` |
 
 ## ip
   - **Ограничения / валидация**: Обязательный параметр. Значение должно содержать IP-адрес в формате строки.
@@ -2282,8 +2291,8 @@
     client_mss = "256"
     ```
 ## synlimit (server.listeners)
-  - **Ограничения / валидация**: `false`, `"iptables"` или `"nftables"`. Если параметр не задан или задан как `false`, SYN limiter для этого listener’а выключен.
-  - **Описание**: Устанавливает per-listener Linux netfilter two-tier SYN-fix rules для порта listener’а. `"iptables"` использует `iptables`/`ip6tables` filter rules с `hashlimit`, `length` и TTL/hop-limit matches. `"nftables"` использует Telemt-owned tables с per-source `meter` rules и эквивалентными IPv4/IPv6 classifiers. Rules вставляются рано в `INPUT`, принимают under-limit SYN packets и отвечают TCP RST на over-limit SYN packets, чтобы клиент быстро переподключался вместо ожидания silent DROP timeout. Generic bucket управляется `synlimit_seconds`, `synlimit_hitcount` и `synlimit_burst`; iOS-like TTL/length bucket управляется `synlimit_ios_*`. Rules reconciled at runtime и удаляются при graceful shutdown Telemt; `SIGKILL` процессом не очищается. Требует CAP_NET_ADMIN. Изменения `synlimit*` hot-reload’ятся для существующих listener endpoints; изменение listener `ip` или `port` по-прежнему требует restart/rebind.
+  - **Ограничения / валидация**: `false`, `"iptables"`, `"nftables"` или `"pf"`. Если параметр отсутствует или равен `false`, SYN limiting для этого listener отключён.
+  - **Описание**: Устанавливает принадлежащие startup-процессу per-listener firewall rules для порта listener. Linux принимает только `"iptables"` или `"nftables"`, FreeBSD — только `"pf"`, остальные платформы — только `false`. Linux netfilter rules принимают SYN packets в пределах лимита и отклоняют превышение с TCP RST. PF формирует отдельные `inet`/`inet6` rules и использует native `max-src-conn-rate`; превышающие лимит state-creating packets молча отбрасываются. При отсутствии privileges, ошибке backend validation, очистки stale candidate или применения rules startup завершается до запуска accept loops. Любое изменение `synlimit*` требует перезапуска процесса. Комбинация включённого SYN limiting с `--run-as-user` или `--run-as-group` отклоняется до появления отдельного privileged firewall helper. Rules удаляются при graceful shutdown; после `SIGKILL` процесс не может их очистить. Linux требует CAP_NET_ADMIN. FreeBSD требует root и hook в основном PF ruleset, например `anchor "telemt_synlimit/*"`.
   - **Operator note**: Telemt не сохраняет rules через `iptables-persistent`, не пишет `/etc/sysctl.d`, не меняет systemd limits и не модифицирует `client_mss`. Host-level tuning применяется оператором вручную.
   - **Пример**:
 
@@ -2297,10 +2306,15 @@
     ip = "::"
     port = 443
     synlimit = "nftables"
+
+    [[server.listeners]]
+    ip = "0.0.0.0"
+    port = 443
+    synlimit = "pf"
     ```
 ## synlimit_seconds (server.listeners)
   - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `60`.
-  - **Описание**: Generic SYN-fix token-bucket interval. Rate равен `synlimit_hitcount / synlimit_seconds` и рендерится в native netfilter rate units (`second`, `minute`, `hour` или `day`). Этот bucket обрабатывает SYN packets, которые не совпали с iOS-like TTL/length classifier.
+  - **Описание**: Generic SYN-fix token-bucket interval. В Linux rate равен `synlimit_hitcount / synlimit_seconds` и рендерится в native netfilter rate units (`second`, `minute`, `hour` или `day`). Этот bucket обрабатывает SYN packets, которые не совпали с iOS-like TTL/length classifier. PF рендерит ту же пару как `max-src-conn-rate hitcount/seconds`.
   - **Пример**:
 
     ```toml
@@ -2312,7 +2326,7 @@
     ```
 ## synlimit_hitcount (server.listeners)
   - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `48`.
-  - **Описание**: Generic SYN-fix token-bucket rate amount. Вместе с `synlimit_seconds` задает разрешенный source-IP SYN rate до того, как excess SYN packets получат TCP RST.
+  - **Описание**: Generic SYN-fix token-bucket rate amount. Вместе с `synlimit_seconds` задаёт разрешённый source-IP SYN rate. Linux netfilter отклоняет превышение с TCP RST; PF молча отбрасывает превышающие лимит state-creating packets.
   - **Пример**:
 
     ```toml
@@ -2323,7 +2337,7 @@
     synlimit_hitcount = 48
     ```
 ## synlimit_burst (server.listeners)
-  - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `1`.
+  - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `24`.
   - **Описание**: Generic SYN-fix token-bucket burst size. Более высокие значения разрешают short connection bursts с одного source IP перед применением steady-state rate `synlimit_hitcount / synlimit_seconds`.
   - **Пример**:
 
@@ -2332,7 +2346,7 @@
     ip = "0.0.0.0"
     port = 443
     synlimit = "iptables"
-    synlimit_burst = 1
+    synlimit_burst = 24
     ```
 ## synlimit_ios_seconds (server.listeners)
   - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `1`.
@@ -2372,7 +2386,7 @@
     ```
 ## synlimit_hashlimit_expire_ms (server.listeners)
   - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `60000`.
-  - **Описание**: Entry expiration в миллисекундах для iptables/ip6tables hashlimit buckets. nftables meters используют kernel-managed state и не имеют точного аналога этого knob.
+  - **Описание**: Entry expiration в миллисекундах для iptables/ip6tables hashlimit buckets. nftables meters и PF source tracking используют kernel-managed state и не имеют точного аналога этого knob.
   - **Пример**:
 
     ```toml
@@ -2384,7 +2398,7 @@
     ```
 ## synlimit_hashlimit_size (server.listeners)
   - **Ограничения / валидация**: `u32`, должно быть `> 0`. Значение по умолчанию: `32768`.
-  - **Описание**: Hash table size для iptables/ip6tables hashlimit buckets. nftables meters используют kernel-managed state и не имеют точного аналога этого knob.
+  - **Описание**: Hash table size для iptables/ip6tables hashlimit buckets. nftables meters и PF source tracking используют kernel-managed state и не имеют точного аналога этого knob.
   - **Пример**:
 
     ```toml
@@ -2437,6 +2451,142 @@
     ip = "0.0.0.0"
     reuse_allow = false
     ```
+
+## transport (server.listeners)
+  - **Ограничения / валидация**: `"mtproxy"` или `"web"`.
+  - **Описание**: Выбирает протокол listener’а. WEB-listener принимает обычный HTTP/1.1 от доверенного TLS-терминатора и требует перезапуска процесса. Для него обязательны `proxy_protocol = false` и `reuse_allow = false`; параметры `client_mss`, `synlimit`, `announce` и `announce_ip` запрещены.
+  - **Пример**:
+
+    ```toml
+    [[server.listeners]]
+    ip = "127.0.0.1"
+    port = 18080
+    transport = "web"
+    proxy_protocol = false
+    web_trusted_proxy_cidrs = ["127.0.0.1/32"]
+    ```
+
+## web_client_ip_source (server.listeners)
+  - **Ограничения / валидация**: Первая реализация WEB поддерживает только `"x_forwarded_for"`.
+  - **Описание**: Выбирает L7-источник исходного IP клиента. От прямого TCP peer из `web_trusted_proxy_cidrs` Telemt принимает один корректно разбираемый адрес `X-Forwarded-For`. Если доверенный peer не передал header, Telemt использует его адрес; настройте TLS-терминатор на передачу header, чтобы per-client limits и source policy применялись к реальному адресу клиента.
+
+## web_trusted_proxy_cidrs (server.listeners)
+  - **Ограничения / валидация**: Непустой массив CIDR только для WEB. Сеть `/0` запрещена. Параметр недопустим для MTProxy-listener’а.
+  - **Описание**: Граница доверия для непосредственного NGINX или HAProxy. Указывайте только адреса, которые могут напрямую подключаться к этому listener’у; не публикуйте plain HTTP listener в недоверенной сети.
+
+
+# [web]
+
+WEB-режим переносит MTProxy-трафик Telegram Desktop внутри HTTPS, который терминирует внешний NGINX или HAProxy. Telemt принимает обычный HTTP/1.1 на приватном listener’е с `transport = "web"`. Перед включением режима прочитайте [полное руководство по развёртыванию WEB](../WEB/WEB_PROXY.ru.md).
+
+| Ключ | Тип | По умолчанию | Hot-Reload |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | `✔` |
+| `carrier` | `"https"` или `"https-lanes"` | `"https"` | `✔` |
+| `limits` | таблица | ограниченные defaults | `✘` |
+| `timeouts` | таблица | ограниченные defaults | `✔` |
+| `vhosts` | массив таблиц | `[]` | `✔` |
+
+Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `carrier = "https"` сохраняет сериализованный HTTPS transport. При `carrier = "https-lanes"` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; этот carrier требует `max_http_handlers >= 2` и публичного HTTP/2 на TLS-терминаторе, чтобы убрать application-level inter-stream head-of-line blocking. Reload применяет `carrier` только к новым bridge sessions. Отключение WEB после reload прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
+
+# [web.limits]
+
+Эти process-wide границы ограничивают все WEB-реестры, очереди, тела запросов, статические snapshots и admission-пути. Значения проверяются совместно: per-owner лимиты не могут превышать глобальные, резервы очередей должны сохранять прогресс control frames, body-резервы должны помещаться в общий бюджет, а все заявленные байтовые границы — в `memory_envelope_bytes`. Изменение любого значения этой таблицы требует перезапуска процесса.
+
+| Ключ | Тип | По умолчанию | Описание |
+| --- | --- | --- | --- |
+| `max_header_bytes` | `usize` | `16384` | Максимальный размер заголовка одного HTTP-запроса. |
+| `max_body_bytes` | `usize` | `2097152` | Максимальный размер собранного carrier body. |
+| `max_frame_payload_bytes` | `usize` | `1048576` | Максимальный payload одного WEB frame. |
+| `carrier_batch_bytes` | `usize` | `2097152` | Максимальный закодированный downlink batch. |
+| `max_frames_per_body` | `usize` | `4096` | Максимальное число frames в одном carrier body. |
+| `max_http_connections` | `usize` | `1024` | Принятые WEB HTTP connections на весь процесс. |
+| `max_http_handlers` | `usize` | `512` | Одновременно выполняемые HTTP handlers на весь процесс; HTTPS lanes могут занять long polls не более половины лимита, оставляя остаток для session, uplink и control work. |
+| `max_body_readers` | `usize` | `32` | Одновременно собираемые request bodies на весь процесс. |
+| `max_body_bytes_global` | `usize` | `67108864` | Глобальный байтовый резерв для собранных bodies. |
+| `max_sessions_global` | `usize` | `128` | Активные WEB-сессии на весь процесс. |
+| `max_sessions_per_ip` | `usize` | `16` | Активные сессии одного forwarded client IP. |
+| `max_streams_per_session` | `usize` | `128` | Default активных logical streams на сессию. |
+| `max_streams_global` | `usize` | `4096` | Активные logical streams на весь процесс. |
+| `max_stream_handshakes` | `usize` | `256` | Одновременные внутренние MTProxy handshakes. |
+| `max_tombstones_per_session` | `usize` | `4096` | Закрытые stream IDs, сохраняемые одной сессией. |
+| `pending_bytes_per_session` | `usize` | `33554432` | Байты данных и управления в очередях одной сессии. |
+| `pending_bytes_global` | `usize` | `536870912` | Байты данных и управления в очередях всего процесса. |
+| `pending_items_per_session` | `usize` | `16384` | Элементы данных и управления в очередях одной сессии. |
+| `pending_items_global` | `usize` | `262144` | Элементы данных и управления в очередях всего процесса. |
+| `control_bytes_per_session` | `usize` | `262144` | Резерв одной сессии только для control frames. |
+| `control_bytes_global` | `usize` | `16777216` | Process-wide резерв только для control frames. |
+| `max_bootstraps_global` | `usize` | `512` | Активные bootstrap credentials на весь процесс. |
+| `max_bootstraps_per_ip` | `usize` | `64` | Активные bootstrap credentials на один client IP. |
+| `max_vhosts` | `usize` | `8` | Настроенные WEB virtual hosts. |
+| `max_profiles` | `usize` | `32` | WEB-профили всех vhosts. |
+| `max_static_files` | `usize` | `4096` | Элементы static snapshot всех vhosts. |
+| `max_static_file_bytes` | `usize` | `8388608` | Максимальный размер одного статического файла. |
+| `max_static_bytes` | `usize` | `67108864` | Размер static snapshots всех vhosts. |
+| `memory_envelope_bytes` | `usize` | `805306368` | Заявленный envelope для HTTP heads, bodies, очередей и static snapshots; максимум 4 GiB. |
+| `new_bootstraps_per_minute` | `u32` | `1200` | Устойчивая process-wide скорость выдачи bootstrap. |
+| `new_bootstraps_burst` | `u32` | `256` | Process-wide burst выдачи bootstrap. |
+| `new_sessions_per_minute` | `u32` | `600` | Устойчивая process-wide скорость создания сессий. |
+| `new_sessions_burst` | `u32` | `128` | Process-wide burst создания сессий. |
+| `new_streams_per_minute` | `u32` | `6000` | Устойчивая скорость создания logical streams. |
+| `new_streams_burst` | `u32` | `512` | Process-wide burst создания logical streams. |
+
+# [web.timeouts]
+
+Все таймауты задаются в секундах и должны входить в диапазон `1..=3600`. Самый длинный request deadline должен быть меньше `http_idle_secs`.
+
+| Ключ | Тип | По умолчанию | Hot-Reload | Описание |
+| --- | --- | --- | --- | --- |
+| `header_secs` | `u64` | `10` | `✔` | Получение полного заголовка HTTP-запроса. |
+| `body_secs` | `u64` | `30` | `✔` | Сбор одного аутентифицированного carrier body. |
+| `stream_handshake_secs` | `u64` | `10` | `✔` | Выполнение внутреннего MTProxy handshake. |
+| `long_poll_secs` | `u64` | `25` | `✔` | Максимальная длительность пустого downlink long poll. |
+| `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Срок неиспользованного bootstrap и replay-marker закрытого token. |
+| `reconnect_grace_secs` | `u64` | `120` | `✔` | Максимальная неактивность carrier до закрытия сессии. |
+| `http_idle_secs` | `u64` | `75` | `✔` | Idle lifetime WEB HTTP keep-alive connection. |
+| `shutdown_secs` | `u64` | `15` | `✔` | Deadline корректного завершения WEB. |
+| `decoy_header_secs` | `u64` | `30` | `✔` | Deadline подключения и получения response head от HTTP decoy. |
+
+# [[web.vhosts]]
+
+| Ключ | Тип | Обязательный | Hot-Reload | Описание |
+| --- | --- | --- | --- | --- |
+| `host` | `String` | да | `✔` | Уникальный канонический lowercase ACE FQDN без порта, пути, credentials и завершающей точки. |
+| `public_addr` | `SocketAddr` | да | `✔` | Конкретный публичный IP на порту `443`, используемый во внутреннем destination tuple relay. |
+| `decoy` | таблица | да | `✔` | Обычный сайт для неаутентифицированного или некорректного трафика. |
+| `profiles` | массив таблиц | при включённом WEB | `✔` | Явные пользователи и client secret modes для этого hostname. |
+
+Hostname нормализуется при валидации и должен приниматься Telegram Desktop. Bootstrap является bearer credential: адрес клиента и его IP-семейство могут измениться до создания session. Неиспользованный bootstrap остаётся действительным после reload конфигурации, только пока активен профиль с той же identity.
+
+# [web.vhosts.decoy]
+
+Обязателен ровно один decoy mode:
+
+| Mode | Обязательные ключи | Валидация |
+| --- | --- | --- |
+| `http_upstream` | `upstream` | `http://` origin с loopback, link-local или private IP literal; без credentials, path, query и fragment. |
+| `static_directory` | `directory`; необязательный `index = "index.html"` | Абсолютный реальный каталог и одно безопасное имя index-файла. Symlinks и выход за пределы каталога запрещены; immutable snapshot загружается в пределах `[web.limits]`. |
+
+# [[web.vhosts.profiles]]
+
+| Ключ | Тип | Обязательный | По умолчанию | Описание |
+| --- | --- | --- | --- | --- |
+| `user` | `String` | да | — | Существующий ключ из `[access.users]`. |
+| `secret_mode` | `"plain"` или `"dd"` | да | — | Точное представление секрета для Telegram Desktop. `ee` не поддерживается. |
+| `max_sessions` | `usize` | нет | `web.limits.max_sessions_global` | Активные сессии этого профиля. |
+| `max_streams` | `usize` | нет | `web.limits.max_streams_global` | Активные logical streams этого профиля. |
+| `max_streams_per_session` | `usize` | нет | `web.limits.max_streams_per_session` | Активные logical streams в одной сессии профиля. |
+
+Лимиты профиля должны быть ненулевыми и не превышать соответствующие глобальные границы. Повторяющиеся профили `(user, secret_mode)` в одном vhost запрещены.
+
+## Lifecycle WEB и управление через API
+
+- Config watcher и generation reload применяют `web.enabled`, `web.carrier`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Существующие сессии сохраняют carrier, лимиты и deadlines своего момента создания; новые bridge sessions используют активное поколение.
+- Состав WEB-listeners и их trust policy в `server.listeners`, а также все значения `web.limits` принадлежат процессу и требуют перезапуска.
+- Отдельного endpoint `/v1/web` нет. `GET /v1/config` не возвращает `[web]`, а `PATCH /v1/config` отклоняет ключ `web` с `400 section_not_editable`.
+- Для удалённого применения WEB policy измените соответствующий TOML-файл и вызовите `POST /v1/system/reload`; проверьте `GET /v1/system/reload/{id}` и поле `deferred_process_fields`. Если оно содержит `server.listeners` или `web.limits`, перезапустите Telemt.
+- Существующих access users можно создавать, изменять, ротировать, включать, выключать и удалять через `/v1/users`. Создание пользователя не добавляет WEB-профиль. Отключение пользователя немедленно обновляет admission и завершает его активные сессии.
+- `PATCH /v1/config` может сохранить `server.listeners`, включая поля WEB-listener’а, но изменённый WEB-listener активируется только после перезапуска процесса.
 
 
 # [timeouts]

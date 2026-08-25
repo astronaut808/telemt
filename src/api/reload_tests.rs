@@ -8,7 +8,7 @@ async fn config_file() -> (tempfile::TempDir, PathBuf, String) {
     config.server.max_connections = 4_242;
     let body = toml::to_string_pretty(&config).unwrap();
     tokio::fs::write(&path, &body).await.unwrap();
-    let revision = config_store::compute_revision(&body);
+    let revision = config_store::current_revision(&path).await.unwrap();
     (directory, path, revision)
 }
 

@@ -1,6 +1,7 @@
 use super::*;
 
-pub(crate) async fn handle_via_middle_proxy<R, W>(
+/// Runs Middle-End relay with explicit kernel-conntrack close publication policy.
+pub(crate) async fn handle_via_middle_proxy_with_conntrack<R, W>(
     mut crypto_reader: CryptoReader<R>,
     crypto_writer: CryptoWriter<W>,
     success: HandshakeSuccess,
@@ -15,6 +16,7 @@ pub(crate) async fn handle_via_middle_proxy<R, W>(
     session_id: u64,
     session_cancel: CancellationToken,
     shared: Arc<ProxySharedState>,
+    conntrack_close_policy: ConntrackClosePolicy,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -78,7 +80,7 @@ where
         return Err(ProxyError::RouteSwitched);
     }
 
-    // Per-user ad_tag from access.user_ad_tags; fallback to general.ad_tag (hot-reloadable)
+    // Prefer the hot-reloadable per-user ad tag over the global fallback.
     let user_tag: Option<Vec<u8>> = config
         .access
         .user_ad_tags
@@ -785,7 +787,7 @@ where
         }
     };
 
-    // When client closes, but ME channel stopped as unregistered - it isnt error
+    // A client-initiated close can unregister the ME channel before its writer exits.
     if client_closed && matches!(writer_result, Err(ProxyError::MiddleConnectionLost)) {
         writer_result = Ok(());
     }
@@ -808,17 +810,19 @@ where
         "ME relay cleanup"
     );
 
-    let close_reason = classify_conntrack_close_reason(&result);
-    let publish_result = shared.publish_conntrack_close_event(ConntrackCloseEvent {
-        src: peer,
-        dst: local_addr,
-        reason: close_reason,
-    });
-    if !matches!(
-        publish_result,
-        ConntrackClosePublishResult::Sent | ConntrackClosePublishResult::Disabled
-    ) {
-        stats.increment_conntrack_close_event_drop_total();
+    if conntrack_close_policy == ConntrackClosePolicy::Publish {
+        let close_reason = classify_conntrack_close_reason(&result);
+        let publish_result = shared.publish_conntrack_close_event(ConntrackCloseEvent {
+            src: peer,
+            dst: local_addr,
+            reason: close_reason,
+        });
+        if !matches!(
+            publish_result,
+            ConntrackClosePublishResult::Sent | ConntrackClosePublishResult::Disabled
+        ) {
+            stats.increment_conntrack_close_event_drop_total();
+        }
     }
 
     clear_relay_idle_candidate_in(shared.as_ref(), conn_id);

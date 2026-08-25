@@ -3,7 +3,9 @@ use tracing::warn;
 
 use crate::error::{ProxyError, Result};
 
-use super::super::types::{LoggingConfig, LoggingDestination, NetworkConfig, UpstreamType};
+use super::super::types::{
+    LoggingConfig, LoggingDestination, NetworkConfig, SynLimitMode, UpstreamType,
+};
 use super::ProxyConfig;
 
 pub(super) fn validate_network_cfg(net: &mut NetworkConfig) -> Result<()> {
@@ -87,6 +89,77 @@ pub(super) fn validate_upstreams(config: &ProxyConfig) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+pub(super) fn validate_listener_runtime_profiles(config: &ProxyConfig) -> Result<()> {
+    for (index, listener) in config.server.listeners.iter().enumerate() {
+        let supported = if cfg!(target_os = "linux") {
+            matches!(
+                listener.synlimit,
+                SynLimitMode::Off | SynLimitMode::Iptables | SynLimitMode::Nftables
+            )
+        } else if cfg!(target_os = "freebsd") {
+            matches!(listener.synlimit, SynLimitMode::Off | SynLimitMode::Pf)
+        } else {
+            listener.synlimit == SynLimitMode::Off
+        };
+        if !supported {
+            let backend = match listener.synlimit {
+                SynLimitMode::Off => "off",
+                SynLimitMode::Iptables => "iptables",
+                SynLimitMode::Nftables => "nftables",
+                SynLimitMode::Pf => "pf",
+            };
+            let supported = if cfg!(target_os = "linux") {
+                "off, iptables, nftables"
+            } else if cfg!(target_os = "freebsd") {
+                "off, pf"
+            } else {
+                "off"
+            };
+            return Err(ProxyError::Config(format!(
+                "server.listeners[{index}].synlimit backend {backend} is unsupported on this platform; supported values: {supported}"
+            )));
+        }
+    }
+
+    let Some(bulk_mss) = config
+        .server
+        .client_mss_bulk_value()
+        .map_err(|error| ProxyError::Config(format!("server.client_mss_bulk {error}")))?
+    else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Err(ProxyError::Config(
+            "server.client_mss_bulk is supported only on Linux".to_string(),
+        ));
+    }
+
+    let mut participants = 0usize;
+    for (index, listener) in config.server.listeners.iter().enumerate() {
+        let handshake_mss = listener
+            .effective_client_mss(&config.server)
+            .map_err(|error| {
+                ProxyError::Config(format!("server.listeners[{index}].client_mss {error}"))
+            })?;
+        let Some(handshake_mss) = handshake_mss else {
+            continue;
+        };
+        participants = participants.saturating_add(1);
+        if bulk_mss <= handshake_mss {
+            return Err(ProxyError::Config(format!(
+                "server.client_mss_bulk ({bulk_mss}) must be greater than the effective handshake MSS ({handshake_mss}) for server.listeners[{index}]"
+            )));
+        }
+    }
+    if participants == 0 {
+        return Err(ProxyError::Config(
+            "server.client_mss_bulk requires an effective client_mss on at least one listener"
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 

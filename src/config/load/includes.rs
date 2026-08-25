@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -27,6 +27,8 @@ pub(super) fn preprocess_includes(
     base_dir: &Path,
     depth: u8,
     source_files: &mut BTreeSet<PathBuf>,
+    source_contents: &mut BTreeMap<PathBuf, String>,
+    source_overrides: &BTreeMap<PathBuf, String>,
 ) -> Result<String> {
     if depth > 10 {
         return Err(ProxyError::Config("Include depth > 10".into()));
@@ -39,15 +41,23 @@ pub(super) fn preprocess_includes(
             if let Some(rest) = rest.strip_prefix('=') {
                 let path_str = rest.trim().trim_matches('"');
                 let resolved = base_dir.join(path_str);
-                source_files.insert(normalize_config_path(&resolved));
-                let included = std::fs::read_to_string(&resolved)
+                let normalized = normalize_config_path(&resolved);
+                source_files.insert(normalized.clone());
+                let included = source_overrides
+                    .get(&normalized)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| std::fs::read_to_string(&resolved))
                     .map_err(|e| ProxyError::Config(e.to_string()))?;
+                source_contents.insert(normalized, included.clone());
                 let included_dir = resolved.parent().unwrap_or(base_dir);
                 output.push_str(&preprocess_includes(
                     &included,
                     included_dir,
                     depth + 1,
                     source_files,
+                    source_contents,
+                    source_overrides,
                 )?);
                 output.push('\n');
                 continue;

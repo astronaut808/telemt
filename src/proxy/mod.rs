@@ -59,6 +59,8 @@
 )]
 
 pub mod adaptive_buffers;
+// Shared authenticated admission and relay orchestration for TCP and WEB streams.
+pub(crate) mod authenticated;
 pub mod client;
 // Process-wide Direct relay copy-buffer ownership and pressure policy.
 pub(crate) mod direct_buffer_budget;

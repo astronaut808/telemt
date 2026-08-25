@@ -6,4 +6,5 @@ mod load;
 mod types;
 
 pub use load::ProxyConfig;
+pub(crate) use load::{ConfigSourceGraph, LoadedConfig};
 pub use types::*;

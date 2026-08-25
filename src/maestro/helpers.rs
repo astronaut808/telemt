@@ -607,6 +607,46 @@ pub(crate) fn print_proxy_links(host: &str, port: u16, config: &ProxyConfig) {
     }
 }
 
+/// Prints WEB links only for profiles selected by the existing link policy.
+pub(crate) fn print_web_proxy_links(config: &ProxyConfig) {
+    if !config.web.enabled || config.general.links.show.is_empty() {
+        return;
+    }
+    let Some(runtime) = config.web.runtime.as_ref() else {
+        return;
+    };
+    let shown = config
+        .general
+        .links
+        .show
+        .resolve_users(&config.access.users);
+    let mut heading_printed = false;
+    for profile in &runtime.profiles {
+        if !shown.iter().any(|user| user.as_str() == profile.user) {
+            continue;
+        }
+        if !heading_printed {
+            print_maestro_line("WEB proxy links");
+            heading_printed = true;
+        }
+        let Some(secret) = config.access.users.get(&profile.user) else {
+            continue;
+        };
+        let prefix = match profile.secret_mode {
+            crate::config::WebSecretMode::Plain => "",
+            crate::config::WebSecretMode::Dd => "dd",
+        };
+        print_maestro_line(format!(
+            "User: {} ({:?})",
+            profile.user, profile.secret_mode
+        ));
+        print_maestro_line(format!(
+            "WEB: tg://webproxy?server={}&secret={prefix}{secret}",
+            profile.host,
+        ));
+    }
+}
+
 pub(crate) async fn write_beobachten_snapshot(path: &str, payload: &str) -> std::io::Result<()> {
     if let Some(parent) = std::path::Path::new(path).parent()
         && !parent.as_os_str().is_empty()

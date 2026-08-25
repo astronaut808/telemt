@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 use crate::config::ProxyConfig;
 
@@ -188,6 +189,14 @@ pub(crate) struct ReloadCommandReceiver {
     command_rx: mpsc::Receiver<ReloadCommand>,
 }
 
+/// Capacity and status reservation held while a config mutation is committed.
+pub(crate) struct ReloadReservation {
+    permit: Option<mpsc::OwnedPermit<ReloadCommand>>,
+    status: ReloadStatus,
+    request: ReloadRequest,
+    status_store: Arc<ReloadStatusStore>,
+}
+
 struct ReloadStatusState {
     next_reload_id: u64,
     active_reload_id: Option<u64>,
@@ -232,95 +241,121 @@ impl ReloadControl {
         config_revision: String,
         request: ReloadRequest,
     ) -> Result<ReloadAccepted, ReloadSubmitError> {
+        let reservation = self.reserve(config_revision, request).await?;
+        Ok(reservation.enqueue(config))
+    }
+
+    /// Reserves coordinator capacity before an external config mutation commits.
+    pub(crate) async fn reserve(
+        &self,
+        config_revision: String,
+        request: ReloadRequest,
+    ) -> Result<ReloadReservation, ReloadSubmitError> {
+        let permit = self
+            .command_tx
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| ReloadSubmitError::MaestroUnavailable)?;
         let target_generation = self
             .active_generation
             .load(Ordering::Acquire)
             .saturating_add(1);
-        let status = self
-            .status_store
-            .reserve(target_generation, config_revision, request.clone())
-            .await?;
-        let command = ReloadCommand {
-            reload_id: status.reload_id,
-            target_generation,
-            config,
-            config_revision: status.config_revision.clone(),
-            request,
-        };
-        if self.command_tx.try_send(command).is_err() {
+        let status =
             self.status_store
-                .finish(
-                    status.reload_id,
-                    ReloadPhase::Failed,
-                    Some("maestro command channel is closed".to_string()),
-                )
-                .await;
-            return Err(ReloadSubmitError::MaestroUnavailable);
-        }
-        Ok(ReloadAccepted {
-            reload_id: status.reload_id,
-            target_generation,
-            config_revision: status.config_revision,
-            state: ReloadPhase::Accepted,
-            mode: status.mode,
-            failure_policy: status.failure_policy,
+                .reserve(target_generation, config_revision, request.clone())?;
+        Ok(ReloadReservation {
+            permit: Some(permit),
+            status,
+            request,
+            status_store: self.status_store.clone(),
         })
     }
 
     /// Returns a retained reload status by identifier.
     pub(crate) async fn status(&self, reload_id: u64) -> Option<ReloadStatus> {
-        self.status_store.get(reload_id).await
+        self.status_store.get(reload_id)
     }
 
     /// Returns the identifier of the currently active reload.
     pub(crate) async fn in_progress(&self) -> Option<u64> {
-        self.status_store.state.lock().await.active_reload_id
+        self.status_store.state.lock().active_reload_id
     }
 
     /// Rejects new commands while preserving an already accepted operation.
     pub(crate) async fn begin_shutdown(&self) {
-        self.status_store.state.lock().await.accepting_commands = false;
+        self.status_store.state.lock().accepting_commands = false;
     }
 
     /// Records a non-terminal lifecycle phase.
     pub(crate) async fn mark_phase(&self, reload_id: u64, phase: ReloadPhase) {
-        self.status_store.mark_phase(reload_id, phase).await;
+        self.status_store.mark_phase(reload_id, phase);
     }
 
     /// Records process-owned fields deferred until the next process restart.
     pub(crate) async fn set_deferred_fields(&self, reload_id: u64, fields: Vec<String>) {
         self.status_store
-            .update(reload_id, |status| status.deferred_fields = fields)
-            .await;
+            .update(reload_id, |status| status.deferred_fields = fields);
     }
 
     /// Commits the active generation and completes the matching reload.
     pub(crate) async fn succeed(&self, reload_id: u64, generation: u64) {
         self.status_store
-            .finish_success(reload_id, generation, &self.active_generation)
-            .await;
+            .finish_success(reload_id, generation, &self.active_generation);
     }
 
     /// Marks the matching reload as failed.
     pub(crate) async fn fail(&self, reload_id: u64, error: impl Into<String>) {
         self.status_store
-            .finish(reload_id, ReloadPhase::Failed, Some(error.into()))
-            .await;
+            .finish(reload_id, ReloadPhase::Failed, Some(error.into()));
     }
 
     /// Marks the matching reload as rolled back.
     pub(crate) async fn rolled_back(&self, reload_id: u64, error: impl Into<String>) {
         self.status_store
-            .finish(reload_id, ReloadPhase::RolledBack, Some(error.into()))
-            .await;
+            .finish(reload_id, ReloadPhase::RolledBack, Some(error.into()));
     }
 
     /// Appends a non-fatal warning to the matching reload status.
     pub(crate) async fn add_warning(&self, reload_id: u64, warning: impl Into<String>) {
         let warning = warning.into();
         self.status_store
-            .update(reload_id, |status| status.warnings.push(warning))
-            .await;
+            .update(reload_id, |status| status.warnings.push(warning));
+    }
+}
+
+impl ReloadReservation {
+    /// Enqueues the already reserved command without another fallible step.
+    pub(crate) fn enqueue(mut self, config: Arc<ProxyConfig>) -> ReloadAccepted {
+        let target_generation = self.status.target_generation;
+        let command = ReloadCommand {
+            reload_id: self.status.reload_id,
+            target_generation,
+            config,
+            config_revision: self.status.config_revision.clone(),
+            request: self.request.clone(),
+        };
+        // This consuming transition is the only path that removes the permit.
+        let permit = self
+            .permit
+            .take()
+            .expect("reload reservation always owns one channel permit");
+        permit.send(command);
+        ReloadAccepted {
+            reload_id: self.status.reload_id,
+            target_generation,
+            config_revision: self.status.config_revision.clone(),
+            state: ReloadPhase::Accepted,
+            mode: self.status.mode,
+            failure_policy: self.status.failure_policy,
+        }
+    }
+}
+
+impl Drop for ReloadReservation {
+    fn drop(&mut self) {
+        if self.permit.is_some() {
+            self.status_store.cancel_reservation(self.status.reload_id);
+        }
     }
 }
 
@@ -332,13 +367,13 @@ impl ReloadCommandReceiver {
 }
 
 impl ReloadStatusStore {
-    async fn reserve(
+    fn reserve(
         &self,
         target_generation: u64,
         config_revision: String,
         request: ReloadRequest,
     ) -> Result<ReloadStatus, ReloadSubmitError> {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock();
         if !state.accepting_commands {
             return Err(ReloadSubmitError::MaestroUnavailable);
         }
@@ -369,29 +404,27 @@ impl ReloadStatusStore {
         Ok(status)
     }
 
-    async fn get(&self, reload_id: u64) -> Option<ReloadStatus> {
+    fn get(&self, reload_id: u64) -> Option<ReloadStatus> {
         self.state
             .lock()
-            .await
             .statuses
             .iter()
             .find(|status| status.reload_id == reload_id)
             .cloned()
     }
 
-    async fn mark_phase(&self, reload_id: u64, phase: ReloadPhase) {
+    fn mark_phase(&self, reload_id: u64, phase: ReloadPhase) {
         self.update(reload_id, |status| {
             status.state = phase;
             if status.started_at_epoch_secs.is_none() && phase != ReloadPhase::Accepted {
                 status.started_at_epoch_secs = Some(now_epoch_secs());
             }
-        })
-        .await;
+        });
     }
 
-    async fn finish(&self, reload_id: u64, phase: ReloadPhase, error: Option<String>) {
+    fn finish(&self, reload_id: u64, phase: ReloadPhase, error: Option<String>) {
         debug_assert!(phase.is_terminal());
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock();
         if let Some(status) = state
             .statuses
             .iter_mut()
@@ -406,8 +439,8 @@ impl ReloadStatusStore {
         }
     }
 
-    async fn finish_success(&self, reload_id: u64, generation: u64, active_generation: &AtomicU64) {
-        let mut state = self.state.lock().await;
+    fn finish_success(&self, reload_id: u64, generation: u64, active_generation: &AtomicU64) {
+        let mut state = self.state.lock();
         if state.active_reload_id != Some(reload_id) {
             return;
         }
@@ -425,14 +458,28 @@ impl ReloadStatusStore {
         state.active_reload_id = None;
     }
 
-    async fn update(&self, reload_id: u64, update: impl FnOnce(&mut ReloadStatus)) {
-        let mut state = self.state.lock().await;
+    fn update(&self, reload_id: u64, update: impl FnOnce(&mut ReloadStatus)) {
+        let mut state = self.state.lock();
         if let Some(status) = state
             .statuses
             .iter_mut()
             .find(|status| status.reload_id == reload_id)
         {
             update(status);
+        }
+    }
+
+    fn cancel_reservation(&self, reload_id: u64) {
+        let mut state = self.state.lock();
+        if state.active_reload_id == Some(reload_id) {
+            state.active_reload_id = None;
+        }
+        if let Some(index) = state
+            .statuses
+            .iter()
+            .position(|status| status.reload_id == reload_id)
+        {
+            state.statuses.remove(index);
         }
     }
 }

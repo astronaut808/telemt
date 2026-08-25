@@ -11,6 +11,11 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
+#[cfg(target_os = "linux")]
+mod fragmented_send;
+#[cfg(target_os = "linux")]
+pub(crate) use fragmented_send::send_tcp_fragmented_fd;
+
 const DEFAULT_SOCKET_BUFFER_BYTES: usize = 256 * 1024;
 
 /// Configure TCP socket with recommended settings for proxy use
@@ -122,39 +127,6 @@ pub fn clear_linger_fd(fd: std::os::unix::io::RawFd) -> Result<()> {
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
     let socket = socket2::SockRef::from(&borrowed);
     socket.set_linger(None)?;
-    Ok(())
-}
-
-/// Raise the TCP MSS on an already-accepted connection's fd. Used to fragment
-/// ONLY the TLS handshake (via a low listener MSS) and then restore a normal MSS
-/// for the bulk (post-handshake) data phase — cuts packets-per-second ~10x without losing the
-/// DPI evasion that the fragmented ServerHello provides. No-op safe: errors are
-/// returned to the caller, which logs and continues with the handshake MSS.
-#[cfg(target_os = "linux")]
-pub fn set_tcp_mss_fd(fd: std::os::unix::io::RawFd, mss: u32) -> Result<()> {
-    use std::io::Error;
-    let mss = i32::try_from(mss)
-        .map_err(|_| Error::new(std::io::ErrorKind::InvalidInput, "bulk MSS out of range"))?;
-    // Direct setsockopt(TCP_MAXSEG) — same pattern as the TCP_USER_TIMEOUT call
-    // above; avoids socket2 method-name drift across versions.
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_MAXSEG,
-            &mss as *const libc::c_int as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Non-Linux stub: MSS shaping only on Linux (TCP_MAXSEG).
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn set_tcp_mss_fd(_fd: std::os::unix::io::RawFd, _mss: u32) -> Result<()> {
     Ok(())
 }
 
@@ -306,7 +278,7 @@ pub fn normalize_ip(addr: SocketAddr) -> SocketAddr {
 }
 
 /// Socket options for server listening
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenOptions {
     /// Enable SO_REUSEADDR
     pub reuse_addr: bool,
@@ -332,8 +304,8 @@ impl Default for ListenOptions {
     }
 }
 
-/// Create a listening socket with the specified options
-pub fn create_listener(addr: SocketAddr, options: &ListenOptions) -> Result<Socket> {
+/// Binds a server socket without making it externally accepting.
+pub(crate) fn bind_listener_socket(addr: SocketAddr, options: &ListenOptions) -> Result<Socket> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -370,7 +342,21 @@ pub fn create_listener(addr: SocketAddr, options: &ListenOptions) -> Result<Sock
 
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(options.backlog as i32)?;
+
+    debug!(addr = %addr, "Bound server socket");
+
+    Ok(socket)
+}
+
+/// Activates a previously bound server socket with the configured backlog.
+pub(crate) fn activate_listener_socket(socket: &Socket, backlog: u32) -> Result<()> {
+    socket.listen(backlog as i32)
+}
+
+/// Create a listening socket with the specified options
+pub fn create_listener(addr: SocketAddr, options: &ListenOptions) -> Result<Socket> {
+    let socket = bind_listener_socket(addr, options)?;
+    activate_listener_socket(&socket, options.backlog)?;
 
     debug!(addr = %addr, "Created listening socket");
 
@@ -505,209 +491,5 @@ fn listening_inodes_for_port(addr: SocketAddr) -> HashSet<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::ErrorKind;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    #[tokio::test]
-    async fn test_configure_socket() {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(l) => l,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("bind failed: {e}"),
-        };
-        let addr = listener.local_addr().unwrap();
-
-        let stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("connect failed: {e}"),
-        };
-        if let Err(e) = configure_tcp_socket(&stream, true, Duration::from_secs(30)) {
-            if e.kind() == ErrorKind::PermissionDenied {
-                return;
-            }
-            panic!("configure_tcp_socket failed: {e}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_configure_client_socket() {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(l) => l,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("bind failed: {e}"),
-        };
-        let addr = match listener.local_addr() {
-            Ok(addr) => addr,
-            Err(e) => panic!("local_addr failed: {e}"),
-        };
-
-        let stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("connect failed: {e}"),
-        };
-
-        if let Err(e) = configure_client_socket(&stream, 30, 30) {
-            if e.kind() == ErrorKind::PermissionDenied {
-                return;
-            }
-            panic!("configure_client_socket failed: {e}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_configure_client_socket_zero_ack_timeout() {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(l) => l,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("bind failed: {e}"),
-        };
-        let addr = match listener.local_addr() {
-            Ok(addr) => addr,
-            Err(e) => panic!("local_addr failed: {e}"),
-        };
-
-        let stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("connect failed: {e}"),
-        };
-
-        if let Err(e) = configure_client_socket(&stream, 30, 0) {
-            if e.kind() == ErrorKind::PermissionDenied {
-                return;
-            }
-            panic!("configure_client_socket with zero ack timeout failed: {e}");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_configure_client_socket_roundtrip_io() {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(l) => l,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("bind failed: {e}"),
-        };
-        let addr = match listener.local_addr() {
-            Ok(addr) => addr,
-            Err(e) => panic!("local_addr failed: {e}"),
-        };
-
-        let server_task = tokio::spawn(async move {
-            let (mut accepted, _) = match listener.accept().await {
-                Ok(v) => v,
-                Err(e) => panic!("accept failed: {e}"),
-            };
-            let mut payload = [0u8; 4];
-            if let Err(e) = accepted.read_exact(&mut payload).await {
-                panic!("server read_exact failed: {e}");
-            }
-            if let Err(e) = accepted.write_all(b"pong").await {
-                panic!("server write_all failed: {e}");
-            }
-            payload
-        });
-
-        let mut stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("connect failed: {e}"),
-        };
-
-        if let Err(e) = configure_client_socket(&stream, 30, 30) {
-            if e.kind() == ErrorKind::PermissionDenied {
-                return;
-            }
-            panic!("configure_client_socket failed: {e}");
-        }
-
-        if let Err(e) = stream.write_all(b"ping").await {
-            panic!("client write_all failed: {e}");
-        }
-
-        let mut reply = [0u8; 4];
-        if let Err(e) = stream.read_exact(&mut reply).await {
-            panic!("client read_exact failed: {e}");
-        }
-        assert_eq!(&reply, b"pong");
-
-        let server_seen = match server_task.await {
-            Ok(value) => value,
-            Err(e) => panic!("server task join failed: {e}"),
-        };
-        assert_eq!(&server_seen, b"ping");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn test_configure_client_socket_ack_timeout_overflow_rejected() {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
-            Ok(l) => l,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("bind failed: {e}"),
-        };
-        let addr = match listener.local_addr() {
-            Ok(addr) => addr,
-            Err(e) => panic!("local_addr failed: {e}"),
-        };
-
-        let stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("connect failed: {e}"),
-        };
-
-        let too_large_secs = (i32::MAX as u64 / 1000) + 1;
-        let err = match configure_client_socket(&stream, 30, too_large_secs) {
-            Ok(()) => panic!("expected overflow validation error"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn test_normalize_ip() {
-        // IPv4 stays IPv4
-        let v4: SocketAddr = "192.168.1.1:8080".parse().unwrap();
-        assert_eq!(normalize_ip(v4), v4);
-
-        // Pure IPv6 stays IPv6
-        let v6: SocketAddr = "[::1]:8080".parse().unwrap();
-        assert_eq!(normalize_ip(v6), v6);
-    }
-
-    #[test]
-    fn test_listen_options_default() {
-        let opts = ListenOptions::default();
-        assert!(opts.reuse_addr);
-        assert!(opts.reuse_port);
-        assert_eq!(opts.backlog, 1024);
-        assert_eq!(opts.client_mss, None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_create_listener_applies_client_mss() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let options = ListenOptions {
-            reuse_port: false,
-            client_mss: Some(256),
-            ..Default::default()
-        };
-        let socket = match create_listener(addr, &options) {
-            Ok(socket) => socket,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("create_listener failed: {e}"),
-        };
-        let mss = match socket.tcp_mss() {
-            Ok(mss) => mss,
-            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
-            Err(e) => panic!("tcp_mss failed: {e}"),
-        };
-        assert_eq!(mss, 256);
-    }
-}
+#[path = "socket/tests.rs"]
+mod tests;

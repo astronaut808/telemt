@@ -26,72 +26,6 @@ enum HandshakeOutcome {
     NeedsMasking(PostHandshakeFuture),
 }
 
-#[must_use = "UserConnectionReservation must be kept alive to retain user/IP reservation until release or drop"]
-struct UserConnectionReservation {
-    stats: Arc<Stats>,
-    ip_tracker: Arc<UserIpTracker>,
-    user: String,
-    ip: IpAddr,
-    tracks_ip: bool,
-    state: SessionReservationState,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SessionReservationState {
-    Active,
-    Released,
-}
-
-impl UserConnectionReservation {
-    fn new(
-        stats: Arc<Stats>,
-        ip_tracker: Arc<UserIpTracker>,
-        user: String,
-        ip: IpAddr,
-        tracks_ip: bool,
-    ) -> Self {
-        Self {
-            stats,
-            ip_tracker,
-            user,
-            ip,
-            tracks_ip,
-            state: SessionReservationState::Active,
-        }
-    }
-
-    fn mark_released(&mut self) -> bool {
-        if self.state != SessionReservationState::Active {
-            return false;
-        }
-        self.state = SessionReservationState::Released;
-        true
-    }
-
-    async fn release(mut self) {
-        if !self.mark_released() {
-            return;
-        }
-        if self.tracks_ip {
-            self.ip_tracker.remove_ip(&self.user, self.ip).await;
-        }
-        self.stats.decrement_user_curr_connects(&self.user);
-    }
-}
-
-impl Drop for UserConnectionReservation {
-    fn drop(&mut self) {
-        if !self.mark_released() {
-            return;
-        }
-        self.stats.increment_session_drop_fallback_total();
-        self.stats.decrement_user_curr_connects(&self.user);
-        if self.tracks_ip {
-            self.ip_tracker.enqueue_cleanup(self.user.clone(), self.ip);
-        }
-    }
-}
-
 use crate::config::ProxyConfig;
 use crate::crypto::SecureRandom;
 use crate::error::{HandshakeResult, ProxyError, Result, StreamError};
@@ -107,16 +41,20 @@ use crate::transport::middle_proxy::MePool;
 use crate::transport::socket::normalize_ip;
 use crate::transport::{UpstreamManager, configure_client_socket, parse_proxy_protocol};
 
-use crate::proxy::direct_relay::handle_via_direct_with_shared;
+use crate::proxy::authenticated::{ClientRuntimeDeps, run_authenticated};
+#[cfg(test)]
+use crate::proxy::authenticated::{UserConnectionReservation, acquire_user_connection_reservation};
 use crate::proxy::handshake::{
-    HandshakeSuccess, handle_mtproto_handshake_with_shared, handle_tls_handshake_with_shared,
+    HandshakeSuccess, TlsResponseWriteOptions, handle_mtproto_handshake_with_shared,
+    handle_tls_handshake_with_shared, handle_tls_handshake_with_shared_and_options,
 };
 #[cfg(test)]
 use crate::proxy::handshake::{handle_mtproto_handshake, handle_tls_handshake};
 use crate::proxy::masking::handle_bad_client_with_shared;
-use crate::proxy::middle_relay::handle_via_middle_proxy;
-use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
-use crate::proxy::shared_state::ProxySharedState;
+#[cfg(test)]
+use crate::proxy::route_mode::RelayRouteMode;
+use crate::proxy::route_mode::RouteRuntimeController;
+use crate::proxy::shared_state::{ConntrackClosePolicy, ProxySharedState};
 
 fn beobachten_ttl(config: &ProxyConfig) -> Duration {
     const BEOBACHTEN_TTL_MAX_MINUTES: u64 = 24 * 60;
@@ -989,6 +927,7 @@ pub struct RunningClientHandler {
     #[cfg(unix)]
     raw_fd: std::os::unix::io::RawFd,
     rst_on_close: crate::config::RstOnCloseMode,
+    tls_response_fragment_size: Option<u16>,
 }
 
 impl ClientHandler {
@@ -1036,6 +975,7 @@ impl ClientHandler {
             #[cfg(unix)]
             raw_fd,
             crate::config::RstOnCloseMode::Off,
+            None,
         )
     }
 
@@ -1060,6 +1000,7 @@ impl ClientHandler {
         real_peer_report: Arc<std::sync::Mutex<Option<SocketAddr>>>,
         #[cfg(unix)] raw_fd: std::os::unix::io::RawFd,
         rst_on_close: crate::config::RstOnCloseMode,
+        tls_response_fragment_size: Option<u16>,
     ) -> RunningClientHandler {
         let normalized_peer = normalize_ip(peer);
         RunningClientHandler {
@@ -1084,6 +1025,7 @@ impl ClientHandler {
             #[cfg(unix)]
             raw_fd,
             rst_on_close,
+            tls_response_fragment_size,
         }
     }
 }
@@ -1105,12 +1047,6 @@ impl RunningClientHandler {
         #[cfg(unix)]
         let raw_fd = self.raw_fd;
         let rst_on_close = self.rst_on_close;
-        // MSS for the bulk data phase: once the handshake (incl. ServerHello) is
-        // sent, restore a normal MSS so only the handshake stays fragmented by the
-        // low listener `client_mss`. Cuts pps ~10x (anti-DDoS abuse on pps-policing
-        // hosts like FastVPS). None = keep handshake MSS for the whole connection.
-        #[cfg(unix)]
-        let bulk_mss: Option<u16> = self.config.server.client_mss_bulk_value().ok().flatten();
 
         let outcome = match self.do_handshake().await? {
             Some(outcome) => outcome,
@@ -1123,14 +1059,6 @@ impl RunningClientHandler {
                 #[cfg(unix)]
                 if matches!(rst_on_close, crate::config::RstOnCloseMode::Errors) {
                     let _ = crate::transport::socket::clear_linger_fd(raw_fd);
-                }
-                // Handshake (ServerHello) done — raise MSS for bulk transfer.
-                #[cfg(unix)]
-                if let Some(mss) = bulk_mss {
-                    if let Err(e) = crate::transport::socket::set_tcp_mss_fd(raw_fd, u32::from(mss))
-                    {
-                        debug!(error = %e, "Failed to raise bulk MSS; keeping handshake MSS");
-                    }
                 }
                 fut.await
             }
@@ -1412,50 +1340,58 @@ impl RunningClientHandler {
 
         let (read_half, write_half) = self.stream.into_split();
 
-        let (mut tls_reader, tls_writer, tls_user) = match handle_tls_handshake_with_shared(
-            &handshake,
-            read_half,
-            write_half,
-            peer,
-            &config,
-            &replay_checker,
-            &self.rng,
-            self.tls_cache.clone(),
-            self.shared.as_ref(),
-        )
-        .await
-        {
-            HandshakeResult::Success(result) => result,
-            HandshakeResult::BadClient { reader, writer } => {
-                stats.increment_connects_bad_with_class("tls_handshake_bad_client");
-                record_tls_fingerprint_bad_or_probe(
-                    stats.as_ref(),
-                    &config,
-                    peer.ip(),
-                    tls_fingerprint.as_ref(),
-                );
-                return Ok(masking_outcome(
-                    reader,
-                    writer,
-                    handshake.clone(),
-                    peer,
-                    local_addr,
-                    config.clone(),
-                    self.beobachten.clone(),
-                    self.shared.clone(),
-                ));
-            }
-            HandshakeResult::Error(e) => {
-                record_tls_fingerprint_bad_or_probe(
-                    stats.as_ref(),
-                    &config,
-                    peer.ip(),
-                    tls_fingerprint.as_ref(),
-                );
-                increment_bad_on_unknown_tls_sni(stats.as_ref(), &e);
-                return Err(e);
-            }
-        };
+        #[cfg(target_os = "linux")]
+        let response_write_options =
+            TlsResponseWriteOptions::tcp(self.raw_fd, self.tls_response_fragment_size);
+        #[cfg(not(target_os = "linux"))]
+        let response_write_options = TlsResponseWriteOptions::default();
+
+        let (mut tls_reader, tls_writer, tls_user) =
+            match handle_tls_handshake_with_shared_and_options(
+                &handshake,
+                read_half,
+                write_half,
+                peer,
+                &config,
+                &replay_checker,
+                &self.rng,
+                self.tls_cache.clone(),
+                self.shared.as_ref(),
+                response_write_options,
+            )
+            .await
+            {
+                HandshakeResult::Success(result) => result,
+                HandshakeResult::BadClient { reader, writer } => {
+                    stats.increment_connects_bad_with_class("tls_handshake_bad_client");
+                    record_tls_fingerprint_bad_or_probe(
+                        stats.as_ref(),
+                        &config,
+                        peer.ip(),
+                        tls_fingerprint.as_ref(),
+                    );
+                    return Ok(masking_outcome(
+                        reader,
+                        writer,
+                        handshake.clone(),
+                        peer,
+                        local_addr,
+                        config.clone(),
+                        self.beobachten.clone(),
+                        self.shared.clone(),
+                    ));
+                }
+                HandshakeResult::Error(e) => {
+                    record_tls_fingerprint_bad_or_probe(
+                        stats.as_ref(),
+                        &config,
+                        peer.ip(),
+                        tls_fingerprint.as_ref(),
+                    );
+                    increment_bad_on_unknown_tls_sni(stats.as_ref(), &e);
+                    return Err(e);
+                }
+            };
         record_tls_fingerprint_auth_success(
             stats.as_ref(),
             &config,
@@ -1689,112 +1625,30 @@ impl RunningClientHandler {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let user = success.user.clone();
-
-        if !shared.is_user_enabled(&user) {
-            warn!(user = %user, "Disabled user rejected");
-            return Err(ProxyError::UserDisabled { user });
-        }
-
-        let user_limit_reservation = match Self::acquire_user_connection_reservation_static(
-            &user,
-            &config,
-            stats.clone(),
-            peer_addr,
-            ip_tracker,
-        )
-        .await
-        {
-            Ok(reservation) => reservation,
-            Err(e) => {
-                warn!(user = %user, error = %e, "User admission check failed");
-                return Err(e);
-            }
-        };
-
-        let route_snapshot = route_runtime.snapshot();
-        let session_id = rng.u64();
-        let _user_session = shared.register_user_session(&user, session_id);
-        let session_cancel = _user_session.token();
-        let selected_me_pool = if config.general.use_middle_proxy
-            && matches!(route_snapshot.mode, RelayRouteMode::Middle)
-        {
-            if let Some(ref pool) = me_pool {
-                Some(pool.clone())
-            } else if let Some(pool_runtime) = me_pool_runtime.as_ref() {
-                pool_runtime.read().await.clone()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let relay_result = if config.general.use_middle_proxy
-            && matches!(route_snapshot.mode, RelayRouteMode::Middle)
-        {
-            if let Some(pool) = selected_me_pool {
-                handle_via_middle_proxy(
-                    client_reader,
-                    client_writer,
-                    success,
-                    pool,
-                    stats.clone(),
-                    config,
-                    buffer_pool,
-                    local_addr,
-                    rng,
-                    route_runtime.subscribe(),
-                    route_snapshot,
-                    session_id,
-                    session_cancel.clone(),
-                    shared.clone(),
-                )
-                .await
-            } else {
-                warn!("use_middle_proxy=true but MePool not initialized, falling back to direct");
-                handle_via_direct_with_shared(
-                    client_reader,
-                    client_writer,
-                    success,
-                    upstream_manager,
-                    stats.clone(),
-                    config,
-                    buffer_pool,
-                    rng,
-                    route_runtime.subscribe(),
-                    route_snapshot,
-                    session_id,
-                    local_addr,
-                    session_cancel.clone(),
-                    shared.clone(),
-                )
-                .await
-            }
-        } else {
-            // Direct mode (original behavior)
-            handle_via_direct_with_shared(
-                client_reader,
-                client_writer,
-                success,
-                upstream_manager,
-                stats.clone(),
+        run_authenticated(
+            client_reader,
+            client_writer,
+            success,
+            ClientRuntimeDeps {
                 config,
+                stats,
+                upstream_manager,
                 buffer_pool,
                 rng,
-                route_runtime.subscribe(),
-                route_snapshot,
-                session_id,
-                local_addr,
-                session_cancel,
-                shared.clone(),
-            )
-            .await
-        };
-        user_limit_reservation.release().await;
-        relay_result
+                me_pool,
+                me_pool_runtime,
+                route_runtime,
+                ip_tracker,
+                shared,
+            },
+            local_addr,
+            peer_addr,
+            ConntrackClosePolicy::Publish,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn acquire_user_connection_reservation_static(
         user: &str,
         config: &ProxyConfig,
@@ -1802,60 +1656,7 @@ impl RunningClientHandler {
         peer_addr: SocketAddr,
         ip_tracker: Arc<UserIpTracker>,
     ) -> Result<UserConnectionReservation> {
-        if let Some(expiration) = config.access.user_expirations.get(user)
-            && chrono::Utc::now() > *expiration
-        {
-            return Err(ProxyError::UserExpired {
-                user: user.to_string(),
-            });
-        }
-
-        if let Some(quota) = config.access.user_data_quota.get(user)
-            && stats.get_user_quota_used(user) >= *quota
-        {
-            return Err(ProxyError::DataQuotaExceeded {
-                user: user.to_string(),
-            });
-        }
-
-        let limit = config
-            .access
-            .user_max_tcp_conns
-            .get(user)
-            .copied()
-            .filter(|limit| *limit > 0)
-            .or((config.access.user_max_tcp_conns_global_each > 0)
-                .then_some(config.access.user_max_tcp_conns_global_each))
-            .map(|v| v as u64);
-        if !stats.try_acquire_user_curr_connects(user, limit) {
-            return Err(ProxyError::ConnectionLimitExceeded {
-                user: user.to_string(),
-            });
-        }
-
-        match ip_tracker.check_and_add(user, peer_addr.ip()).await {
-            Ok(()) => {}
-            Err(reason) => {
-                stats.decrement_user_curr_connects(user);
-                warn!(
-                    user = %user,
-                    ip = %peer_addr.ip(),
-                    reason = %reason,
-                    "IP limit exceeded"
-                );
-                return Err(ProxyError::ConnectionLimitExceeded {
-                    user: user.to_string(),
-                });
-            }
-        }
-
-        Ok(UserConnectionReservation::new(
-            stats,
-            ip_tracker,
-            user.to_string(),
-            peer_addr.ip(),
-            true,
-        ))
+        acquire_user_connection_reservation(user, config, stats, peer_addr, ip_tracker).await
     }
 
     #[cfg(test)]

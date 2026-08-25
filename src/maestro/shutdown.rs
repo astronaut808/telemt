@@ -51,7 +51,6 @@ pub(crate) async fn wait_for_shutdown(
     process_started_at: Instant,
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     quota_state_path: PathBuf,
-    synlimit_controller: synlimit_control::SynlimitController,
     reload_supervisor: ReloadSupervisorHandle,
 ) {
     let signal = wait_for_shutdown_signal().await;
@@ -60,7 +59,6 @@ pub(crate) async fn wait_for_shutdown(
         process_started_at,
         active_runtime,
         quota_state_path,
-        synlimit_controller,
         reload_supervisor,
     )
     .await;
@@ -92,13 +90,12 @@ async fn perform_shutdown(
     process_started_at: Instant,
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     quota_state_path: PathBuf,
-    synlimit_controller: synlimit_control::SynlimitController,
     reload_supervisor: ReloadSupervisorHandle,
 ) {
     let shutdown_started_at = Instant::now();
     info!(signal = %signal, "Received shutdown signal");
 
-    reload_supervisor.quiesce().await;
+    let listener_manager = reload_supervisor.quiesce().await;
     let runtime = active_runtime.load_full();
     let stats = runtime.stats.as_ref();
 
@@ -110,6 +107,10 @@ async fn perform_shutdown(
     info!("Shutting down...");
     let uptime_secs = process_started_at.elapsed().as_secs();
     info!("Uptime: {}", format_uptime(uptime_secs));
+
+    if let Err(error) = listener_manager.lock().await.shutdown().await {
+        warn!(error = %error, "Failed to stop one or more listener tasks cleanly");
+    }
 
     // Graceful ME pool shutdown
     runtime.stop_sessions().await;
@@ -130,7 +131,6 @@ async fn perform_shutdown(
         }
     }
 
-    synlimit_controller.shutdown().await;
     if let Err(error) = synlimit_control::clear_synlimit_rules_all_backends().await {
         warn!(error = %error, "Failed to clear SYN limiter rules during shutdown");
     }

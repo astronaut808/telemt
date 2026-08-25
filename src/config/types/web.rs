@@ -1,0 +1,457 @@
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+
+/// Client-facing secret representation used to derive a WEB capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSecretMode {
+    /// Use the existing 16-byte access secret without a prefix.
+    Plain,
+    /// Prefix the existing access secret with `0xdd` for capability derivation.
+    Dd,
+}
+
+/// HTTP carrier selected for newly issued WEB bridge sessions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebCarrier {
+    /// Serialize all logical streams through one uplink and one downlink sequence.
+    #[default]
+    Https,
+    /// Give every logical stream independent HTTPS sequencing and polling state.
+    HttpsLanes,
+}
+
+impl WebCarrier {
+    /// Returns the exact carrier token advertised to the browser bridge.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Https => "https",
+            Self::HttpsLanes => "https-lanes",
+        }
+    }
+}
+
+/// One access user explicitly exposed through a WEB virtual host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebProfileConfig {
+    /// Existing `[access.users]` key authenticated by the inner MTProxy handshake.
+    pub user: String,
+    /// Exact client-facing secret representation advertised in WEB links.
+    pub secret_mode: WebSecretMode,
+    /// Optional per-profile live session ceiling.
+    #[serde(default)]
+    pub max_sessions: Option<usize>,
+    /// Optional per-profile live logical-stream ceiling.
+    #[serde(default)]
+    pub max_streams: Option<usize>,
+    /// Optional per-profile stream ceiling for one session.
+    #[serde(default)]
+    pub max_streams_per_session: Option<usize>,
+}
+
+/// Public-site fallback used for requests that are not authenticated WEB traffic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum WebDecoyConfig {
+    /// Stream requests to one fixed private HTTP origin.
+    HttpUpstream {
+        /// Origin URL without a query or fragment.
+        upstream: String,
+    },
+    /// Serve an immutable, bounded snapshot of a local directory.
+    StaticDirectory {
+        /// Absolute directory containing public files.
+        directory: PathBuf,
+        /// File served for `/` and directory paths.
+        #[serde(default = "default_web_static_index")]
+        index: String,
+    },
+}
+
+/// One externally visible WEB hostname and its explicit access profiles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebVhostConfig {
+    /// Canonical lowercase ACE hostname used by Telegram Desktop.
+    pub host: String,
+    /// Stable public destination tuple used by inner relay routing and KDF metadata.
+    pub public_addr: SocketAddr,
+    /// Ordinary-site fallback for this hostname.
+    pub decoy: WebDecoyConfig,
+    /// Access users and exact secret modes enabled for this hostname.
+    #[serde(default)]
+    pub profiles: Vec<WebProfileConfig>,
+}
+
+/// Hard process and protocol limits for WEB ingress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebLimitsConfig {
+    /// Maximum bytes accepted while parsing one HTTP request head.
+    #[serde(default = "default_web_max_header_bytes")]
+    pub max_header_bytes: usize,
+    /// Maximum collected carrier request body size.
+    #[serde(default = "default_web_max_body_bytes")]
+    pub max_body_bytes: usize,
+    /// Maximum payload carried by one WEB frame.
+    #[serde(default = "default_web_max_frame_payload_bytes")]
+    pub max_frame_payload_bytes: usize,
+    /// Maximum encoded downlink batch returned by one poll.
+    #[serde(default = "default_web_carrier_batch_bytes")]
+    pub carrier_batch_bytes: usize,
+    /// Maximum frame count parsed or emitted in one carrier body.
+    #[serde(default = "default_web_max_frames_per_body")]
+    pub max_frames_per_body: usize,
+    /// Process-wide accepted WEB HTTP connection ceiling.
+    #[serde(default = "default_web_max_http_connections")]
+    pub max_http_connections: usize,
+    /// Process-wide concurrently executing HTTP handler ceiling.
+    #[serde(default = "default_web_max_http_handlers")]
+    pub max_http_handlers: usize,
+    /// Process-wide concurrently collected request body ceiling.
+    #[serde(default = "default_web_max_body_readers")]
+    pub max_body_readers: usize,
+    /// Process-wide byte reservation for collected request bodies.
+    #[serde(default = "default_web_max_body_bytes_global")]
+    pub max_body_bytes_global: usize,
+    /// Process-wide live WEB session ceiling.
+    #[serde(default = "default_web_max_sessions_global")]
+    pub max_sessions_global: usize,
+    /// Live WEB session ceiling for one forwarded client address.
+    #[serde(default = "default_web_max_sessions_per_ip")]
+    pub max_sessions_per_ip: usize,
+    /// Default live logical-stream ceiling for one WEB session.
+    #[serde(default = "default_web_max_streams_per_session")]
+    pub max_streams_per_session: usize,
+    /// Process-wide live logical-stream ceiling.
+    #[serde(default = "default_web_max_streams_global")]
+    pub max_streams_global: usize,
+    /// Process-wide concurrent inner MTProxy handshake ceiling.
+    #[serde(default = "default_web_max_stream_handshakes")]
+    pub max_stream_handshakes: usize,
+    /// Closed stream identifiers retained by one session.
+    #[serde(default = "default_web_max_tombstones")]
+    pub max_tombstones_per_session: usize,
+    /// Total queued data and control bytes allowed for one session.
+    #[serde(default = "default_web_pending_bytes_per_session")]
+    pub pending_bytes_per_session: usize,
+    /// Process-wide queued data and control byte ceiling.
+    #[serde(default = "default_web_pending_bytes_global")]
+    pub pending_bytes_global: usize,
+    /// Total queued data and control item ceiling for one session.
+    #[serde(default = "default_web_pending_items_per_session")]
+    pub pending_items_per_session: usize,
+    /// Process-wide queued data and control item ceiling.
+    #[serde(default = "default_web_pending_items_global")]
+    pub pending_items_global: usize,
+    /// Per-session byte reserve available only to control frames.
+    #[serde(default = "default_web_control_bytes_per_session")]
+    pub control_bytes_per_session: usize,
+    /// Process-wide byte reserve available only to control frames.
+    #[serde(default = "default_web_control_bytes_global")]
+    pub control_bytes_global: usize,
+    /// Process-wide live bootstrap credential ceiling.
+    #[serde(default = "default_web_max_bootstraps_global")]
+    pub max_bootstraps_global: usize,
+    /// Live bootstrap credential ceiling for one forwarded client address.
+    #[serde(default = "default_web_max_bootstraps_per_ip")]
+    pub max_bootstraps_per_ip: usize,
+    /// Maximum configured WEB virtual-host count.
+    #[serde(default = "default_web_max_vhosts")]
+    pub max_vhosts: usize,
+    /// Maximum configured WEB access-profile count across all virtual hosts.
+    #[serde(default = "default_web_max_profiles")]
+    pub max_profiles: usize,
+    /// Maximum static snapshot entry count across all virtual hosts.
+    #[serde(default = "default_web_max_static_files")]
+    pub max_static_files: usize,
+    /// Maximum bytes read from one static snapshot file.
+    #[serde(default = "default_web_max_static_file_bytes")]
+    pub max_static_file_bytes: usize,
+    /// Maximum static snapshot bytes across all virtual hosts.
+    #[serde(default = "default_web_max_static_bytes")]
+    pub max_static_bytes: usize,
+    /// Declared process envelope for HTTP heads, bodies, queues, and static snapshots.
+    #[serde(default = "default_web_memory_envelope_bytes")]
+    pub memory_envelope_bytes: usize,
+    /// Sustained process-wide bootstrap issuance rate.
+    #[serde(default = "default_web_new_bootstraps_per_minute")]
+    pub new_bootstraps_per_minute: u32,
+    /// Process-wide bootstrap issuance burst.
+    #[serde(default = "default_web_new_bootstraps_burst")]
+    pub new_bootstraps_burst: u32,
+    /// Sustained process-wide session creation rate.
+    #[serde(default = "default_web_new_sessions_per_minute")]
+    pub new_sessions_per_minute: u32,
+    /// Process-wide session creation burst.
+    #[serde(default = "default_web_new_sessions_burst")]
+    pub new_sessions_burst: u32,
+    /// Sustained process-wide logical-stream creation rate.
+    #[serde(default = "default_web_new_streams_per_minute")]
+    pub new_streams_per_minute: u32,
+    /// Process-wide logical-stream creation burst.
+    #[serde(default = "default_web_new_streams_burst")]
+    pub new_streams_burst: u32,
+}
+
+impl Default for WebLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_header_bytes: default_web_max_header_bytes(),
+            max_body_bytes: default_web_max_body_bytes(),
+            max_frame_payload_bytes: default_web_max_frame_payload_bytes(),
+            carrier_batch_bytes: default_web_carrier_batch_bytes(),
+            max_frames_per_body: default_web_max_frames_per_body(),
+            max_http_connections: default_web_max_http_connections(),
+            max_http_handlers: default_web_max_http_handlers(),
+            max_body_readers: default_web_max_body_readers(),
+            max_body_bytes_global: default_web_max_body_bytes_global(),
+            max_sessions_global: default_web_max_sessions_global(),
+            max_sessions_per_ip: default_web_max_sessions_per_ip(),
+            max_streams_per_session: default_web_max_streams_per_session(),
+            max_streams_global: default_web_max_streams_global(),
+            max_stream_handshakes: default_web_max_stream_handshakes(),
+            max_tombstones_per_session: default_web_max_tombstones(),
+            pending_bytes_per_session: default_web_pending_bytes_per_session(),
+            pending_bytes_global: default_web_pending_bytes_global(),
+            pending_items_per_session: default_web_pending_items_per_session(),
+            pending_items_global: default_web_pending_items_global(),
+            control_bytes_per_session: default_web_control_bytes_per_session(),
+            control_bytes_global: default_web_control_bytes_global(),
+            max_bootstraps_global: default_web_max_bootstraps_global(),
+            max_bootstraps_per_ip: default_web_max_bootstraps_per_ip(),
+            max_vhosts: default_web_max_vhosts(),
+            max_profiles: default_web_max_profiles(),
+            max_static_files: default_web_max_static_files(),
+            max_static_file_bytes: default_web_max_static_file_bytes(),
+            max_static_bytes: default_web_max_static_bytes(),
+            memory_envelope_bytes: default_web_memory_envelope_bytes(),
+            new_bootstraps_per_minute: default_web_new_bootstraps_per_minute(),
+            new_bootstraps_burst: default_web_new_bootstraps_burst(),
+            new_sessions_per_minute: default_web_new_sessions_per_minute(),
+            new_sessions_burst: default_web_new_sessions_burst(),
+            new_streams_per_minute: default_web_new_streams_per_minute(),
+            new_streams_burst: default_web_new_streams_burst(),
+        }
+    }
+}
+
+/// Deadlines for WEB HTTP, bootstrap, session, and shutdown lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebTimeoutsConfig {
+    /// Deadline for receiving one complete HTTP request head.
+    #[serde(default = "default_web_header_timeout_secs")]
+    pub header_secs: u64,
+    /// Deadline for collecting one authenticated carrier request body.
+    #[serde(default = "default_web_body_timeout_secs")]
+    pub body_secs: u64,
+    /// Deadline for the inner MTProxy handshake on one logical stream.
+    #[serde(default = "default_web_stream_handshake_timeout_secs")]
+    pub stream_handshake_secs: u64,
+    /// Maximum wait for one empty downlink long poll.
+    #[serde(default = "default_web_long_poll_timeout_secs")]
+    pub long_poll_secs: u64,
+    /// Lifetime of an unused bootstrap credential and closed-token replay marker.
+    #[serde(default = "default_web_bootstrap_lifetime_secs")]
+    pub bootstrap_lifetime_secs: u64,
+    /// Maximum carrier inactivity before a session is closed.
+    #[serde(default = "default_web_reconnect_grace_secs")]
+    pub reconnect_grace_secs: u64,
+    /// Maximum idle lifetime of a WEB HTTP keep-alive connection.
+    #[serde(default = "default_web_http_idle_secs")]
+    pub http_idle_secs: u64,
+    /// Maximum graceful wait for WEB connections and process-owned tasks.
+    #[serde(default = "default_web_shutdown_secs")]
+    pub shutdown_secs: u64,
+    /// Deadline for connecting to and receiving headers from an HTTP decoy.
+    #[serde(default = "default_web_decoy_header_timeout_secs")]
+    pub decoy_header_secs: u64,
+}
+
+impl Default for WebTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            header_secs: default_web_header_timeout_secs(),
+            body_secs: default_web_body_timeout_secs(),
+            stream_handshake_secs: default_web_stream_handshake_timeout_secs(),
+            long_poll_secs: default_web_long_poll_timeout_secs(),
+            bootstrap_lifetime_secs: default_web_bootstrap_lifetime_secs(),
+            reconnect_grace_secs: default_web_reconnect_grace_secs(),
+            http_idle_secs: default_web_http_idle_secs(),
+            shutdown_secs: default_web_shutdown_secs(),
+            decoy_header_secs: default_web_decoy_header_timeout_secs(),
+        }
+    }
+}
+
+/// WEB ingress, carrier, fallback, and lifecycle configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Enables issuance of new WEB bridge and session credentials.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Carrier selected for newly issued WEB bridge sessions.
+    #[serde(default)]
+    pub carrier: WebCarrier,
+    /// Hard process and protocol limits.
+    #[serde(default)]
+    pub limits: WebLimitsConfig,
+    /// WEB lifecycle deadlines.
+    #[serde(default)]
+    pub timeouts: WebTimeoutsConfig,
+    /// Public hostnames served by WEB listeners.
+    #[serde(default)]
+    pub vhosts: Vec<WebVhostConfig>,
+    /// Validated immutable runtime snapshot built during configuration loading.
+    #[serde(skip)]
+    pub(crate) runtime: Option<Arc<WebRuntimeConfig>>,
+}
+
+/// Precomputed WEB configuration consumed by listener hot paths.
+#[derive(Debug)]
+pub(crate) struct WebRuntimeConfig {
+    /// Canonical host lookup used by HTTP request routing.
+    pub(crate) vhosts: BTreeMap<String, Arc<WebRuntimeVhost>>,
+    /// Flat profile inventory used by startup link emission.
+    pub(crate) profiles: Vec<Arc<WebRuntimeProfile>>,
+}
+
+/// Precomputed immutable virtual-host data.
+#[derive(Debug)]
+pub(crate) struct WebRuntimeVhost {
+    /// Canonical lowercase ACE hostname.
+    pub(crate) host: String,
+    /// Immutable ordinary-site fallback snapshot.
+    pub(crate) decoy: WebRuntimeDecoy,
+    /// Upstream connect and response-head deadline.
+    pub(crate) decoy_header_secs: u64,
+    /// Exact capability profiles accepted by this host.
+    pub(crate) profiles: Vec<Arc<WebRuntimeProfile>>,
+}
+
+/// Precomputed exact-user capability entry.
+#[derive(Debug)]
+pub(crate) struct WebRuntimeProfile {
+    /// Canonical host that owns this profile.
+    pub(crate) host: String,
+    /// Stable public destination tuple supplied to relay routing.
+    pub(crate) public_addr: SocketAddr,
+    /// Exact access user authenticated by logical streams.
+    pub(crate) user: String,
+    /// Client secret representation and inner protocol policy.
+    pub(crate) secret_mode: WebSecretMode,
+    /// Carrier frozen into bridge and session state at issuance time.
+    pub(crate) carrier: WebCarrier,
+    /// HMAC-derived bridge capability.
+    pub(crate) capability: [u8; 32],
+    /// Per-profile live session ceiling.
+    pub(crate) max_sessions: usize,
+    /// Per-profile live logical-stream ceiling.
+    pub(crate) max_streams: usize,
+    /// Per-session live relay-task ceiling.
+    pub(crate) max_streams_per_session: usize,
+}
+
+/// Runtime-ready ordinary-site fallback.
+#[derive(Debug)]
+pub(crate) enum WebRuntimeDecoy {
+    HttpUpstream { addr: SocketAddr, authority: String },
+    StaticDirectory(Arc<WebStaticSite>),
+}
+
+/// Immutable bounded static-site snapshot.
+#[derive(Debug)]
+pub(crate) struct WebStaticSite {
+    /// Canonical URL-path to immutable response asset mapping.
+    pub(crate) assets: BTreeMap<String, WebStaticAsset>,
+    /// Configured root index file name.
+    pub(crate) index: String,
+}
+
+/// One immutable static response body and metadata.
+#[derive(Debug)]
+pub(crate) struct WebStaticAsset {
+    /// Immutable response body retained by the runtime snapshot.
+    pub(crate) body: Bytes,
+    /// Extension-derived static content type.
+    pub(crate) content_type: &'static str,
+    /// Strong SHA-256 entity tag.
+    pub(crate) etag: String,
+}
+
+fn default_web_static_index() -> String {
+    "index.html".to_string()
+}
+
+macro_rules! usize_default {
+    ($name:ident, $value:expr) => {
+        fn $name() -> usize {
+            $value
+        }
+    };
+}
+
+macro_rules! u32_default {
+    ($name:ident, $value:expr) => {
+        fn $name() -> u32 {
+            $value
+        }
+    };
+}
+
+macro_rules! u64_default {
+    ($name:ident, $value:expr) => {
+        fn $name() -> u64 {
+            $value
+        }
+    };
+}
+
+usize_default!(default_web_max_header_bytes, 16 * 1024);
+usize_default!(default_web_max_body_bytes, 2 * 1024 * 1024);
+usize_default!(default_web_max_frame_payload_bytes, 1024 * 1024);
+usize_default!(default_web_carrier_batch_bytes, 2 * 1024 * 1024);
+usize_default!(default_web_max_frames_per_body, 4096);
+usize_default!(default_web_max_http_connections, 1024);
+usize_default!(default_web_max_http_handlers, 512);
+usize_default!(default_web_max_body_readers, 32);
+usize_default!(default_web_max_body_bytes_global, 64 * 1024 * 1024);
+usize_default!(default_web_max_sessions_global, 128);
+usize_default!(default_web_max_sessions_per_ip, 16);
+usize_default!(default_web_max_streams_per_session, 128);
+usize_default!(default_web_max_streams_global, 4096);
+usize_default!(default_web_max_stream_handshakes, 256);
+usize_default!(default_web_max_tombstones, 4096);
+usize_default!(default_web_pending_bytes_per_session, 32 * 1024 * 1024);
+usize_default!(default_web_pending_bytes_global, 512 * 1024 * 1024);
+usize_default!(default_web_pending_items_per_session, 16 * 1024);
+usize_default!(default_web_pending_items_global, 256 * 1024);
+usize_default!(default_web_control_bytes_per_session, 256 * 1024);
+usize_default!(default_web_control_bytes_global, 16 * 1024 * 1024);
+usize_default!(default_web_max_bootstraps_global, 512);
+usize_default!(default_web_max_bootstraps_per_ip, 64);
+usize_default!(default_web_max_vhosts, 8);
+usize_default!(default_web_max_profiles, 32);
+usize_default!(default_web_max_static_files, 4096);
+usize_default!(default_web_max_static_file_bytes, 8 * 1024 * 1024);
+usize_default!(default_web_max_static_bytes, 64 * 1024 * 1024);
+usize_default!(default_web_memory_envelope_bytes, 768 * 1024 * 1024);
+u32_default!(default_web_new_bootstraps_per_minute, 1200);
+u32_default!(default_web_new_bootstraps_burst, 256);
+u32_default!(default_web_new_sessions_per_minute, 600);
+u32_default!(default_web_new_sessions_burst, 128);
+u32_default!(default_web_new_streams_per_minute, 6000);
+u32_default!(default_web_new_streams_burst, 512);
+u64_default!(default_web_header_timeout_secs, 10);
+u64_default!(default_web_body_timeout_secs, 30);
+u64_default!(default_web_stream_handshake_timeout_secs, 10);
+u64_default!(default_web_long_poll_timeout_secs, 25);
+u64_default!(default_web_bootstrap_lifetime_secs, 120);
+u64_default!(default_web_reconnect_grace_secs, 120);
+u64_default!(default_web_http_idle_secs, 75);
+u64_default!(default_web_shutdown_secs, 15);
+u64_default!(default_web_decoy_header_timeout_secs, 30);

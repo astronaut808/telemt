@@ -1,7 +1,7 @@
 use super::*;
 
 fn handshake_source() -> &'static str {
-    include_str!("../handshake.rs")
+    include_str!("../handshake/auth_candidates.rs")
 }
 
 #[test]

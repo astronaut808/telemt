@@ -33,6 +33,7 @@ async fn fixture(request: ReloadRequest) -> ReloadFixture {
         .unwrap();
     let (detected_ips_tx, _detected_ips_rx) = watch::channel((None, None));
     let (runtime_watch_tx, runtime_watch_rx) = watch::channel(Some(old_runtime.watch_state()));
+    let listener_manager = Arc::new(Mutex::new(ListenerManager::empty(active_runtime.clone())));
     let supervisor = Arc::new(ReloadSupervisor {
         active_runtime,
         control: control.clone(),
@@ -42,6 +43,7 @@ async fn fixture(request: ReloadRequest) -> ReloadFixture {
         detected_ips_tx,
         runtime_log_filter: runtime_log_filter(),
         runtime_watch_tx,
+        listener_manager,
     });
     let command = ReloadCommand {
         reload_id: accepted.reload_id,
@@ -293,6 +295,7 @@ async fn quiesce_joins_idle_supervisor_and_rejects_later_submissions() {
     let (control, commands) = ReloadControl::channel(runtime.id);
     let (detected_ips_tx, _detected_ips_rx) = watch::channel((None, None));
     let (runtime_watch_tx, _runtime_watch_rx) = watch::channel(Some(runtime.watch_state()));
+    let listener_manager = ListenerManager::empty(active_runtime.clone());
     let handle = ReloadSupervisor::spawn(
         active_runtime,
         control.clone(),
@@ -302,6 +305,7 @@ async fn quiesce_joins_idle_supervisor_and_rejects_later_submissions() {
         detected_ips_tx,
         runtime_log_filter(),
         runtime_watch_tx,
+        listener_manager,
     );
 
     tokio::time::timeout(Duration::from_secs(1), handle.quiesce())

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -10,11 +11,12 @@ use tracing::{info, warn};
 use crate::stats::QuotaStore;
 
 use super::generation::{RuntimeGeneration, RuntimeWatchState};
+use super::listeners::{ListenerManager, PreparedListenerTransition};
 use super::reload::{
     ReloadCommand, ReloadCommandReceiver, ReloadControl, ReloadFailurePolicy, ReloadMode,
     ReloadPhase,
 };
-use super::runtime_build::{PreparedRuntime, deferred_process_fields, prepare_runtime};
+use super::runtime_build::{PreparedRuntime, prepare_runtime, resolve_reload_config};
 use super::runtime_tasks::RuntimeLogFilter;
 
 pub(crate) struct ReloadSupervisor {
@@ -26,6 +28,7 @@ pub(crate) struct ReloadSupervisor {
     detected_ips_tx: watch::Sender<(Option<std::net::IpAddr>, Option<std::net::IpAddr>)>,
     runtime_log_filter: RuntimeLogFilter,
     runtime_watch_tx: watch::Sender<Option<RuntimeWatchState>>,
+    listener_manager: Arc<Mutex<ListenerManager>>,
 }
 
 /// Process-owned handle that quiesces reloads before shutdown snapshots the runtime.
@@ -33,16 +36,18 @@ pub(crate) struct ReloadSupervisorHandle {
     control: ReloadControl,
     shutdown: CancellationToken,
     join: tokio::task::JoinHandle<()>,
+    listener_manager: Arc<Mutex<ListenerManager>>,
 }
 
 impl ReloadSupervisorHandle {
     /// Stops new submissions and waits for the accepted reload to finish.
-    pub(crate) async fn quiesce(self) {
+    pub(crate) async fn quiesce(self) -> Arc<Mutex<ListenerManager>> {
         self.control.begin_shutdown().await;
         self.shutdown.cancel();
         if let Err(error) = self.join.await {
             warn!(error = %error, "Reload supervisor failed while quiescing");
         }
+        self.listener_manager
     }
 }
 
@@ -99,7 +104,9 @@ impl ReloadSupervisor {
         detected_ips_tx: watch::Sender<(Option<std::net::IpAddr>, Option<std::net::IpAddr>)>,
         runtime_log_filter: RuntimeLogFilter,
         runtime_watch_tx: watch::Sender<Option<RuntimeWatchState>>,
+        listener_manager: ListenerManager,
     ) -> ReloadSupervisorHandle {
+        let listener_manager = Arc::new(Mutex::new(listener_manager));
         let supervisor = Self {
             active_runtime,
             control,
@@ -109,6 +116,7 @@ impl ReloadSupervisor {
             detected_ips_tx,
             runtime_log_filter,
             runtime_watch_tx,
+            listener_manager: listener_manager.clone(),
         };
         let control = supervisor.control.clone();
         let shutdown = CancellationToken::new();
@@ -117,6 +125,7 @@ impl ReloadSupervisor {
             control,
             shutdown,
             join,
+            listener_manager,
         }
     }
 
@@ -147,14 +156,14 @@ impl ReloadSupervisor {
             .mark_phase(command.reload_id, ReloadPhase::Preparing)
             .await;
         let old_runtime = self.active_runtime.load_full();
-        let deferred = deferred_process_fields(&old_runtime.config(), &command.config);
+        let resolved = resolve_reload_config(&old_runtime.config(), &command.config);
         self.control
-            .set_deferred_fields(command.reload_id, deferred)
+            .set_deferred_fields(command.reload_id, resolved.deferred_process_fields.clone())
             .await;
 
         let prepared = match prepare_runtime(
             command.target_generation,
-            command.config.as_ref().clone(),
+            resolved.effective,
             &self.config_path,
             self.quota_store.clone(),
             self.runtime_log_filter.clone(),
@@ -168,23 +177,81 @@ impl ReloadSupervisor {
             }
         };
 
+        let listener_transition = match self
+            .listener_manager
+            .lock()
+            .await
+            .prepare_transition(prepared.generation.config().as_ref())
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = cleanup_candidate(&prepared.generation).await;
+                self.runtime_log_filter
+                    .apply_reload(&old_runtime.config().general.log_level);
+                self.control.fail(command.reload_id, error).await;
+                return;
+            }
+        };
         let revision_action = revision_gate_action(
             &command.config_revision,
             crate::api::config_store::current_revision_for_maestro(&self.config_path).await,
             command.request.failure_policy,
         );
-        self.activate_prepared(command, old_runtime, prepared, revision_action, |entries| {
-            crate::network::dns_overrides::install_entries(entries)
-                .map_err(|error| error.to_string())
-        })
+        self.activate_prepared_with_transition(
+            command,
+            old_runtime,
+            prepared,
+            listener_transition,
+            revision_action,
+            |entries| {
+                crate::network::dns_overrides::install_entries(entries)
+                    .map_err(|error| error.to_string())
+            },
+        )
         .await;
     }
 
+    #[cfg(test)]
     async fn activate_prepared<InstallDns>(
         &self,
         command: ReloadCommand,
         old_runtime: Arc<RuntimeGeneration>,
         prepared: PreparedRuntime,
+        revision_action: RevisionGateAction,
+        install_dns: InstallDns,
+    ) where
+        InstallDns: FnOnce(&[String]) -> Result<(), String>,
+    {
+        let listener_transition = match self
+            .listener_manager
+            .lock()
+            .await
+            .prepare_transition(prepared.generation.config().as_ref())
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = cleanup_candidate(&prepared.generation).await;
+                self.control.fail(command.reload_id, error).await;
+                return;
+            }
+        };
+        self.activate_prepared_with_transition(
+            command,
+            old_runtime,
+            prepared,
+            listener_transition,
+            revision_action,
+            install_dns,
+        )
+        .await;
+    }
+
+    async fn activate_prepared_with_transition<InstallDns>(
+        &self,
+        command: ReloadCommand,
+        old_runtime: Arc<RuntimeGeneration>,
+        prepared: PreparedRuntime,
+        listener_transition: Option<PreparedListenerTransition>,
         revision_action: RevisionGateAction,
         install_dns: InstallDns,
     ) where
@@ -208,7 +275,6 @@ impl ReloadSupervisor {
             .mark_phase(command.reload_id, ReloadPhase::Activating)
             .await;
         let new_runtime = prepared.generation;
-        old_runtime.stop_accepting_sessions();
         if let Err(error) = install_dns(&new_runtime.config().network.dns_overrides) {
             let message = format!("runtime DNS activation failed: {}", error);
             if command.request.failure_policy == ReloadFailurePolicy::Rollback {
@@ -221,7 +287,34 @@ impl ReloadSupervisor {
             }
             self.control.add_warning(command.reload_id, message).await;
         }
+        let pending_listener_transition = if let Some(listener_transition) = listener_transition {
+            match self
+                .listener_manager
+                .lock()
+                .await
+                .begin_transition(listener_transition)
+                .await
+            {
+                Ok(pending) => Some(pending),
+                Err(error) => {
+                    let _ = cleanup_candidate(&new_runtime).await;
+                    self.runtime_log_filter
+                        .apply_reload(&old_runtime.config().general.log_level);
+                    self.control.fail(command.reload_id, error).await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        old_runtime.stop_accepting_sessions();
         let replaced = self.active_runtime.swap(new_runtime.clone());
+        if let Some(pending) = pending_listener_transition {
+            self.listener_manager
+                .lock()
+                .await
+                .finish_transition(pending);
+        }
         self.detected_ips_tx.send_replace(prepared.detected_ips);
         self.runtime_log_filter
             .apply_reload(&new_runtime.config().general.log_level);

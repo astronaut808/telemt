@@ -220,12 +220,51 @@ async fn closed_command_channel_marks_reload_failed_and_releases_slot() {
 
     assert_eq!(result, Err(ReloadSubmitError::MaestroUnavailable));
     assert_eq!(control.in_progress().await, None);
-    let status = control.status(1).await.unwrap();
-    assert_eq!(status.state, ReloadPhase::Failed);
-    assert_eq!(
-        status.error.as_deref(),
-        Some("maestro command channel is closed")
-    );
+    assert!(control.status(1).await.is_none());
+}
+
+#[tokio::test]
+async fn dropped_reservation_releases_status_and_channel_capacity() {
+    let (control, mut receiver) = ReloadControl::channel(1);
+    let reservation = control
+        .reserve("rev-reserved".to_string(), ReloadRequest::default())
+        .await
+        .unwrap();
+    let reload_id = reservation.status.reload_id;
+
+    drop(reservation);
+
+    assert_eq!(control.in_progress().await, None);
+    assert!(control.status(reload_id).await.is_none());
+    let accepted = control
+        .submit(
+            Arc::new(ProxyConfig::default()),
+            "rev-next".to_string(),
+            ReloadRequest::default(),
+        )
+        .await
+        .unwrap();
+    assert!(receiver.recv().await.is_some());
+    assert!(accepted.reload_id > reload_id);
+}
+
+#[tokio::test]
+async fn reservation_preserves_the_complete_reload_request() {
+    let (control, mut receiver) = ReloadControl::channel(1);
+    let request = ReloadRequest {
+        mode: ReloadMode::Drain,
+        timeout_secs: Some(30),
+        failure_policy: ReloadFailurePolicy::Rollback,
+    };
+    let reservation = control
+        .reserve("rev-drain".to_string(), request.clone())
+        .await
+        .unwrap();
+
+    reservation.enqueue(Arc::new(ProxyConfig::default()));
+    let command = receiver.recv().await.unwrap();
+
+    assert_eq!(command.request, request);
 }
 
 #[tokio::test]
