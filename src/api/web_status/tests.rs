@@ -1,0 +1,82 @@
+use http_body_util::BodyExt as _;
+
+use super::*;
+use crate::web::trace::{TraceIdentity, TraceLifecycleEvent};
+
+#[test]
+fn query_rejects_noncanonical_ip_and_excessive_window() {
+    let policy = WebDebugConfig::default();
+    assert!(parse_query(Some("ip=2001%3A0db8%3A%3A1"), &policy).is_err());
+    assert!(parse_query(Some("window_secs=3601"), &policy).is_err());
+    assert!(parse_query(Some("session=1&session=2"), &policy).is_err());
+}
+
+#[test]
+fn html_escaping_covers_active_markup_characters() {
+    let mut output = String::new();
+    escape(&mut output, "<script a='\"'>&");
+    assert_eq!(output, "&lt;script a=&#39;&quot;&#39;&gt;&amp;");
+}
+
+#[tokio::test]
+async fn renderer_filters_groups_and_sets_control_plane_security_headers() {
+    let mut policy = WebDebugConfig::default();
+    policy.enabled = true;
+    let mut limits = crate::config::WebLimitsConfig::default();
+    limits.debug_records_capacity = 8;
+    limits.debug_bytes_global = 16 * 1024;
+    let store = WebTraceStore::new(policy.clone(), &limits);
+    store.record_lifecycle(
+        None,
+        Some("192.0.2.40".parse().unwrap()),
+        TraceIdentity {
+            session_id: Some(42),
+            user: Some("alice".to_string()),
+            key_fingerprint: Some("0123456789abcdef".to_string()),
+        },
+        TraceLifecycleEvent::SessionCreated,
+        None,
+        None,
+    );
+
+    let response = render(
+        Some("ip=192.0.2.40&session=42&key=0123456789abcdef&group_by=ip&group_by=key"),
+        &store,
+        &policy,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert!(response.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("session_created"));
+    assert!(body.contains("0123456789abcdef"));
+    assert!(body.contains("192.0.2.40"));
+}
+
+#[tokio::test]
+async fn render_permits_remain_owned_by_inflight_response_bodies() {
+    let policy = WebDebugConfig::default();
+    let limits = crate::config::WebLimitsConfig::default();
+    let store = WebTraceStore::new(policy.clone(), &limits);
+
+    let first = render(None, &store, &policy).await;
+    let second = render(None, &store, &policy).await;
+    let busy = render(None, &store, &policy).await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    drop(first);
+    let admitted = render(None, &store, &policy).await;
+    assert_eq!(admitted.status(), StatusCode::OK);
+    drop(second);
+    drop(admitted);
+}
+
+#[test]
+fn page_truncation_preserves_utf8_boundary_and_cap() {
+    let mut html = "я".repeat(MAX_PAGE_BYTES);
+    truncate_page(&mut html);
+    assert!(html.len() <= MAX_PAGE_BYTES);
+    assert!(html.ends_with("[page output truncated]"));
+}

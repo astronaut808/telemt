@@ -2,6 +2,11 @@ use std::collections::HashSet;
 
 use super::*;
 
+// Debug capture validation is independent from restart-only storage limits.
+mod debug;
+// Memory-envelope arithmetic remains isolated from protocol validation.
+mod memory;
+
 const WEB_FRAME_HEADER_BYTES: usize = 8;
 const WEB_QUEUE_ITEM_COST: usize = 256;
 const WEB_CONTROL_EXTRA_ITEMS: usize = 16;
@@ -59,6 +64,7 @@ pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
     }
 
     validate_limits(&config.web.limits)?;
+    debug::validate(&config.web.debug, &config.web.limits)?;
     if config.web.carrier == WebCarrier::HttpsLanes && config.web.limits.max_http_handlers < 2 {
         return config_error("web.carrier=https-lanes requires web.limits.max_http_handlers >= 2");
     }
@@ -175,6 +181,8 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         ("max_static_files", limits.max_static_files),
         ("max_static_file_bytes", limits.max_static_file_bytes),
         ("max_static_bytes", limits.max_static_bytes),
+        ("debug_records_capacity", limits.debug_records_capacity),
+        ("debug_bytes_global", limits.debug_bytes_global),
         ("memory_envelope_bytes", limits.memory_envelope_bytes),
     ];
     if let Some((field, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
@@ -309,38 +317,7 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
             "web.limits pending ceilings must preserve one uplink batch and downlink progress",
         );
     }
-    let body_reservation = limits
-        .max_body_readers
-        .checked_mul(limits.max_body_bytes)
-        .ok_or_else(|| {
-            ProxyError::Config("web.limits body reader reservation overflowed usize".to_string())
-        })?;
-    if body_reservation > limits.max_body_bytes_global
-        || limits.max_body_bytes_global > u32::MAX as usize
-    {
-        return config_error(
-            "web.limits max_body_readers * max_body_bytes must fit max_body_bytes_global and u32",
-        );
-    }
-    let http_header_reservation = limits
-        .max_http_connections
-        .checked_mul(limits.max_header_bytes)
-        .ok_or_else(|| {
-            ProxyError::Config("web.limits HTTP header reservations overflow usize".to_string())
-        })?;
-    let reserved = limits
-        .pending_bytes_global
-        .checked_add(limits.max_body_bytes_global)
-        .and_then(|value| value.checked_add(limits.max_static_bytes))
-        .and_then(|value| value.checked_add(http_header_reservation))
-        .ok_or_else(|| ProxyError::Config("web.limits byte ceilings overflow usize".to_string()))?;
-    if reserved > limits.memory_envelope_bytes
-        || limits.memory_envelope_bytes > MAX_WEB_MEMORY_ENVELOPE_BYTES
-    {
-        return config_error(
-            "web.limits memory reservations must fit memory_envelope_bytes within 4 GiB",
-        );
-    }
+    memory::validate(limits)?;
     Ok(())
 }
 

@@ -30,6 +30,7 @@ use crate::startup::StartupTracker;
 use crate::stats::Stats;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
+use crate::web::trace::WebTraceStore;
 
 mod config_edit;
 pub(crate) mod config_store;
@@ -47,6 +48,7 @@ mod runtime_stats;
 mod runtime_watch;
 mod runtime_zero;
 mod users;
+mod web_status;
 
 use config_store::{
     current_revision, ensure_expected_revision, load_config_for_reload, load_config_from_disk,
@@ -122,6 +124,7 @@ pub(super) struct ApiShared {
     pub(super) proxy_shared: Arc<ProxySharedState>,
     pub(super) reload_control: ReloadControl,
     pub(super) active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
+    pub(super) web_trace: Arc<WebTraceStore>,
 }
 
 impl ApiShared {
@@ -155,6 +158,7 @@ impl ApiShared {
             proxy_shared: runtime.proxy_shared.clone(),
             reload_control: self.reload_control.clone(),
             active_runtime: self.active_runtime.clone(),
+            web_trace: self.web_trace.clone(),
         }
     }
 }
@@ -243,7 +247,8 @@ fn allowed_methods_for_path(path: &str) -> Option<&'static str> {
         | "/v1/runtime/tls-fingerprints"
         | "/v1/stats/users/active-ips"
         | "/v1/stats/users/quota"
-        | "/v1/stats/users" => Some(ALLOW_GET),
+        | "/v1/stats/users"
+        | "/web-status" => Some(ALLOW_GET),
         "/v1/system/reload" => Some(ALLOW_POST),
         "/v1/users" => Some(ALLOW_GET_POST),
         "/v1/config" => Some(ALLOW_GET_PATCH),
@@ -279,6 +284,7 @@ pub async fn serve(
     reload_control: ReloadControl,
     mut active_runtime_rx: watch::Receiver<Option<Arc<ArcSwap<RuntimeGeneration>>>>,
     mut runtime_watch_rx: watch::Receiver<Option<RuntimeWatchState>>,
+    web_trace: Arc<WebTraceStore>,
 ) {
     let active_runtime = loop {
         if let Some(active_runtime) = active_runtime_rx.borrow().clone() {
@@ -312,7 +318,7 @@ pub async fn serve(
         }
     };
 
-    info!("API endpoint: http://{}/v1/*", listen);
+    info!("API endpoint: http://{}/v1/* and /web-status", listen);
 
     let runtime_state = Arc::new(ApiRuntimeState {
         process_started_at_epoch_secs,
@@ -344,6 +350,7 @@ pub async fn serve(
         proxy_shared,
         reload_control,
         active_runtime,
+        web_trace,
     });
 
     spawn_runtime_watchers(
@@ -492,6 +499,12 @@ async fn handle(
 
     let result: Result<Response<Full<Bytes>>, ApiFailure> = async {
         match (method.as_str(), normalized_path) {
+            ("GET", "/web-status") => Ok(web_status::render(
+                query.as_deref(),
+                &shared.web_trace,
+                &cfg.web.debug,
+            )
+            .await),
             ("GET", "/v1/health") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let data = HealthData {

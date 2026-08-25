@@ -496,4 +496,13 @@ pub(super) fn log_changes(
             new_hot.user_max_unique_ips_window_secs
         );
     }
+    if old_hot.web_debug != new_hot.web_debug {
+        info!(
+            "config reload: web.debug updated: enabled={} body_capture={:?} window={}..={}s",
+            new_hot.web_debug.enabled,
+            new_hot.web_debug.body_capture,
+            new_hot.web_debug.default_window_secs,
+            new_hot.web_debug.max_window_secs,
+        );
+    }
 }

@@ -17,6 +17,7 @@ use crate::stats::{QuotaStore, Stats};
 use crate::synlimit_control;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
+use crate::web::trace::WebTraceStore;
 
 use super::{
     bootstrap, generation, listeners, reload, reload_supervisor, runtime_startup, runtime_tasks,
@@ -104,6 +105,7 @@ pub(super) async fn run_telemt_core(
         config.access.user_rate_limits.clone(),
         config.access.cidr_rate_limits.clone(),
     );
+    let web_trace = WebTraceStore::new(config.web.debug.clone(), &config.web.limits);
 
     let (detected_ips_tx, detected_ips_rx) = watch::channel((None::<IpAddr>, None::<IpAddr>));
     let initial_direct_first = config.general.use_middle_proxy && config.general.me2dc_fallback;
@@ -154,6 +156,7 @@ pub(super) async fn run_telemt_core(
             let reload_control_api = reload_control.clone();
             let active_runtime_rx_api = active_runtime_rx.clone();
             let runtime_watch_rx_api = runtime_watch_rx.clone();
+            let web_trace_api = web_trace.clone();
             tokio::spawn(async move {
                 api::serve(
                     listen,
@@ -171,6 +174,7 @@ pub(super) async fn run_telemt_core(
                     reload_control_api,
                     active_runtime_rx_api,
                     runtime_watch_rx_api,
+                    web_trace_api,
                 )
                 .await;
             });
@@ -314,7 +318,11 @@ pub(super) async fn run_telemt_core(
     active_runtime_tx.send_replace(Some(active_runtime.clone()));
     runtime_tasks::mark_runtime_ready(&startup_tracker).await;
 
-    let listener_manager = listeners::ListenerManager::start(bound, active_runtime.clone());
+    let listener_manager = listeners::ListenerManager::start(
+        bound,
+        active_runtime.clone(),
+        web_trace.clone(),
+    );
     let reload_supervisor = reload_supervisor::ReloadSupervisor::spawn(
         active_runtime.clone(),
         reload_control,
@@ -325,6 +333,7 @@ pub(super) async fn run_telemt_core(
         runtime_log_filter,
         runtime_watch_tx,
         listener_manager,
+        web_trace,
     );
 
     shutdown::spawn_signal_handlers(active_runtime.clone(), process_started_at);

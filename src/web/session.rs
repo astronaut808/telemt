@@ -120,6 +120,7 @@ pub(crate) struct WebSession {
     manager: std::sync::Weak<WebProcessRuntime>,
     token_hash: TokenHash,
     client_ip: IpAddr,
+    trace_session_id: u64,
     profile: Arc<WebRuntimeProfile>,
     profile_key: ProfileKey,
     limits: WebLimitsConfig,
@@ -150,6 +151,7 @@ impl WebSession {
         manager: std::sync::Weak<WebProcessRuntime>,
         token_hash: TokenHash,
         client_ip: IpAddr,
+        trace_session_id: u64,
         profile: Arc<WebRuntimeProfile>,
         profile_key: ProfileKey,
         limits: WebLimitsConfig,
@@ -163,6 +165,7 @@ impl WebSession {
             manager,
             token_hash,
             client_ip,
+            trace_session_id,
             profile,
             profile_key,
             limits,
@@ -211,6 +214,30 @@ impl WebSession {
         self.profile.carrier
     }
 
+    /// Returns a cloned non-secret identity only for enabled debug capture.
+    pub(crate) fn trace_identity(&self) -> crate::web::trace::TraceIdentity {
+        crate::web::trace::TraceIdentity::from_profile(self.trace_session_id, &self.profile)
+    }
+
+    /// Records one typed lifecycle event without exposing session credentials.
+    pub(super) fn trace_lifecycle(
+        &self,
+        event: crate::web::trace::TraceLifecycleEvent,
+        stream_id: Option<u32>,
+        reason: Option<&'static str>,
+    ) {
+        if let Some(manager) = self.manager.upgrade() {
+            manager.trace().record_profile_lifecycle(
+                self.client_ip,
+                Some(self.trace_session_id),
+                &self.profile,
+                event,
+                stream_id,
+                reason,
+            );
+        }
+    }
+
     /// Closes carrier state while relay tasks retain their admission until exit.
     pub(crate) fn close(&self) {
         let (data_bytes, data_items, control_bytes, control_items) = {
@@ -253,6 +280,11 @@ impl WebSession {
             manager.release_pending(data_bytes, data_items, false);
             manager.release_pending(control_bytes, control_items, true);
             if !self.finished.swap(true, Ordering::AcqRel) {
+                self.trace_lifecycle(
+                    crate::web::trace::TraceLifecycleEvent::SessionClosed,
+                    None,
+                    Some("closed"),
+                );
                 manager.session_finished(
                     self.token_hash,
                     self.client_ip,

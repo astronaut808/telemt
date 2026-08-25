@@ -22,6 +22,8 @@ pub(super) struct Bootstrap {
     pub(super) issuance_ip: IpAddr,
     /// Immutable profile selected during capability validation.
     pub(super) profile: Arc<WebRuntimeProfile>,
+    /// Process-unique non-secret identifier shared by bootstrap and session traces.
+    pub(super) trace_session_id: u64,
     /// Digest of the accepted HELLO body for idempotent retry matching.
     pub(super) body_digest: TokenHash,
     /// Zeroizing copy returned only for an exact session-creation retry.
@@ -130,6 +132,7 @@ pub(super) fn matching_profile(
                 && profile.secret_mode == expected.secret_mode
                 && profile.carrier == expected.carrier
                 && profile.capability == expected.capability
+                && profile.key_fingerprint == expected.key_fingerprint
         })
         .cloned()
 }

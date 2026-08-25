@@ -17,7 +17,7 @@ use crate::maestro::generation::test_runtime_generation;
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::WebProcessRuntime;
 
-fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
+pub(super) fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
     let profile = Arc::new(WebRuntimeProfile {
         host: "proxy.example.com".to_string(),
         public_addr: "203.0.113.10:443".parse().unwrap(),
@@ -25,6 +25,7 @@ fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
         secret_mode: WebSecretMode::Plain,
         carrier,
         capability,
+        key_fingerprint: "0000000000000000".to_string(),
         max_sessions: 4,
         max_streams: 16,
         max_streams_per_session: 4,
@@ -71,7 +72,7 @@ fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
     config
 }
 
-async fn request(
+pub(super) async fn request(
     listener: &TcpListener,
     runtime: &Arc<WebProcessRuntime>,
     request: Vec<u8>,
@@ -97,7 +98,7 @@ async fn request(
     response
 }
 
-fn split_response(response: &[u8]) -> (&[u8], &[u8]) {
+pub(super) fn split_response(response: &[u8]) -> (&[u8], &[u8]) {
     let separator = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

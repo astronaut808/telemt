@@ -6,6 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::web_debug::WebDebugConfig;
+
 /// Client-facing secret representation used to derive a WEB capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -175,6 +177,12 @@ pub struct WebLimitsConfig {
     /// Maximum static snapshot bytes across all virtual hosts.
     #[serde(default = "default_web_max_static_bytes")]
     pub max_static_bytes: usize,
+    /// Maximum retained WEB debug record count.
+    #[serde(default = "default_web_debug_records_capacity")]
+    pub debug_records_capacity: usize,
+    /// Process-wide retained and in-flight WEB debug byte ceiling.
+    #[serde(default = "default_web_debug_bytes_global")]
+    pub debug_bytes_global: usize,
     /// Declared process envelope for HTTP heads, bodies, queues, and static snapshots.
     #[serde(default = "default_web_memory_envelope_bytes")]
     pub memory_envelope_bytes: usize,
@@ -229,6 +237,8 @@ impl Default for WebLimitsConfig {
             max_static_files: default_web_max_static_files(),
             max_static_file_bytes: default_web_max_static_file_bytes(),
             max_static_bytes: default_web_max_static_bytes(),
+            debug_records_capacity: default_web_debug_records_capacity(),
+            debug_bytes_global: default_web_debug_bytes_global(),
             memory_envelope_bytes: default_web_memory_envelope_bytes(),
             new_bootstraps_per_minute: default_web_new_bootstraps_per_minute(),
             new_bootstraps_burst: default_web_new_bootstraps_burst(),
@@ -300,6 +310,9 @@ pub struct WebConfig {
     /// Hard process and protocol limits.
     #[serde(default)]
     pub limits: WebLimitsConfig,
+    /// Hot-reloadable bounded server-side debug policy.
+    #[serde(default)]
+    pub debug: WebDebugConfig,
     /// WEB lifecycle deadlines.
     #[serde(default)]
     pub timeouts: WebTimeoutsConfig,
@@ -348,6 +361,8 @@ pub(crate) struct WebRuntimeProfile {
     pub(crate) carrier: WebCarrier,
     /// HMAC-derived bridge capability.
     pub(crate) capability: [u8; 32],
+    /// Non-secret domain-separated client-secret fingerprint for debugging.
+    pub(crate) key_fingerprint: String,
     /// Per-profile live session ceiling.
     pub(crate) max_sessions: usize,
     /// Per-profile live logical-stream ceiling.
@@ -439,6 +454,8 @@ usize_default!(default_web_max_profiles, 32);
 usize_default!(default_web_max_static_files, 4096);
 usize_default!(default_web_max_static_file_bytes, 8 * 1024 * 1024);
 usize_default!(default_web_max_static_bytes, 64 * 1024 * 1024);
+usize_default!(default_web_debug_records_capacity, 65_536);
+usize_default!(default_web_debug_bytes_global, 64 * 1024 * 1024);
 usize_default!(default_web_memory_envelope_bytes, 768 * 1024 * 1024);
 u32_default!(default_web_new_bootstraps_per_minute, 1200);
 u32_default!(default_web_new_bootstraps_burst, 256);

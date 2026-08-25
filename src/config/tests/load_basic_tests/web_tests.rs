@@ -47,6 +47,53 @@ fn web_config_builds_canonical_runtime_snapshot() {
     assert_eq!(vhost.profiles[0].max_sessions, 4);
     assert_eq!(vhost.profiles[0].max_streams, 64);
     assert_eq!(vhost.profiles[0].max_streams_per_session, 16);
+    assert_eq!(vhost.profiles[0].key_fingerprint.len(), 16);
+    assert_ne!(vhost.profiles[0].key_fingerprint, "0001020304050607");
+}
+
+#[test]
+fn web_debug_table_uses_debug_name_and_bounded_defaults() {
+    let configured = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.debug]\nenabled = true\nbody_capture = \"prefix\"\nbody_prefix_bytes = 2048\ndefault_window_secs = 180\nmax_window_secs = 900\n\n[[web.vhosts]]",
+    );
+    let config = load_config_from_temp_toml(&configured);
+    assert!(config.web.debug.enabled);
+    assert_eq!(config.web.debug.body_capture, WebDebugBodyCapture::Prefix);
+    assert_eq!(config.web.debug.body_prefix_bytes, 2048);
+    assert_eq!(config.web.debug.default_window_secs, 180);
+    assert_eq!(config.web.debug.max_window_secs, 900);
+
+    let old_name = format!("[general]\nconfig_strict = true\n{}", WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.trace]\nenabled = true\n\n[[web.vhosts]]",
+    ));
+    let error = load_config_error_from_temp_toml(&old_name);
+    assert!(error.contains("web.trace"));
+}
+
+#[test]
+fn web_debug_prefix_and_window_validation_fail_closed() {
+    let oversized_prefix = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.debug]\nenabled = true\nbody_prefix_bytes = 2097153\n\n[[web.vhosts]]",
+    );
+    let error = load_config_error_from_temp_toml(&oversized_prefix);
+    assert!(error.contains("web.debug.body_prefix_bytes"));
+
+    let reversed_window = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.debug]\nenabled = true\ndefault_window_secs = 181\nmax_window_secs = 180\n\n[[web.vhosts]]",
+    );
+    let error = load_config_error_from_temp_toml(&reversed_window);
+    assert!(error.contains("web.debug windows"));
+
+    let undersized_store = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"https-lanes\"\n\n[web.limits]\ndebug_bytes_global = 4095",
+    );
+    let error = load_config_error_from_temp_toml(&undersized_store);
+    assert!(error.contains("debug_bytes_global must be at least 4096"));
 }
 
 #[test]

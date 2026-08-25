@@ -22,11 +22,21 @@ impl WebSession {
         };
         let generation = manager.active_generation();
         if !*generation.admission_rx.borrow() {
+            self.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::StreamRejected,
+                Some(stream_id),
+                Some("admission_closed"),
+            );
             self.stream_finished(stream_id, peer_port);
             return;
         }
         let Ok(connection_permit) = generation.max_connections.clone().try_acquire_owned() else {
             manager.record_stream_rejected();
+            self.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::StreamRejected,
+                Some(stream_id),
+                Some("connection_limit"),
+            );
             self.stream_finished(stream_id, peer_port);
             return;
         };
@@ -42,11 +52,17 @@ impl WebSession {
                 stream_id,
                 peer_port,
             };
+            session.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::StreamAdmitted,
+                Some(stream_id),
+                None,
+            );
             let stream = WebLogicalStream::new(Arc::clone(&session), stream_id);
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 _ = run_stream(
                     Arc::clone(&session),
+                    stream_id,
                     stream,
                     deps,
                     replay_checker,
@@ -55,6 +71,11 @@ impl WebSession {
             }
         });
         if !spawned {
+            self.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::StreamRejected,
+                Some(stream_id),
+                Some("generation_closed"),
+            );
             self.tasks_live.fetch_sub(1, Ordering::AcqRel);
             self.stream_finished(stream_id, peer_port);
             self.tasks_done.notify_waiters();
@@ -100,6 +121,11 @@ struct StreamCompletion {
 
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
+        self.session.trace_lifecycle(
+            crate::web::trace::TraceLifecycleEvent::StreamClosed,
+            Some(self.stream_id),
+            None,
+        );
         self.session.stream_finished(self.stream_id, self.peer_port);
         if self.session.tasks_live.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.session.tasks_done.notify_waiters();
@@ -109,6 +135,7 @@ impl Drop for StreamCompletion {
 
 async fn run_stream(
     session: Arc<WebSession>,
+    stream_id: u32,
     stream: WebLogicalStream,
     deps: crate::proxy::authenticated::ClientRuntimeDeps,
     replay_checker: Arc<crate::stats::ReplayChecker>,
@@ -129,14 +156,29 @@ async fn run_stream(
     // first byte. Session and stream quotas bound this idle phase without
     // consuming the process-wide active-handshake budget.
     if reader.read_exact(&mut handshake[..1]).await.is_err() {
+        session.trace_lifecycle(
+            crate::web::trace::TraceLifecycleEvent::HandshakeIo,
+            Some(stream_id),
+            Some("first_byte_io"),
+        );
         deps.stats
             .increment_connects_bad_with_class("web_mtproto_handshake_io");
         return;
     }
+    session.trace_lifecycle(
+        crate::web::trace::TraceLifecycleEvent::StreamFirstByte,
+        Some(stream_id),
+        None,
+    );
     let Some(manager) = session.manager.upgrade() else {
         return;
     };
     let Some(handshake_permit) = manager.try_stream_handshake() else {
+        session.trace_lifecycle(
+            crate::web::trace::TraceLifecycleEvent::StreamRejected,
+            Some(stream_id),
+            Some("handshake_limit"),
+        );
         return;
     };
     let handshake_result = tokio::time::timeout(
@@ -163,6 +205,11 @@ async fn run_stream(
     drop(handshake_permit);
     let (reader, writer, success) = match handshake_result {
         Err(_) => {
+            session.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::HandshakeTimeout,
+                Some(stream_id),
+                Some("timeout"),
+            );
             deps.stats
                 .increment_connects_bad_with_class("web_mtproto_handshake_timeout");
             deps.stats.increment_handshake_timeouts();
@@ -170,20 +217,40 @@ async fn run_stream(
             return;
         }
         Ok(Err(_)) => {
+            session.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::HandshakeIo,
+                Some(stream_id),
+                Some("io"),
+            );
             deps.stats
                 .increment_connects_bad_with_class("web_mtproto_handshake_io");
             return;
         }
         Ok(Ok(crate::error::HandshakeResult::Success((reader, writer, success)))) => {
+            session.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::HandshakeSucceeded,
+                Some(stream_id),
+                None,
+            );
             (reader, writer, success)
         }
         Ok(Ok(_)) => {
+            session.trace_lifecycle(
+                crate::web::trace::TraceLifecycleEvent::HandshakeRejected,
+                Some(stream_id),
+                Some("bad_client"),
+            );
             deps.stats
                 .increment_connects_bad_with_class("web_mtproto_bad_client");
             return;
         }
     };
-    let _ = run_authenticated(
+    session.trace_lifecycle(
+        crate::web::trace::TraceLifecycleEvent::RelayStarted,
+        Some(stream_id),
+        None,
+    );
+    let relay_result = run_authenticated(
         reader,
         writer,
         success,
@@ -193,4 +260,9 @@ async fn run_stream(
         ConntrackClosePolicy::Suppress,
     )
     .await;
+    session.trace_lifecycle(
+        crate::web::trace::TraceLifecycleEvent::RelayEnded,
+        Some(stream_id),
+        Some(if relay_result.is_ok() { "completed" } else { "error" }),
+    );
 }

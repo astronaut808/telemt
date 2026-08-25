@@ -24,6 +24,8 @@ mod network;
 mod policies;
 mod server;
 mod web;
+// WEB debug capture policy is reusable by config reload and process storage.
+mod web_debug;
 
 pub use access::{AccessConfig, CidrRateLimitKey, RateLimitBps};
 #[allow(unused_imports)]
@@ -52,6 +54,8 @@ pub use web::{
     WebCarrier, WebConfig, WebDecoyConfig, WebLimitsConfig, WebProfileConfig, WebSecretMode,
     WebTimeoutsConfig, WebVhostConfig,
 };
+pub use web_debug::{WebDebugBodyCapture, WebDebugConfig};
+pub(crate) use web_debug::web_debug_fits_limits;
 pub(crate) use web::{
     WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile, WebRuntimeVhost, WebStaticAsset,
     WebStaticSite,

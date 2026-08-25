@@ -14,6 +14,7 @@ use super::plan::{ListenerBindSpec, listener_bind_plan};
 #[cfg(unix)]
 use super::unix::UnixAcceptHandle;
 use crate::web::manager::WebProcessRuntime;
+use crate::web::trace::WebTraceStore;
 
 /// Process-owned listener inventory and accept-task lifecycle controller.
 pub(crate) struct ListenerManager {
@@ -43,12 +44,14 @@ impl ListenerManager {
     pub(crate) fn start(
         bound: BoundListeners,
         active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
+        trace: Arc<WebTraceStore>,
     ) -> Self {
         let has_web = bound
             .listeners
             .iter()
             .any(|listener| listener.spec.transport == ListenerTransport::Web);
-        let web_runtime = has_web.then(|| WebProcessRuntime::start(active_runtime.clone()));
+        let web_runtime =
+            has_web.then(|| WebProcessRuntime::start_with_trace(active_runtime.clone(), trace));
         let mut slots = BTreeMap::new();
         for listener in bound.listeners {
             let addr = listener.spec.addr;
@@ -307,7 +310,11 @@ mod tests {
             #[cfg(unix)]
             unix_listener: None,
         };
-        let mut manager = ListenerManager::start(bound, active_runtime);
+        let trace = WebTraceStore::new(
+            runtime.config().web.debug.clone(),
+            &runtime.config().web.limits,
+        );
+        let mut manager = ListenerManager::start(bound, active_runtime, trace);
         let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let blocked_addr = blocker.local_addr().unwrap();
         let mut desired = ProxyConfig::default();
@@ -330,7 +337,11 @@ mod tests {
             #[cfg(unix)]
             unix_listener: None,
         };
-        let mut manager = ListenerManager::start(bound, active_runtime);
+        let trace = WebTraceStore::new(
+            runtime.config().web.debug.clone(),
+            &runtime.config().web.limits,
+        );
+        let mut manager = ListenerManager::start(bound, active_runtime, trace);
         let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let new_addr = reservation.local_addr().unwrap();
         drop(reservation);

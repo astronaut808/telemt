@@ -86,6 +86,42 @@ fn bind_stale_mode_is_hot() {
 }
 
 #[test]
+fn web_debug_policy_is_hot_while_debug_capacity_is_process_owned() {
+    let old = sample_config();
+    let mut new = old.clone();
+    new.web.debug.enabled = true;
+    new.web.debug.default_window_secs = 60;
+    new.web.limits.debug_records_capacity += 1;
+
+    let applied = overlay_hot_fields(&old, &new);
+    assert!(applied.web.debug.enabled);
+    assert_eq!(applied.web.debug.default_window_secs, 60);
+    assert_eq!(
+        applied.web.limits.debug_records_capacity,
+        old.web.limits.debug_records_capacity
+    );
+    assert_ne!(
+        HotFields::from_config(&old),
+        HotFields::from_config(&applied)
+    );
+}
+
+#[test]
+fn web_debug_prefix_requiring_deferred_capacity_is_not_hot_applied() {
+    let old = sample_config();
+    let mut new = old.clone();
+    new.web.limits.max_body_bytes = 4 * 1024 * 1024;
+    new.web.debug.body_prefix_bytes = 3 * 1024 * 1024;
+
+    let applied = overlay_hot_fields(&old, &new);
+    assert_eq!(applied.web.limits.max_body_bytes, old.web.limits.max_body_bytes);
+    assert_eq!(
+        applied.web.debug.body_prefix_bytes,
+        old.web.debug.body_prefix_bytes
+    );
+}
+
+#[test]
 fn keepalive_is_not_hot() {
     let old = sample_config();
     let mut new = old.clone();
