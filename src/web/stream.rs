@@ -7,21 +7,21 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::futures::OwnedNotified;
 
-use crate::web::session::WebSession;
+use crate::web::session::{StreamIdentity, WebSession};
 
 /// Async byte stream that maps one WEB stream identifier onto carrier frames.
 pub(crate) struct WebLogicalStream {
     session: Arc<WebSession>,
-    stream_id: u32,
+    stream: StreamIdentity,
     budget_wait: Option<Pin<Box<OwnedNotified>>>,
 }
 
 impl WebLogicalStream {
     /// Binds a virtual byte stream to one live carrier stream identifier.
-    pub(crate) fn new(session: Arc<WebSession>, stream_id: u32) -> Self {
+    pub(crate) fn new(session: Arc<WebSession>, stream: StreamIdentity) -> Self {
         Self {
             session,
-            stream_id,
+            stream,
             budget_wait: None,
         }
     }
@@ -33,7 +33,7 @@ impl AsyncRead for WebLogicalStream {
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.session.poll_read(self.stream_id, cx, output)
+        self.session.poll_read(self.stream, cx, output)
     }
 }
 
@@ -43,7 +43,7 @@ impl AsyncWrite for WebLogicalStream {
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let result = self.session.poll_write(self.stream_id, cx, input);
+        let result = self.session.poll_write(self.stream, cx, input);
         if !result.is_pending() {
             self.budget_wait = None;
             return result;
@@ -64,7 +64,7 @@ impl AsyncWrite for WebLogicalStream {
             }
             self.budget_wait = None;
         }
-        match self.session.poll_write(self.stream_id, cx, input) {
+        match self.session.poll_write(self.stream, cx, input) {
             Poll::Ready(result) => {
                 self.budget_wait = None;
                 Poll::Ready(result)

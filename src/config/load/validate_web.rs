@@ -72,9 +72,9 @@ pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
     validate_limits(&config.web.limits)?;
     debug::validate(&config.web.debug, &config.web.limits)?;
     let carriers = negotiation::validate(&config.web)?;
-    if carriers.contains(&WebCarrier::HttpsLanes) && config.web.limits.max_http_handlers < 2 {
+    if carriers.contains(&WebCarrier::HttpsLanes) && config.web.limits.max_http_handlers < 4 {
         return config_error(
-            "WEB https-lanes candidates require web.limits.max_http_handlers >= 2",
+            "WEB https-lanes candidates require web.limits.max_http_handlers >= 4",
         );
     }
     timeouts::validate(&config.web.timeouts)?;
@@ -163,6 +163,16 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         ("max_http_connections", limits.max_http_connections),
         ("max_http_handlers", limits.max_http_handlers),
         (
+            "max_lane_open_waits_per_session",
+            limits.max_lane_open_waits_per_session,
+        ),
+        ("pending_bytes_per_lane", limits.pending_bytes_per_lane),
+        ("pending_items_per_lane", limits.pending_items_per_lane),
+        (
+            "max_websocket_evictions_in_flight",
+            limits.max_websocket_evictions_in_flight,
+        ),
+        (
             "max_carrier_learning_entries",
             limits.max_carrier_learning_entries,
         ),
@@ -240,6 +250,8 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         || limits.max_body_readers > limits.max_http_handlers
         || limits.pending_bytes_per_session > limits.pending_bytes_global
         || limits.pending_items_per_session > limits.pending_items_global
+        || limits.pending_bytes_per_lane > limits.pending_bytes_per_session
+        || limits.pending_items_per_lane > limits.pending_items_per_session
         || limits.control_bytes_per_session > limits.control_bytes_global
         || limits.control_bytes_per_session > limits.pending_bytes_per_session
         || limits.control_bytes_global > limits.pending_bytes_global

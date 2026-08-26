@@ -53,8 +53,8 @@ pub use server::{
 };
 #[allow(unused_imports)]
 pub use web::{
-    WebConfig, WebDecoyConfig, WebLimitsConfig, WebProfileConfig, WebSecretMode, WebTimeoutsConfig,
-    WebVhostConfig,
+    WebCarrierNegotiationAggressiveness, WebConfig, WebDecoyConfig, WebLimitsConfig,
+    WebProfileConfig, WebSecretMode, WebTimeoutsConfig, WebVhostConfig,
 };
 #[allow(unused_imports)]
 pub use web_carrier::{WebCarrier, WebCarriers};

@@ -46,7 +46,14 @@ struct InboundChunk {
     offset: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamIdentity {
+    pub(crate) id: u32,
+    pub(crate) instance: u64,
+}
+
 struct StreamState {
+    instance: u64,
     inbound: VecDeque<InboundChunk>,
     receive_window: u32,
     send_credit: u64,
@@ -73,6 +80,7 @@ struct DownBatch {
 }
 
 struct CarrierLane {
+    instance: u64,
     pending_frames: VecDeque<QueuedFrame>,
     pending_windows: HashMap<u32, usize>,
     unacked: Option<DownBatch>,
@@ -85,8 +93,9 @@ struct CarrierLane {
 }
 
 impl CarrierLane {
-    fn new() -> Self {
+    fn new(instance: u64) -> Self {
         Self {
+            instance,
             pending_frames: VecDeque::new(),
             pending_windows: HashMap::new(),
             unacked: None,
@@ -102,6 +111,8 @@ impl CarrierLane {
 
 struct SessionState {
     streams: HashMap<u32, StreamState>,
+    closing_streams: HashMap<u32, u64>,
+    next_stream_instance: u64,
     active_peer_ports: HashSet<u16>,
     closed_streams: HashSet<u32>,
     closed_order: VecDeque<u32>,
@@ -113,6 +124,7 @@ struct SessionState {
     last_up_sequence: u64,
     last_up_digest: TokenHash,
     carrier_lanes: HashMap<u32, CarrierLane>,
+    next_lane_instance: u64,
     websocket_lane_reservations: HashMap<u32, u16>,
     pending_bytes: usize,
     pending_items: usize,
@@ -183,8 +195,10 @@ impl WebSession {
         timeouts: WebTimeoutsConfig,
     ) -> Arc<Self> {
         let mut carrier_lanes = HashMap::new();
+        let mut next_lane_instance = 1;
         if selected_carrier == WebCarrier::HttpsLanes {
-            carrier_lanes.insert(0, CarrierLane::new());
+            carrier_lanes.insert(0, CarrierLane::new(next_lane_instance));
+            next_lane_instance += 1;
         }
         Arc::new(Self {
             manager,
@@ -201,6 +215,8 @@ impl WebSession {
             timeouts,
             state: Mutex::new(SessionState {
                 streams: HashMap::new(),
+                closing_streams: HashMap::new(),
+                next_stream_instance: 1,
                 active_peer_ports: HashSet::new(),
                 closed_streams: HashSet::new(),
                 closed_order: VecDeque::new(),
@@ -212,6 +228,7 @@ impl WebSession {
                 last_up_sequence: 0,
                 last_up_digest: [0; 32],
                 carrier_lanes,
+                next_lane_instance,
                 websocket_lane_reservations: HashMap::new(),
                 pending_bytes: 0,
                 pending_items: 0,
@@ -329,17 +346,21 @@ impl WebSession {
     /// Polls client-to-server bytes and returns consumed flow-control credit.
     pub(super) fn poll_read(
         &self,
-        stream_id: u32,
+        stream: StreamIdentity,
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut state = self.state.lock();
         let (count, finished) = {
-            let Some(stream) = state.streams.get_mut(&stream_id) else {
+            let Some(stream_state) = state
+                .streams
+                .get_mut(&stream.id)
+                .filter(|state| state.instance == stream.instance)
+            else {
                 return Poll::Ready(Ok(()));
             };
-            let Some(chunk) = stream.inbound.front_mut() else {
-                stream.read_waker = Some(cx.waker().clone());
+            let Some(chunk) = stream_state.inbound.front_mut() else {
+                stream_state.read_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             };
             let available = &chunk.bytes[chunk.offset..];
@@ -348,14 +369,14 @@ impl WebSession {
             chunk.offset += count;
             let finished = chunk.offset == chunk.bytes.len();
             if finished {
-                stream.inbound.pop_front();
+                stream_state.inbound.pop_front();
             }
-            stream.receive_window = stream.receive_window.saturating_add(count as u32);
+            stream_state.receive_window = stream_state.receive_window.saturating_add(count as u32);
             (count, finished)
         };
         let overhead = if finished { QUEUE_ITEM_COST } else { 0 };
         self.release_locked(&mut state, count + overhead, usize::from(finished), false);
-        if !self.queue_window_locked(&mut state, stream_id, count as u32) {
+        if !self.queue_window_locked(&mut state, stream.id, count as u32) {
             drop(state);
             self.close();
             return Poll::Ready(Err(io::Error::other(
@@ -368,7 +389,7 @@ impl WebSession {
     /// Polls server-to-client writes against stream credit and bounded queues.
     pub(super) fn poll_write(
         &self,
-        stream_id: u32,
+        stream: StreamIdentity,
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -376,7 +397,11 @@ impl WebSession {
             return Poll::Ready(Ok(0));
         }
         let mut state = self.state.lock();
-        let Some(stream) = state.streams.get_mut(&stream_id) else {
+        let Some(stream_state) = state
+            .streams
+            .get_mut(&stream.id)
+            .filter(|state| state.instance == stream.instance)
+        else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WEB logical stream is closed",
@@ -386,24 +411,32 @@ impl WebSession {
             .len()
             .min(frame::DATA_CHUNK_BYTES)
             .min(self.limits.max_frame_payload_bytes)
-            .min(stream.send_credit as usize);
+            .min(stream_state.send_credit as usize);
         if count == 0 {
-            stream.write_waker = Some(cx.waker().clone());
+            stream_state.write_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        if !self.queue_data_locked(&mut state, stream_id, &input[..count]) {
-            if let Some(stream) = state.streams.get_mut(&stream_id) {
-                stream.write_waker = Some(cx.waker().clone());
+        if !self.queue_data_locked(&mut state, stream.id, &input[..count]) {
+            if let Some(stream_state) = state
+                .streams
+                .get_mut(&stream.id)
+                .filter(|state| state.instance == stream.instance)
+            {
+                stream_state.write_waker = Some(cx.waker().clone());
             }
             return Poll::Pending;
         }
-        let Some(stream) = state.streams.get_mut(&stream_id) else {
+        let Some(stream_state) = state
+            .streams
+            .get_mut(&stream.id)
+            .filter(|state| state.instance == stream.instance)
+        else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WEB logical stream is closed",
             )));
         };
-        stream.send_credit -= count as u64;
+        stream_state.send_credit -= count as u64;
         state.last_activity = Instant::now();
         drop(state);
         if self.carrier().is_multiplexed() {

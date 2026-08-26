@@ -7,7 +7,7 @@ use crate::proxy::shared_state::ConntrackClosePolicy;
 use crate::web::frame::FrameType;
 use crate::web::stream::WebLogicalStream;
 
-use super::{WebSession, inbound_queue_cost};
+use super::{StreamIdentity, WebSession, inbound_queue_cost};
 
 #[cfg(test)]
 #[path = "backend_tests.rs"]
@@ -17,61 +17,64 @@ impl WebSession {
     /// Starts one owned inner handshake and relay task for an admitted stream.
     pub(super) fn spawn_stream(
         self: &Arc<Self>,
-        stream_id: u32,
-        peer_port: u16,
+        completion: StreamCompletion,
         retain_reservation_on_reject: bool,
     ) -> bool {
+        let stream = completion.stream;
+        let peer_port = completion.peer_port;
         let Some(manager) = self.manager.upgrade() else {
-            self.stream_rejected_before_spawn(stream_id, peer_port, retain_reservation_on_reject);
+            completion
+                .retain_rejected
+                .store(retain_reservation_on_reject, Ordering::Release);
+            drop(completion);
             return false;
         };
         let generation = manager.active_generation();
         if !*generation.admission_rx.borrow() {
             self.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamRejected,
-                Some(stream_id),
+                Some(stream.id),
                 Some("admission_closed"),
             );
-            self.stream_rejected_before_spawn(stream_id, peer_port, retain_reservation_on_reject);
+            completion
+                .retain_rejected
+                .store(retain_reservation_on_reject, Ordering::Release);
+            drop(completion);
             return false;
         }
         let Ok(connection_permit) = generation.max_connections.clone().try_acquire_owned() else {
             manager.record_stream_rejected();
             self.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamRejected,
-                Some(stream_id),
+                Some(stream.id),
                 Some("connection_limit"),
             );
-            self.stream_rejected_before_spawn(stream_id, peer_port, retain_reservation_on_reject);
+            completion
+                .retain_rejected
+                .store(retain_reservation_on_reject, Ordering::Release);
+            drop(completion);
             return false;
         };
         let deps = generation.client_runtime_deps();
         let replay_checker = Arc::clone(&generation.replay_checker);
         let session = Arc::clone(self);
         let cancel = self.cancel.clone();
-        let retain_rejected = Arc::new(AtomicBool::new(false));
-        self.tasks_live.fetch_add(1, Ordering::AcqRel);
-        let completion = StreamCompletion {
-            session: Arc::clone(&session),
-            stream_id,
-            peer_port,
-            retain_rejected: Arc::clone(&retain_rejected),
-        };
+        let retain_rejected = Arc::clone(&completion.retain_rejected);
         let future = async move {
             let _connection_permit = connection_permit;
             let _completion = completion;
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamAdmitted,
-                Some(stream_id),
+                Some(stream.id),
                 None,
             );
-            let stream = WebLogicalStream::new(Arc::clone(&session), stream_id);
+            let logical_stream = WebLogicalStream::new(Arc::clone(&session), stream);
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 _ = run_stream(
                     Arc::clone(&session),
-                    stream_id,
                     stream,
+                    logical_stream,
                     deps,
                     replay_checker,
                     peer_port,
@@ -82,7 +85,7 @@ impl WebSession {
             retain_rejected.store(retain_reservation_on_reject, Ordering::Release);
             self.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamRejected,
-                Some(stream_id),
+                Some(stream.id),
                 Some("generation_closed"),
             );
             drop(future);
@@ -93,21 +96,28 @@ impl WebSession {
 
     fn stream_rejected_before_spawn(
         &self,
-        stream_id: u32,
+        stream: StreamIdentity,
         peer_port: u16,
         retain_reservation: bool,
     ) {
         if !retain_reservation {
-            self.stream_finished(stream_id, peer_port);
+            self.stream_finished(stream, peer_port);
             return;
         }
         let queued = {
             let mut state = self.state.lock();
-            state.streams.remove(&stream_id).map(|stream| {
-                let (bytes, items) = inbound_queue_cost(&stream.inbound);
+            state
+                .streams
+                .get(&stream.id)
+                .filter(|state| state.instance == stream.instance)
+                .is_some()
+                .then(|| state.streams.remove(&stream.id))
+                .flatten()
+                .map(|stream_state| {
+                let (bytes, items) = inbound_queue_cost(&stream_state.inbound);
                 self.release_locked(&mut state, bytes, items, false);
-                self.remember_closed_locked(&mut state, stream_id);
-                self.queue_control_locked(&mut state, FrameType::Close, stream_id, &[])
+                self.remember_closed_locked(&mut state, stream.id);
+                self.queue_control_locked(&mut state, FrameType::Close, stream.id, &[])
             })
         };
         if queued.is_some_and(|queued| !queued) {
@@ -115,16 +125,24 @@ impl WebSession {
         }
     }
 
-    fn stream_finished(&self, stream_id: u32, peer_port: u16) {
+    fn stream_finished(&self, stream: StreamIdentity, peer_port: u16) {
         let (queued, reserved) = {
             let mut state = self.state.lock();
             let reserved = state.active_peer_ports.remove(&peer_port);
-            let queued = state.streams.remove(&stream_id).map(|stream| {
-                let (bytes, items) = inbound_queue_cost(&stream.inbound);
+            let current = state
+                .streams
+                .get(&stream.id)
+                .is_some_and(|state| state.instance == stream.instance);
+            let queued = current.then(|| state.streams.remove(&stream.id)).flatten().map(|stream_state| {
+                let (bytes, items) = inbound_queue_cost(&stream_state.inbound);
                 self.release_locked(&mut state, bytes, items, false);
-                self.remember_closed_locked(&mut state, stream_id);
-                self.queue_control_locked(&mut state, FrameType::Close, stream_id, &[])
+                self.remember_closed_locked(&mut state, stream.id);
+                self.queue_control_locked(&mut state, FrameType::Close, stream.id, &[])
             });
+            if state.closing_streams.get(&stream.id) == Some(&stream.instance) {
+                state.closing_streams.remove(&stream.id);
+                self.remember_closed_locked(&mut state, stream.id);
+            }
             (queued, reserved)
         };
         if reserved && let Some(manager) = self.manager.upgrade() {
@@ -146,25 +164,41 @@ impl WebSession {
     }
 }
 
-struct StreamCompletion {
+pub(super) struct StreamCompletion {
     session: Arc<WebSession>,
-    stream_id: u32,
-    peer_port: u16,
+    pub(super) stream: StreamIdentity,
+    pub(super) peer_port: u16,
     retain_rejected: Arc<AtomicBool>,
+}
+
+impl WebSession {
+    pub(super) fn own_stream_task(
+        self: &Arc<Self>,
+        stream: StreamIdentity,
+        peer_port: u16,
+    ) -> StreamCompletion {
+        self.tasks_live.fetch_add(1, Ordering::AcqRel);
+        StreamCompletion {
+            session: Arc::clone(self),
+            stream,
+            peer_port,
+            retain_rejected: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
         self.session.trace_lifecycle(
             crate::web::trace::TraceLifecycleEvent::StreamClosed,
-            Some(self.stream_id),
+            Some(self.stream.id),
             None,
         );
         if self.retain_rejected.load(Ordering::Acquire) {
             self.session
-                .stream_rejected_before_spawn(self.stream_id, self.peer_port, true);
+                .stream_rejected_before_spawn(self.stream, self.peer_port, true);
         } else {
-            self.session.stream_finished(self.stream_id, self.peer_port);
+            self.session.stream_finished(self.stream, self.peer_port);
         }
         if self.session.tasks_live.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.session.tasks_done.notify_waiters();
@@ -174,7 +208,7 @@ impl Drop for StreamCompletion {
 
 async fn run_stream(
     session: Arc<WebSession>,
-    stream_id: u32,
+    stream_identity: StreamIdentity,
     stream: WebLogicalStream,
     deps: crate::proxy::authenticated::ClientRuntimeDeps,
     replay_checker: Arc<crate::stats::ReplayChecker>,
@@ -191,13 +225,27 @@ async fn run_stream(
     let peer = std::net::SocketAddr::new(session.client_ip, peer_port);
     deps.stats.increment_connects_all();
 
-    // A carrier may publish OPEN before the local MTProto socket writes its
-    // first byte. Session and stream quotas bound this idle phase without
-    // consuming the process-wide active-handshake budget.
-    if reader.read_exact(&mut handshake[..1]).await.is_err() {
+    // Silent OPEN ownership has a separate absolute deadline so it cannot
+    // consume stream and tuple quotas indefinitely before handshake admission.
+    let first_byte = tokio::time::timeout(
+        Duration::from_secs(session.timeouts.stream_first_byte_secs),
+        reader.read_exact(&mut handshake[..1]),
+    )
+    .await;
+    if first_byte.is_err() {
+        session.trace_lifecycle(
+            crate::web::trace::TraceLifecycleEvent::HandshakeTimeout,
+            Some(stream_identity.id),
+            Some("first_byte_timeout"),
+        );
+        deps.stats
+            .increment_connects_bad_with_class("web_mtproto_first_byte_timeout");
+        return;
+    }
+    if first_byte.is_ok_and(|result| result.is_err()) {
         session.trace_lifecycle(
             crate::web::trace::TraceLifecycleEvent::HandshakeIo,
-            Some(stream_id),
+            Some(stream_identity.id),
             Some("first_byte_io"),
         );
         deps.stats
@@ -206,7 +254,7 @@ async fn run_stream(
     }
     session.trace_lifecycle(
         crate::web::trace::TraceLifecycleEvent::StreamFirstByte,
-        Some(stream_id),
+        Some(stream_identity.id),
         None,
     );
     let Some(manager) = session.manager.upgrade() else {
@@ -215,7 +263,7 @@ async fn run_stream(
     let Some(handshake_permit) = manager.try_stream_handshake() else {
         session.trace_lifecycle(
             crate::web::trace::TraceLifecycleEvent::StreamRejected,
-            Some(stream_id),
+            Some(stream_identity.id),
             Some("handshake_limit"),
         );
         return;
@@ -246,7 +294,7 @@ async fn run_stream(
         Err(_) => {
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::HandshakeTimeout,
-                Some(stream_id),
+                Some(stream_identity.id),
                 Some("timeout"),
             );
             deps.stats
@@ -258,7 +306,7 @@ async fn run_stream(
         Ok(Err(_)) => {
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::HandshakeIo,
-                Some(stream_id),
+                Some(stream_identity.id),
                 Some("io"),
             );
             deps.stats
@@ -268,7 +316,7 @@ async fn run_stream(
         Ok(Ok(crate::error::HandshakeResult::Success((reader, writer, success)))) => {
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::HandshakeSucceeded,
-                Some(stream_id),
+                Some(stream_identity.id),
                 None,
             );
             (reader, writer, success)
@@ -276,7 +324,7 @@ async fn run_stream(
         Ok(Ok(_)) => {
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::HandshakeRejected,
-                Some(stream_id),
+                Some(stream_identity.id),
                 Some("bad_client"),
             );
             deps.stats
@@ -286,7 +334,7 @@ async fn run_stream(
     };
     session.trace_lifecycle(
         crate::web::trace::TraceLifecycleEvent::RelayStarted,
-        Some(stream_id),
+        Some(stream_identity.id),
         None,
     );
     let relay_result = run_authenticated(
@@ -301,7 +349,7 @@ async fn run_stream(
     .await;
     session.trace_lifecycle(
         crate::web::trace::TraceLifecycleEvent::RelayEnded,
-        Some(stream_id),
+        Some(stream_identity.id),
         Some(if relay_result.is_ok() {
             "completed"
         } else {

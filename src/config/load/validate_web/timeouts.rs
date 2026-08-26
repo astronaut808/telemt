@@ -6,7 +6,12 @@ pub(super) fn validate(timeouts: &WebTimeoutsConfig) -> Result<()> {
         ("header_secs", timeouts.header_secs),
         ("body_secs", timeouts.body_secs),
         ("stream_handshake_secs", timeouts.stream_handshake_secs),
+        ("stream_first_byte_secs", timeouts.stream_first_byte_secs),
         ("long_poll_secs", timeouts.long_poll_secs),
+        ("lane_open_wait_secs", timeouts.lane_open_wait_secs),
+        ("carrier_health_secs", timeouts.carrier_health_secs),
+        ("websocket_upgrade_secs", timeouts.websocket_upgrade_secs),
+        ("websocket_open_secs", timeouts.websocket_open_secs),
         ("websocket_write_secs", timeouts.websocket_write_secs),
         (
             "websocket_backpressure_secs",

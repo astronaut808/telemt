@@ -98,6 +98,15 @@ pub struct WebLimitsConfig {
     /// Process-wide concurrently executing HTTP handler ceiling.
     #[serde(default = "default_web_max_http_handlers")]
     pub max_http_handlers: usize,
+    /// Per-session ceiling for downlink polls waiting for a lane OPEN.
+    #[serde(default = "default_web_max_lane_open_waits_per_session")]
+    pub max_lane_open_waits_per_session: usize,
+    /// Queued and in-flight downlink bytes allowed for one independent lane.
+    #[serde(default = "default_web_pending_bytes_per_lane")]
+    pub pending_bytes_per_lane: usize,
+    /// Queued and in-flight downlink items allowed for one independent lane.
+    #[serde(default = "default_web_pending_items_per_lane")]
+    pub pending_items_per_lane: usize,
     /// Process-wide transient WebSocket byte sub-budget inside pending bytes.
     #[serde(default = "default_web_websocket_bytes_global")]
     pub websocket_bytes_global: usize,
@@ -110,6 +119,9 @@ pub struct WebLimitsConfig {
     /// Accepted HTTP connections that WebSocket upgrades must leave available.
     #[serde(default = "default_web_websocket_http_connection_reserve")]
     pub websocket_http_connection_reserve: usize,
+    /// Concurrent pressure-eviction claims allowed process-wide.
+    #[serde(default = "default_web_max_websocket_evictions_in_flight")]
+    pub max_websocket_evictions_in_flight: usize,
     /// Process-wide bounded carrier-learning evidence entry ceiling.
     #[serde(default = "default_web_max_carrier_learning_entries")]
     pub max_carrier_learning_entries: usize,
@@ -215,10 +227,15 @@ impl Default for WebLimitsConfig {
             max_frames_per_body: default_web_max_frames_per_body(),
             max_http_connections: default_web_max_http_connections(),
             max_http_handlers: default_web_max_http_handlers(),
+            max_lane_open_waits_per_session: default_web_max_lane_open_waits_per_session(),
+            pending_bytes_per_lane: default_web_pending_bytes_per_lane(),
+            pending_items_per_lane: default_web_pending_items_per_lane(),
             websocket_bytes_global: default_web_websocket_bytes_global(),
             websocket_admission_watermark_pct: default_web_websocket_admission_watermark_pct(),
             websocket_eviction_watermark_pct: default_web_websocket_eviction_watermark_pct(),
             websocket_http_connection_reserve: default_web_websocket_http_connection_reserve(),
+            max_websocket_evictions_in_flight:
+                default_web_max_websocket_evictions_in_flight(),
             max_carrier_learning_entries: default_web_max_carrier_learning_entries(),
             max_body_readers: default_web_max_body_readers(),
             max_body_bytes_global: default_web_max_body_bytes_global(),
@@ -266,9 +283,24 @@ pub struct WebTimeoutsConfig {
     /// Deadline from the first inner byte through MTProxy authentication.
     #[serde(default = "default_web_stream_handshake_timeout_secs")]
     pub stream_handshake_secs: u64,
+    /// Absolute deadline for receiving the first inner MTProxy byte.
+    #[serde(default = "default_web_stream_first_byte_secs")]
+    pub stream_first_byte_secs: u64,
     /// Maximum wait for one empty downlink long poll.
     #[serde(default = "default_web_long_poll_timeout_secs")]
     pub long_poll_secs: u64,
+    /// Grace for a canonical downlink poll that races its lane OPEN.
+    #[serde(default = "default_web_lane_open_wait_secs")]
+    pub lane_open_wait_secs: u64,
+    /// Post-commit observation interval required before learning succeeds.
+    #[serde(default = "default_web_carrier_health_secs")]
+    pub carrier_health_secs: u64,
+    /// Maximum wait for Hyper to transfer an accepted WebSocket upgrade.
+    #[serde(default = "default_web_websocket_upgrade_secs")]
+    pub websocket_upgrade_secs: u64,
+    /// Absolute deadline for the first carrier binary message after upgrade.
+    #[serde(default = "default_web_websocket_open_secs")]
+    pub websocket_open_secs: u64,
     /// Maximum wait for one WebSocket write to complete.
     #[serde(default = "default_web_websocket_write_secs")]
     pub websocket_write_secs: u64,
@@ -307,7 +339,12 @@ impl Default for WebTimeoutsConfig {
             header_secs: default_web_header_timeout_secs(),
             body_secs: default_web_body_timeout_secs(),
             stream_handshake_secs: default_web_stream_handshake_timeout_secs(),
+            stream_first_byte_secs: default_web_stream_first_byte_secs(),
             long_poll_secs: default_web_long_poll_timeout_secs(),
+            lane_open_wait_secs: default_web_lane_open_wait_secs(),
+            carrier_health_secs: default_web_carrier_health_secs(),
+            websocket_upgrade_secs: default_web_websocket_upgrade_secs(),
+            websocket_open_secs: default_web_websocket_open_secs(),
             websocket_write_secs: default_web_websocket_write_secs(),
             websocket_backpressure_secs: default_web_websocket_backpressure_secs(),
             websocket_eviction_secs: default_web_websocket_eviction_secs(),
@@ -321,6 +358,19 @@ impl Default for WebTimeoutsConfig {
             decoy_header_secs: default_web_decoy_header_timeout_secs(),
         }
     }
+}
+
+/// Sensitivity of process-local carrier-learning evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebCarrierNegotiationAggressiveness {
+    /// Require broad evidence and never rank by client IP.
+    #[default]
+    Conservative,
+    /// Use moderate User-Agent, client-IP, and profile thresholds.
+    Balanced,
+    /// React to the first bounded evidence sample.
+    Aggressive,
 }
 
 /// WEB ingress, carrier, fallback, and lifecycle configuration.
@@ -338,6 +388,9 @@ pub struct WebConfig {
     /// Enables bounded process-local carrier learning for automatic sessions.
     #[serde(default = "default_web_carrier_learning")]
     pub carrier_learning: bool,
+    /// Controls the evidence thresholds used by automatic carrier ranking.
+    #[serde(default)]
+    pub carrier_negotiation_aggressiveness: WebCarrierNegotiationAggressiveness,
     /// Hard process and protocol limits.
     #[serde(default)]
     pub limits: WebLimitsConfig,
@@ -381,6 +434,8 @@ impl Default for WebConfig {
             carrier: WebCarrier::default(),
             carriers: WebCarriers::default(),
             carrier_learning: default_web_carrier_learning(),
+            carrier_negotiation_aggressiveness:
+                WebCarrierNegotiationAggressiveness::default(),
             limits: WebLimitsConfig::default(),
             debug: WebDebugConfig::default(),
             timeouts: WebTimeoutsConfig::default(),
