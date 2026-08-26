@@ -22,6 +22,8 @@ mod legacy_tests;
 #[path = "negotiation_tests.rs"]
 mod negotiation_tests;
 
+const TEST_CARRIER_DEADLINES_SECS: [u64; 4] = [3, 5, 8, 12];
+
 pub(super) fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
     runtime_config_with_carriers(capability, carrier, false, true, Arc::from([carrier]))
 }
@@ -42,6 +44,41 @@ fn runtime_config_with_carriers(
     carrier_learning: bool,
     carriers: Arc<[WebCarrier]>,
 ) -> ProxyConfig {
+    runtime_config_with_carriers_and_deadlines(
+        capability,
+        carrier,
+        carrier_negotiation_enabled,
+        carrier_learning,
+        carriers,
+        TEST_CARRIER_DEADLINES_SECS,
+    )
+}
+
+pub(super) fn negotiation_runtime_config_with_deadlines(
+    capability: [u8; 32],
+    carrier: WebCarrier,
+    carrier_learning: bool,
+    carriers: Arc<[WebCarrier]>,
+    carrier_negotiation_deadlines_secs: [u64; 4],
+) -> ProxyConfig {
+    runtime_config_with_carriers_and_deadlines(
+        capability,
+        carrier,
+        true,
+        carrier_learning,
+        carriers,
+        carrier_negotiation_deadlines_secs,
+    )
+}
+
+fn runtime_config_with_carriers_and_deadlines(
+    capability: [u8; 32],
+    carrier: WebCarrier,
+    carrier_negotiation_enabled: bool,
+    carrier_learning: bool,
+    carriers: Arc<[WebCarrier]>,
+    carrier_negotiation_deadlines_secs: [u64; 4],
+) -> ProxyConfig {
     let profile = Arc::new(WebRuntimeProfile {
         host: "proxy.example.com".to_string(),
         public_addr: "203.0.113.10:443".parse().unwrap(),
@@ -51,7 +88,7 @@ fn runtime_config_with_carriers(
         carrier_negotiation_enabled,
         carrier_learning,
         carriers: Arc::clone(&carriers),
-        carrier_negotiation_deadlines_secs: [3, 5, 8, 12],
+        carrier_negotiation_deadlines_secs,
         capability,
         key_fingerprint: "0000000000000000".to_string(),
         max_sessions: 4,
@@ -97,6 +134,8 @@ fn runtime_config_with_carriers(
         WebCarriers::Disabled
     };
     config.web.carrier_learning = carrier_learning;
+    config.web.timeouts.carrier_negotiation_deadlines_secs =
+        carrier_negotiation_deadlines_secs;
     config.web.limits.max_bootstraps_per_ip = 1;
     config.web.timeouts.shutdown_secs = 1;
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {

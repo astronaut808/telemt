@@ -5,6 +5,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 const CAPABILITIES: &str = "https,https-lanes,websocket,websocket-lanes";
+const NATIVE_USER_AGENT_HEADER: &str =
+    "User-Agent: Telegram/3951 CFNetwork/3896.100.1.2.1 Darwin/27.0.0\r\n";
 
 fn issue_bootstrap(runtime: &Arc<WebProcessRuntime>, client_ip: &str) -> String {
     let profile = runtime
@@ -28,6 +30,16 @@ fn create_request(
     attempt: Option<u8>,
     failure: Option<&str>,
 ) -> Vec<u8> {
+    create_request_with_headers(bootstrap, hello, attempt, failure, "")
+}
+
+fn create_request_with_headers(
+    bootstrap: &str,
+    hello: &[u8],
+    attempt: Option<u8>,
+    failure: Option<&str>,
+    extra_headers: &str,
+) -> Vec<u8> {
     let negotiation = attempt.map_or_else(String::new, |attempt| {
         let failure = failure
             .map(|failure| format!("X-Carrier-Failure: {failure}\r\n"))
@@ -37,7 +49,7 @@ fn create_request(
         )
     });
     let mut request = format!(
-        "POST /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {bootstrap}\r\nContent-Type: application/octet-stream\r\n{negotiation}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {bootstrap}\r\nContent-Type: application/octet-stream\r\n{negotiation}{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         hello.len()
     )
     .into_bytes();
@@ -58,6 +70,17 @@ fn token_hash(token: &str) -> crate::web::manager::TokenHash {
         .decode(token)
         .unwrap();
     Sha256::digest(raw).into()
+}
+
+fn assert_no_negotiation_headers(headers: &[u8]) {
+    for header in [
+        "x-carrier-attempt",
+        "x-carrier-candidate-count",
+        "x-carrier-deadline",
+        "x-carrier-state",
+    ] {
+        assert!(optional_response_header(headers, header).is_none());
+    }
 }
 
 #[tokio::test]
@@ -88,6 +111,121 @@ async fn absent_carriers_reject_negotiation_and_preserve_legacy_creation() {
     assert!(legacy_headers.starts_with(b"HTTP/1.1 200"));
     assert_eq!(response_header(legacy_headers, "x-carrier-mode"), "https");
     assert!(optional_response_header(legacy_headers, "x-carrier-attempt").is_none());
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn metadata_free_native_client_can_use_each_fixed_carrier() {
+    for (index, carrier) in WebCarrier::ALL.into_iter().enumerate() {
+        let capability = [50 + index as u8; 32];
+        let generation = test_runtime_generation(1, runtime_config(capability, carrier));
+        let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+        let hello = frame::encode(FrameType::Hello, 0, &[1]);
+
+        let response = request(
+            &listener,
+            &runtime,
+            create_request_with_headers(
+                &bootstrap,
+                &hello,
+                None,
+                None,
+                NATIVE_USER_AGENT_HEADER,
+            ),
+        )
+        .await;
+        let (headers, _) = split_response(&response);
+        assert!(headers.starts_with(b"HTTP/1.1 200"));
+        assert_eq!(response_header(headers, "x-carrier-mode"), carrier.as_str());
+        assert_no_negotiation_headers(headers);
+
+        runtime.shutdown().await;
+        generation.stop_sessions().await;
+        generation.stop_background_tasks().await;
+    }
+}
+
+#[tokio::test]
+async fn metadata_free_native_client_uses_fallback_when_candidates_are_enabled() {
+    let capability = [55; 32];
+    let generation = test_runtime_generation(
+        1,
+        negotiation_runtime_config(
+            capability,
+            WebCarrier::HttpsLanes,
+            false,
+            Arc::from([WebCarrier::Websocket, WebCarrier::HttpsLanes]),
+        ),
+    );
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+
+    let response = request(
+        &listener,
+        &runtime,
+        create_request_with_headers(
+            &bootstrap,
+            &hello,
+            None,
+            None,
+            NATIVE_USER_AGENT_HEADER,
+        ),
+    )
+    .await;
+    let (headers, _) = split_response(&response);
+    assert!(headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(response_header(headers, "x-carrier-mode"), "https-lanes");
+    assert_no_negotiation_headers(headers);
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn explicit_native_capabilities_participate_in_automatic_selection() {
+    let capability = [56; 32];
+    let generation = test_runtime_generation(
+        1,
+        negotiation_runtime_config(
+            capability,
+            WebCarrier::Https,
+            false,
+            Arc::from([WebCarrier::WebsocketLanes, WebCarrier::Https]),
+        ),
+    );
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+
+    let response = request(
+        &listener,
+        &runtime,
+        create_request_with_headers(
+            &bootstrap,
+            &hello,
+            Some(1),
+            None,
+            NATIVE_USER_AGENT_HEADER,
+        ),
+    )
+    .await;
+    let (headers, _) = split_response(&response);
+    assert!(headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        response_header(headers, "x-carrier-mode"),
+        "websocket-lanes"
+    );
+    assert_eq!(response_header(headers, "x-carrier-attempt"), "1");
+    assert_eq!(response_header(headers, "x-carrier-candidate-count"), "2");
 
     runtime.shutdown().await;
     generation.stop_sessions().await;
@@ -218,6 +356,65 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
             .get_session(token_hash(&second_token), "proxy.example.com")
             .unwrap()
             .is_carrier_committed()
+    );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn timed_out_attempt_replays_before_successor_own_deadline() {
+    let capability = [57; 32];
+    let generation = test_runtime_generation(
+        1,
+        negotiation_runtime_config_with_deadlines(
+            capability,
+            WebCarrier::HttpsLanes,
+            false,
+            Arc::from([WebCarrier::Https, WebCarrier::HttpsLanes]),
+            [1, 5, 8, 12],
+        ),
+    );
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+    let first_request = create_request(&bootstrap, &hello, Some(1), None);
+
+    let first = request(&listener, &runtime, first_request.clone()).await;
+    let (first_headers, _) = split_response(&first);
+    assert!(first_headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(response_header(first_headers, "x-carrier-mode"), "https");
+    let first_token = response_header(first_headers, "x-session-token").to_string();
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    let replay = request(&listener, &runtime, first_request).await;
+    let (replay_headers, _) = split_response(&replay);
+    assert!(replay_headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        response_header(replay_headers, "x-session-token"),
+        first_token
+    );
+    assert_eq!(response_header(replay_headers, "x-carrier-state"), "provisional");
+
+    let second = request(
+        &listener,
+        &runtime,
+        create_request(&bootstrap, &hello, Some(2), Some("timeout")),
+    )
+    .await;
+    let (second_headers, _) = split_response(&second);
+    assert!(second_headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        response_header(second_headers, "x-carrier-mode"),
+        "https-lanes"
+    );
+    assert_eq!(response_header(second_headers, "x-carrier-attempt"), "2");
+    assert_ne!(
+        response_header(second_headers, "x-session-token"),
+        first_token
     );
 
     runtime.shutdown().await;

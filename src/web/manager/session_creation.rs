@@ -11,6 +11,7 @@ use super::state::{
     CarrierChainPhase, decrement_map, matching_profile, new_unique_token, profile_key,
     remember_closed_token_locked, remove_expired_locked,
 };
+use super::negotiation::carrier_attempt_deadline_index;
 use super::session_admission::admit_initial;
 use super::{
     CarrierLearningContext, CarrierRequest, CreateResult, ManagerError, TokenHash, WebProcessRuntime,
@@ -154,7 +155,10 @@ impl WebProcessRuntime {
             else {
                 return Err(ManagerError::Protocol);
             };
-            let deadline_index = usize::from(next_attempt.saturating_sub(2));
+            let candidate_count = u8::try_from(entry.carrier_candidates.len())
+                .map_err(|_| ManagerError::Protocol)?;
+            let deadline_index = carrier_attempt_deadline_index(candidate_count, next_attempt)
+                .ok_or(ManagerError::Protocol)?;
             if entry.carrier_started_at.is_some_and(|started| {
                 now.saturating_duration_since(started)
                     >= Duration::from_secs(

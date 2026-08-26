@@ -151,11 +151,7 @@ pub(super) fn carrier_request<B>(request: &Request<B>, host: &str) -> Option<Car
                 } else {
                     CarrierClientClass::Bridge
                 },
-                if native_ios {
-                    CarrierCapabilities::ios()
-                } else {
-                    capabilities
-                },
+                capabilities,
                 attempt,
                 failure,
                 user_agent_hash,
@@ -171,11 +167,7 @@ pub(super) fn carrier_request<B>(request: &Request<B>, host: &str) -> Option<Car
                 } else {
                     CarrierClientClass::BrowserHint
                 },
-                if native_ios {
-                    CarrierCapabilities::ios()
-                } else {
-                    CarrierCapabilities::all()
-                },
+                CarrierCapabilities::all(),
                 attempt,
                 failure,
                 user_agent_hash,
@@ -473,11 +465,23 @@ mod tests {
     }
 
     #[test]
-    fn native_ios_capability_claims_cannot_enable_parallel_carriers() {
-        let request = Request::builder()
+    fn native_ios_user_agent_classifies_without_overriding_capabilities() {
+        let metadata_free = Request::builder()
+            .header(
+                header::USER_AGENT,
+                "Telemt/1 CFNetwork/1498.700.2 Darwin/23.6.0",
+            )
+            .body(())
+            .unwrap();
+        let parsed = carrier_request(&metadata_free, "proxy.example.com").unwrap();
+        assert_eq!(parsed.class(), CarrierClientClass::Ios);
+        assert!(!parsed.is_automatic());
+        assert!(!parsed.uses_capabilities());
+
+        let automatic = Request::builder()
             .header(
                 "x-carrier-capabilities",
-                "https,https-lanes,websocket,websocket-lanes",
+                "https,https-lanes",
             )
             .header("x-carrier-attempt", "1")
             .header(
@@ -486,10 +490,11 @@ mod tests {
             )
             .body(())
             .unwrap();
-        let parsed = carrier_request(&request, "proxy.example.com").unwrap();
+        let parsed = carrier_request(&automatic, "proxy.example.com").unwrap();
         assert_eq!(parsed.class(), CarrierClientClass::Ios);
+        assert!(parsed.is_automatic());
         assert!(parsed.supports(WebCarrier::Https));
-        assert!(!parsed.supports(WebCarrier::HttpsLanes));
+        assert!(parsed.supports(WebCarrier::HttpsLanes));
         assert!(!parsed.supports(WebCarrier::Websocket));
         assert!(!parsed.supports(WebCarrier::WebsocketLanes));
     }

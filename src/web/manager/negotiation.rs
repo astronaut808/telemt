@@ -11,7 +11,7 @@ pub(crate) enum CarrierClientClass {
     Bridge,
     /// Strict same-origin browser metadata survived while the marker did not.
     BrowserHint,
-    /// A native iOS client that supports only the serialized HTTPS carrier.
+    /// A native iOS client classified for diagnostics and learning only.
     Ios,
 }
 
@@ -67,7 +67,7 @@ impl CarrierFailure {
     }
 }
 
-/// Fixed carrier capability set sent by the generated bridge.
+/// Validated carrier capability set sent by a negotiation-capable client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CarrierCapabilities(u8);
 
@@ -75,11 +75,6 @@ impl CarrierCapabilities {
     /// Returns a set containing every carrier implemented by the generated bridge.
     pub(crate) const fn all() -> Self {
         Self(0b1111)
-    }
-
-    /// Returns the only carrier implemented by the native iOS client.
-    pub(crate) const fn ios() -> Self {
-        Self(0b0001)
     }
 
     /// Builds a set from a validated bit representation.
@@ -105,7 +100,6 @@ pub(crate) struct CarrierRequest {
     attempt: Option<u8>,
     failure: Option<CarrierFailure>,
     user_agent_hash: [u8; 32],
-    initial_only: bool,
 }
 
 impl CarrierRequest {
@@ -117,19 +111,17 @@ impl CarrierRequest {
             attempt: None,
             failure: None,
             user_agent_hash,
-            initial_only: false,
         }
     }
 
-    /// Constructs a known fixed-capability client without retry negotiation.
+    /// Constructs a metadata-free native client without inferring capabilities.
     pub(crate) const fn ios(user_agent_hash: [u8; 32]) -> Self {
         Self {
             class: CarrierClientClass::Ios,
-            capabilities: Some(CarrierCapabilities::ios()),
+            capabilities: None,
             attempt: None,
             failure: None,
             user_agent_hash,
-            initial_only: true,
         }
     }
 
@@ -147,13 +139,12 @@ impl CarrierRequest {
             attempt: Some(attempt),
             failure,
             user_agent_hash,
-            initial_only: false,
         }
     }
 
     /// Returns whether this request participates in server-side negotiation.
     pub(crate) const fn is_automatic(self) -> bool {
-        self.capabilities.is_some() && !self.initial_only
+        self.capabilities.is_some()
     }
 
     /// Returns whether server capability filtering applies to this request.
@@ -194,7 +185,6 @@ impl CarrierRequest {
         self.class == other.class
             && self.capabilities_bits() == other.capabilities_bits()
             && self.user_agent_hash == other.user_agent_hash
-            && self.initial_only == other.initial_only
     }
 
     /// Checks the complete idempotent identity of one exact attempt request.
@@ -206,6 +196,21 @@ impl CarrierRequest {
 
     fn capabilities_bits(self) -> Option<u8> {
         self.capabilities.map(|capabilities| capabilities.0)
+    }
+}
+
+/// Returns the cumulative deadline slot assigned to one carrier attempt.
+pub(super) const fn carrier_attempt_deadline_index(
+    candidate_count: u8,
+    attempt: u8,
+) -> Option<usize> {
+    if candidate_count == 0 || candidate_count > 4 || attempt == 0 || attempt > candidate_count {
+        return None;
+    }
+    if attempt == candidate_count {
+        Some(3)
+    } else {
+        Some((attempt - 1) as usize)
     }
 }
 
@@ -224,4 +229,30 @@ pub(crate) struct CarrierLearningContext {
     pub(crate) epoch: u64,
     /// Whether the authoritative client address is safe to use as learning evidence.
     pub(crate) ip_learning_eligible: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::carrier_attempt_deadline_index;
+
+    #[test]
+    fn final_candidate_uses_the_final_cumulative_deadline_slot() {
+        assert_eq!(carrier_attempt_deadline_index(1, 1), Some(3));
+        assert_eq!(carrier_attempt_deadline_index(2, 1), Some(0));
+        assert_eq!(carrier_attempt_deadline_index(2, 2), Some(3));
+        assert_eq!(carrier_attempt_deadline_index(3, 1), Some(0));
+        assert_eq!(carrier_attempt_deadline_index(3, 2), Some(1));
+        assert_eq!(carrier_attempt_deadline_index(3, 3), Some(3));
+        assert_eq!(carrier_attempt_deadline_index(4, 1), Some(0));
+        assert_eq!(carrier_attempt_deadline_index(4, 2), Some(1));
+        assert_eq!(carrier_attempt_deadline_index(4, 3), Some(2));
+        assert_eq!(carrier_attempt_deadline_index(4, 4), Some(3));
+    }
+
+    #[test]
+    fn invalid_candidate_or_attempt_counts_have_no_deadline_slot() {
+        for (candidate_count, attempt) in [(0, 1), (5, 1), (1, 0), (1, 2), (3, 4)] {
+            assert_eq!(carrier_attempt_deadline_index(candidate_count, attempt), None);
+        }
+    }
 }
