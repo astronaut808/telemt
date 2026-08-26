@@ -13,7 +13,7 @@ struct ReleasedQueues {
 impl WebSession {
     /// Closes carrier state while relay tasks retain their admission until exit.
     pub(crate) fn close(&self) {
-        let Some(released) = self.begin_close(false) else {
+        let Some(released) = self.begin_close(false, None) else {
             return;
         };
         self.finish_close(released, false);
@@ -51,11 +51,13 @@ impl WebSession {
     }
 
     /// Completes manager-owned replacement without unregistering the old session twice.
-    pub(crate) fn finish_carrier_supersede(&self) {
-        let Some(released) = self.begin_close(true) else {
-            return;
+    pub(crate) fn finish_carrier_supersede(&self) -> bool {
+        let close_requested = self.state.lock().close_requested;
+        let Some(released) = self.begin_close(true, None) else {
+            return close_requested;
         };
         self.finish_close(released, true);
+        close_requested
     }
 
     /// Waits for all logical-stream tasks after admission has closed.
@@ -69,18 +71,25 @@ impl WebSession {
         }
     }
 
-    /// Returns whether reconnect grace elapsed without activity.
-    pub(crate) fn is_idle(&self, now: Instant) -> bool {
-        let state = self.state.lock();
-        !state.closed
-            && state.negotiation_phase != SessionNegotiationPhase::Replacing
-            && now.saturating_duration_since(state.last_activity)
-                >= Duration::from_secs(self.timeouts.reconnect_grace_secs)
+    /// Atomically closes a session only when reconnect grace is still due.
+    pub(crate) fn close_if_due(&self, now: Instant) -> bool {
+        let Some(released) = self.begin_close(false, Some(now)) else {
+            return false;
+        };
+        self.finish_close(released, false);
+        true
     }
 
-    fn begin_close(&self, superseded: bool) -> Option<ReleasedQueues> {
+    fn begin_close(&self, superseded: bool, idle_now: Option<Instant>) -> Option<ReleasedQueues> {
         let mut state = self.state.lock();
         if state.closed || (superseded && state.negotiation_phase != SessionNegotiationPhase::Replacing) {
+            return None;
+        }
+        if let Some(now) = idle_now
+            && (state.negotiation_phase == SessionNegotiationPhase::Replacing
+                || now.saturating_duration_since(state.last_activity)
+                    < Duration::from_secs(self.timeouts.reconnect_grace_secs))
+        {
             return None;
         }
         if !superseded && state.negotiation_phase == SessionNegotiationPhase::Replacing {

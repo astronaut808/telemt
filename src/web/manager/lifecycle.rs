@@ -119,8 +119,8 @@ impl WebProcessRuntime {
             remove_expired_locked(&mut state, now);
             state.sessions.values().cloned().collect::<Vec<_>>()
         };
-        for session in sessions.into_iter().filter(|session| session.is_idle(now)) {
-            session.close();
+        for session in sessions {
+            session.close_if_due(now);
         }
     }
 }

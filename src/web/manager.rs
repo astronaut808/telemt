@@ -107,6 +107,7 @@ pub(crate) struct WebProcessRuntime {
     http_connections: Arc<Semaphore>,
     http_handlers: Arc<Semaphore>,
     lane_polls: Arc<Semaphore>,
+    lane_aux_polls: Arc<Semaphore>,
     body_readers: Arc<Semaphore>,
     body_bytes: Arc<Semaphore>,
     stream_handshakes: Arc<Semaphore>,
@@ -146,12 +147,17 @@ impl WebProcessRuntime {
         let websocket_connections = limits
             .max_http_connections
             .saturating_sub(limits.websocket_http_connection_reserve);
+        let lane_poll_limit = limits.max_http_handlers / 2;
+        let lane_aux_poll_limit = (lane_poll_limit / 2).max(1);
         let runtime = Arc::new(Self {
             active_runtime,
             trace,
             http_connections: Arc::new(Semaphore::new(limits.max_http_connections)),
             http_handlers: Arc::new(Semaphore::new(limits.max_http_handlers)),
-            lane_polls: Arc::new(Semaphore::new((limits.max_http_handlers / 2).max(1))),
+            lane_polls: Arc::new(Semaphore::new(
+                lane_poll_limit.saturating_sub(lane_aux_poll_limit),
+            )),
+            lane_aux_polls: Arc::new(Semaphore::new(lane_aux_poll_limit)),
             body_readers: Arc::new(Semaphore::new(limits.max_body_readers)),
             body_bytes: Arc::new(Semaphore::new(limits.max_body_bytes_global)),
             stream_handshakes: Arc::new(Semaphore::new(limits.max_stream_handshakes)),
@@ -225,8 +231,13 @@ impl WebProcessRuntime {
     }
 
     /// Reserves one parked lane poll without exhausting all HTTP handlers.
-    pub(crate) fn try_lane_poll(&self) -> Option<OwnedSemaphorePermit> {
-        let permit = Arc::clone(&self.lane_polls).try_acquire_owned().ok();
+    pub(crate) fn try_lane_poll(&self, auxiliary: bool) -> Option<OwnedSemaphorePermit> {
+        let slots = if auxiliary {
+            &self.lane_aux_polls
+        } else {
+            &self.lane_polls
+        };
+        let permit = Arc::clone(slots).try_acquire_owned().ok();
         if permit.is_none() {
             self.record_limit_hit();
         }

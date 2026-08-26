@@ -57,7 +57,8 @@ pub(super) async fn handle_down(
         return serve_decoy(request, vhost, true, &runtime).await;
     }
     let _lane_poll = if lane_id.is_some() {
-        let Some(permit) = runtime.try_lane_poll() else {
+        let auxiliary = lane_id.is_some_and(|lane_id| session.lane_poll_is_auxiliary(lane_id));
+        let Some(permit) = runtime.try_lane_poll(auxiliary) else {
             return service_unavailable();
         };
         Some(permit)

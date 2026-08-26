@@ -354,7 +354,9 @@ impl WebProcessRuntime {
         let identity = session.trace_identity();
         let old_identity = replacement.old_session.trace_identity();
         drop(state);
-        replacement.old_session.finish_carrier_supersede();
+        if replacement.old_session.finish_carrier_supersede() {
+            session.close();
+        }
         if let Some(context) = learning_context {
             self.record_carrier_outcome(context, replacement.old_session.carrier(), false);
         }
