@@ -50,7 +50,7 @@ use decoy::serve_decoy;
 use down::handle_down;
 use request::{
     bearer_token_hash, binary_content_type, bridge_candidate, canonical_request_host,
-    canonical_u64_header, client_ip, compatible_cookie_header, match_profile,
+    canonical_u64_header, carrier_request, client_ip, compatible_cookie_header, match_profile,
 };
 use response::{
     bad_gateway, carrier_empty, carrier_headers, carrier_lane, full_response, generic_not_found,
@@ -224,7 +224,6 @@ async fn handle_root(
         trace.set_route(TraceRoute::Bridge);
         trace.set_effective_ip(client_ip);
     }
-    let carrier = profile.carrier;
     let bootstrap = match runtime.issue_bootstrap(Arc::clone(&profile), client_ip) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
@@ -234,7 +233,7 @@ async fn handle_root(
                 &profile,
                 TraceLifecycleEvent::BootstrapRejected,
                 None,
-                Some(manager_error_reason(error)),
+                Some(error.as_str()),
             );
             strip_query(&mut request);
             return serve_decoy(request, vhost, true, &runtime).await;
@@ -251,7 +250,9 @@ async fn handle_root(
         generation.config().web.limits.carrier_batch_bytes,
         generation.config().web.limits.pending_bytes_per_session,
         generation.config().web.limits.pending_items_per_session,
-        carrier,
+        profile.carrier_negotiation_enabled,
+        profile.carriers.len(),
+        profile.carrier_negotiation_deadlines_secs,
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));
@@ -354,6 +355,9 @@ async fn handle_session(
     if request.method() != Method::POST || !binary_content_type(&request) {
         return serve_decoy(request, vhost, true, &runtime).await;
     }
+    let Some(carrier_request) = carrier_request(&request, &vhost.host) else {
+        return serve_decoy(request, vhost, true, &runtime).await;
+    };
     let Some((trace_session_id, profile)) =
         runtime.bootstrap_trace_identity(token_hash, &vhost.host)
     else {
@@ -381,7 +385,13 @@ async fn handle_session(
             &runtime.active_generation().config().web.limits,
         );
     }
-    match runtime.create_session(token_hash, &vhost.host, client_ip, &body) {
+    match runtime.create_session(
+        token_hash,
+        &vhost.host,
+        client_ip,
+        &body,
+        carrier_request,
+    ) {
         Ok(result) => {
             let welcome = frame::encode(FrameType::Welcome, 0, &[]);
             if let Some(trace) = request_trace(&request) {
@@ -407,6 +417,13 @@ async fn handle_session(
                 HeaderName::from_static("x-down-cursor"),
                 HeaderValue::from_static("0"),
             );
+            if let Some(attempt) = result.attempt {
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-attempt"),
+                    &attempt.to_string(),
+                );
+            }
             response
         }
         Err(
@@ -418,7 +435,7 @@ async fn handle_session(
                 &profile,
                 TraceLifecycleEvent::SessionRejected,
                 None,
-                Some(manager_error_reason(error)),
+                Some(error.as_str()),
             );
             service_unavailable()
         }
@@ -429,7 +446,7 @@ async fn handle_session(
                 &profile,
                 TraceLifecycleEvent::SessionRejected,
                 None,
-                Some(manager_error_reason(error)),
+                Some(error.as_str()),
             );
             serve_decoy(request, vhost, true, &runtime).await
         }
@@ -522,16 +539,5 @@ fn request_trace<B>(request: &Request<B>) -> Option<&Arc<HttpTraceExchange>> {
 fn set_trace_route<B>(request: &Request<B>, route: TraceRoute) {
     if let Some(trace) = request_trace(request) {
         trace.set_route(route);
-    }
-}
-
-fn manager_error_reason(error: ManagerError) -> &'static str {
-    match error {
-        ManagerError::Authentication => "authentication",
-        ManagerError::Backpressure => "backpressure",
-        ManagerError::Limit => "limit",
-        ManagerError::Protocol => "protocol",
-        ManagerError::Concurrent => "concurrent",
-        ManagerError::Closed => "closed",
     }
 }

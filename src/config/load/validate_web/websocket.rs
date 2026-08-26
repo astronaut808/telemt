@@ -7,7 +7,7 @@ const WEBSOCKET_FRAME_OVERHEAD_BYTES: usize = 14;
 
 /// Validates WebSocket admission, memory, and deadline invariants.
 pub(super) fn validate(
-    carrier: WebCarrier,
+    carriers: &[WebCarrier],
     limits: &WebLimitsConfig,
     timeouts: &WebTimeoutsConfig,
 ) -> Result<()> {
@@ -27,7 +27,7 @@ pub(super) fn validate(
             "web.timeouts.websocket_eviction_secs must not exceed websocket_write_secs",
         );
     }
-    if !carrier.uses_websocket() {
+    if !carriers.iter().any(|carrier| carrier.uses_websocket()) {
         return Ok(());
     }
     if limits.carrier_batch_bytes > MAX_WEBSOCKET_BATCH_BYTES {

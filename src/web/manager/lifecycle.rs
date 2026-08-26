@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-use super::state::{ClosedToken, decrement_map, remove_bootstrap_locked, remove_expired_locked};
+use super::state::{
+    decrement_map, remember_closed_token_locked, remove_bootstrap_locked, remove_expired_locked,
+};
 use super::{ProfileKey, TokenHash, WebProcessRuntime};
 
 impl WebProcessRuntime {
@@ -22,33 +24,20 @@ impl WebProcessRuntime {
         }
         decrement_map(&mut state.sessions_per_ip, &client_ip);
         decrement_map(&mut state.sessions_per_profile, &profile_key);
-        let expiry = Instant::now()
-            + Duration::from_secs(
+        remember_closed_token_locked(
+            &mut state,
+            hash,
+            profile_host,
+            Duration::from_secs(
                 self.active_runtime
                     .load()
                     .config()
                     .web
                     .timeouts
                     .bootstrap_lifetime_secs,
-            );
-        state.closed_tokens.insert(
-            hash,
-            ClosedToken {
-                expires_at: expiry,
-                host: profile_host.to_string(),
-            },
+            ),
+            self.limits.max_sessions_global.saturating_mul(16),
         );
-        while state.closed_tokens.len() > self.limits.max_sessions_global.saturating_mul(16) {
-            let Some(oldest) = state
-                .closed_tokens
-                .iter()
-                .min_by_key(|(_, closed)| closed.expires_at)
-                .map(|(hash, _)| *hash)
-            else {
-                break;
-            };
-            state.closed_tokens.remove(&oldest);
-        }
         let bootstrap_hashes = state
             .bootstraps
             .iter()
@@ -124,6 +113,7 @@ impl WebProcessRuntime {
     pub(super) fn cleanup(&self) {
         self.cleanup_websockets();
         let now = Instant::now();
+        self.learning.lock().prune(now);
         let sessions = {
             let mut state = self.state.lock();
             remove_expired_locked(&mut state, now);

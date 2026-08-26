@@ -9,7 +9,11 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::config::{WebClientIpSource, WebRuntimeProfile, WebRuntimeVhost};
-use crate::web::manager::TokenHash;
+use crate::web::manager::{
+    CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierRequest, TokenHash,
+};
+
+const USER_AGENT_CONTEXT: &[u8] = b"telemt-web-carrier-user-agent-v1\0";
 
 /// Parses one lowercase canonical Host value restricted to the public HTTPS port.
 pub(super) fn canonical_request_host<B>(request: &Request<B>) -> Option<&str> {
@@ -167,6 +171,124 @@ pub(super) fn canonical_u64_header<B>(request: &Request<B>, name: &'static str) 
     (parsed.to_string() == value).then_some(parsed)
 }
 
+/// Parses strict bridge negotiation metadata without trusting it for authentication.
+pub(super) fn carrier_request<B>(request: &Request<B>, host: &str) -> Option<CarrierRequest> {
+    let user_agent_hash = normalized_user_agent_hash(request)?;
+    let capabilities = single_header(request, "x-carrier-capabilities");
+    let attempt = optional_canonical_u8_header(request, "x-carrier-attempt")?;
+    let failure = optional_failure_header(request)?;
+    match (capabilities, attempt) {
+        (None, None) if failure.is_none() => Some(CarrierRequest::legacy(user_agent_hash)),
+        (Some(capabilities), Some(attempt)) => {
+            let capabilities = parse_capabilities(capabilities)?;
+            if (attempt == 1) != failure.is_none() {
+                return None;
+            }
+            Some(CarrierRequest::automatic(
+                CarrierClientClass::Bridge,
+                capabilities,
+                attempt,
+                failure,
+                user_agent_hash,
+            ))
+        }
+        (None, Some(attempt)) if strict_browser_hint(request, host) => {
+            if (attempt == 1) != failure.is_none() {
+                return None;
+            }
+            Some(CarrierRequest::automatic(
+                CarrierClientClass::BrowserHint,
+                CarrierCapabilities::all(),
+                attempt,
+                failure,
+                user_agent_hash,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn parse_capabilities(value: &str) -> Option<CarrierCapabilities> {
+    let mut bits = 0u8;
+    let mut previous = None;
+    for token in value.split(',') {
+        let index = match token {
+            "https" => 0,
+            "https-lanes" => 1,
+            "websocket" => 2,
+            "websocket-lanes" => 3,
+            _ => return None,
+        };
+        if previous.is_some_and(|previous| index <= previous) {
+            return None;
+        }
+        previous = Some(index);
+        bits |= 1 << index;
+    }
+    CarrierCapabilities::from_bits(bits)
+}
+
+fn strict_browser_hint<B>(request: &Request<B>, host: &str) -> bool {
+    single_header(request, header::ORIGIN)
+        .is_some_and(|value| value == format!("https://{host}"))
+        && single_header(request, "sec-fetch-site") == Some("same-origin")
+        && single_header(request, "sec-fetch-mode") == Some("cors")
+        && single_header(request, "sec-fetch-dest") == Some("empty")
+}
+
+fn optional_canonical_u8_header<B>(
+    request: &Request<B>,
+    name: &'static str,
+) -> Option<Option<u8>> {
+    if !request.headers().contains_key(name) {
+        return Some(None);
+    }
+    canonical_u64_header(request, name)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (1..=4).contains(value))
+        .map(Some)
+}
+
+fn optional_failure_header<B>(request: &Request<B>) -> Option<Option<CarrierFailure>> {
+    if !request.headers().contains_key("x-carrier-failure") {
+        return Some(None);
+    }
+    single_header(request, "x-carrier-failure")
+        .and_then(CarrierFailure::parse)
+        .map(Some)
+}
+
+fn normalized_user_agent_hash<B>(request: &Request<B>) -> Option<[u8; 32]> {
+    let user_agent = match single_header(request, header::USER_AGENT) {
+        Some(value) => value.as_bytes(),
+        None if !request.headers().contains_key(header::USER_AGENT) => &[],
+        None => return None,
+    };
+    let mut digest = Sha256::new();
+    digest.update(USER_AGENT_CONTEXT);
+    let mut emitted = false;
+    let mut pending_whitespace = false;
+    for &byte in user_agent {
+        if byte.is_ascii_whitespace() {
+            pending_whitespace = emitted;
+        } else {
+            if pending_whitespace {
+                digest.update([b' ']);
+            }
+            digest.update([byte.to_ascii_lowercase()]);
+            emitted = true;
+            pending_whitespace = false;
+        }
+    }
+    Some(digest.finalize().into())
+}
+
+fn single_header<B>(request: &Request<B>, name: impl header::AsHeaderName) -> Option<&str> {
+    let mut values = request.headers().get_all(name).iter();
+    let value = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +440,78 @@ mod tests {
             .headers_mut()
             .append(header::COOKIE, "state=unexpected".parse().unwrap());
         assert!(!compatible_cookie_header(&duplicate_mixed));
+    }
+
+    #[test]
+    fn carrier_metadata_is_canonical_and_legacy_safe() {
+        let automatic = Request::builder()
+            .header(
+                "x-carrier-capabilities",
+                "https,https-lanes,websocket,websocket-lanes",
+            )
+            .header("x-carrier-attempt", "2")
+            .header("x-carrier-failure", "timeout")
+            .header(header::USER_AGENT, "Example  Browser")
+            .body(())
+            .unwrap();
+        let parsed = carrier_request(&automatic, "proxy.example.com").unwrap();
+        assert!(parsed.is_automatic());
+        assert_eq!(parsed.attempt(), Some(2));
+        assert_eq!(parsed.failure(), Some(CarrierFailure::Timeout));
+
+        let missing_failure = Request::builder()
+            .header(
+                "x-carrier-capabilities",
+                "https,https-lanes,websocket,websocket-lanes",
+            )
+            .header("x-carrier-attempt", "2")
+            .body(())
+            .unwrap();
+        assert!(carrier_request(&missing_failure, "proxy.example.com").is_none());
+
+        let legacy = Request::builder()
+            .header(header::USER_AGENT, "Native")
+            .body(())
+            .unwrap();
+        assert!(!carrier_request(&legacy, "proxy.example.com")
+            .unwrap()
+            .is_automatic());
+
+        let reordered = Request::builder()
+            .header("x-carrier-capabilities", "websocket,https")
+            .header("x-carrier-attempt", "1")
+            .body(())
+            .unwrap();
+        assert!(carrier_request(&reordered, "proxy.example.com").is_none());
+    }
+
+    #[test]
+    fn strict_browser_metadata_recovers_a_stripped_capability_marker() {
+        let request = Request::builder()
+            .header("x-carrier-attempt", "1")
+            .header(header::ORIGIN, "https://proxy.example.com")
+            .header("sec-fetch-site", "same-origin")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-dest", "empty")
+            .body(())
+            .unwrap();
+        let parsed = carrier_request(&request, "proxy.example.com").unwrap();
+        assert_eq!(parsed.class(), CarrierClientClass::BrowserHint);
+    }
+
+    #[test]
+    fn user_agent_learning_key_is_case_and_whitespace_normalized() {
+        let first = Request::builder()
+            .header(header::USER_AGENT, "  Example\t Browser  ")
+            .body(())
+            .unwrap();
+        let second = Request::builder()
+            .header(header::USER_AGENT, "example browser")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            normalized_user_agent_hash(&first),
+            normalized_user_agent_hash(&second)
+        );
     }
 }

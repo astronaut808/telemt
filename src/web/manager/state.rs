@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{ProfileKey, TOKEN_BYTES, TokenHash};
-use crate::config::{WebRuntimeConfig, WebRuntimeProfile};
+use super::{CarrierRequest, ProfileKey, TOKEN_BYTES, TokenHash};
+use crate::config::{WebCarrier, WebRuntimeConfig, WebRuntimeProfile};
 use crate::maestro::generation::RuntimeGeneration;
 use crate::web::session::WebSession;
 
@@ -32,6 +32,20 @@ pub(super) struct Bootstrap {
     pub(super) session_token: Zeroizing<String>,
     /// Created session retained while retry replay remains valid.
     pub(super) session: Option<Arc<WebSession>>,
+    /// Metadata that defines exact attempt replay and candidate advancement.
+    pub(super) carrier_request: Option<CarrierRequest>,
+    /// Learning-ranked carrier order frozen by the first automatic attempt.
+    pub(super) carrier_candidates: Arc<[WebCarrier]>,
+    /// Weighted learning scores captured when the candidate order was frozen.
+    pub(super) carrier_scores: [i16; 4],
+    /// Current one-based carrier attempt, or zero before session creation.
+    pub(super) carrier_attempt: u8,
+    /// Prevents concurrent retries from replacing the same attempt twice.
+    pub(super) carrier_transitioning: bool,
+    /// Records the first accepted OPEN or DATA transition exactly once.
+    pub(super) carrier_committed: bool,
+    /// Effective address frozen by the first session-creation request.
+    pub(super) session_client_ip: Option<IpAddr>,
     /// Distinguishes unused issuance quota from completed creation replay state.
     pub(super) used: bool,
 }
@@ -135,6 +149,11 @@ pub(super) fn matching_profile(
                 && profile.user == expected.user
                 && profile.secret_mode == expected.secret_mode
                 && profile.carrier == expected.carrier
+                && profile.carrier_negotiation_enabled == expected.carrier_negotiation_enabled
+                && profile.carrier_learning == expected.carrier_learning
+                && profile.carriers == expected.carriers
+                && profile.carrier_negotiation_deadlines_secs
+                    == expected.carrier_negotiation_deadlines_secs
                 && profile.capability == expected.capability
                 && profile.key_fingerprint == expected.key_fingerprint
         })
@@ -195,6 +214,34 @@ pub(super) fn remove_bootstrap_locked(state: &mut ManagerState, hash: TokenHash)
     };
     if !bootstrap.used {
         decrement_map(&mut state.bootstraps_per_ip, &bootstrap.issuance_ip);
+    }
+}
+
+/// Retains one bounded host-bound marker for an invalidated session credential.
+pub(super) fn remember_closed_token_locked(
+    state: &mut ManagerState,
+    hash: TokenHash,
+    host: &str,
+    lifetime: Duration,
+    capacity: usize,
+) {
+    state.closed_tokens.insert(
+        hash,
+        ClosedToken {
+            expires_at: Instant::now() + lifetime,
+            host: host.to_string(),
+        },
+    );
+    while state.closed_tokens.len() > capacity {
+        let Some(oldest) = state
+            .closed_tokens
+            .iter()
+            .min_by_key(|(_, closed)| closed.expires_at)
+            .map(|(hash, _)| *hash)
+        else {
+            break;
+        };
+        state.closed_tokens.remove(&oldest);
     }
 }
 

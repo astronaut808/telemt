@@ -48,12 +48,17 @@ impl WebSession {
             return Err(ManagerError::Protocol);
         }
         let digest: TokenHash = Sha256::digest(body).into();
+        let progress = frames
+            .iter()
+            .any(|frame| matches!(frame.frame_type, FrameType::Open | FrameType::Data));
         let mut opened = Vec::new();
+        let mut committed = false;
         let result = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(ManagerError::Closed);
             }
+            self.ensure_carrier_active_locked(&state)?;
             state.last_activity = Instant::now();
             if sequence == state.last_up_sequence && sequence != 0 {
                 return if bool::from(state.last_up_digest.ct_eq(&digest)) {
@@ -99,6 +104,7 @@ impl WebSession {
             } else {
                 state.last_up_sequence = sequence;
                 state.last_up_digest = digest;
+                committed = self.commit_carrier_locked(&mut state, progress);
                 Ok(sequence)
             }
         };
@@ -111,6 +117,9 @@ impl WebSession {
                 self.release_stream_reservation(peer_port);
             }
             return result;
+        }
+        if committed {
+            self.finish_carrier_commit();
         }
         for (stream_id, peer_port) in opened {
             self.spawn_stream(stream_id, peer_port, false);
@@ -362,6 +371,10 @@ mod tests {
             user: "alice".to_string(),
             secret_mode: WebSecretMode::Plain,
             carrier: WebCarrier::Https,
+            carrier_negotiation_enabled: false,
+            carrier_learning: true,
+            carriers: Arc::from([WebCarrier::Https]),
+            carrier_negotiation_deadlines_secs: [3, 5, 8, 12],
             capability: [0; 32],
             key_fingerprint: "0000000000000000".to_string(),
             max_sessions: 1,
@@ -375,6 +388,10 @@ mod tests {
             1,
             profile,
             [2; 32],
+            WebCarrier::Https,
+            1,
+            [3; 32],
+            None,
             WebLimitsConfig::default(),
             WebTimeoutsConfig::default(),
         )

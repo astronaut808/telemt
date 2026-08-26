@@ -24,6 +24,8 @@ mod network;
 mod policies;
 mod server;
 mod web;
+// WEB carrier tokens and fixed-slot policy helpers remain independent from bulky config types.
+mod web_carrier;
 // WEB debug capture policy is reusable by config reload and process storage.
 mod web_debug;
 
@@ -51,9 +53,11 @@ pub use server::{
 };
 #[allow(unused_imports)]
 pub use web::{
-    WebCarrier, WebConfig, WebDecoyConfig, WebLimitsConfig, WebProfileConfig, WebSecretMode,
-    WebTimeoutsConfig, WebVhostConfig,
+    WebConfig, WebDecoyConfig, WebLimitsConfig, WebProfileConfig, WebSecretMode, WebTimeoutsConfig,
+    WebVhostConfig,
 };
+#[allow(unused_imports)]
+pub use web_carrier::{WebCarrier, WebCarriers};
 pub(crate) use web::{
     WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile, WebRuntimeVhost, WebStaticAsset,
     WebStaticSite,

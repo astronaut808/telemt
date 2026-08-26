@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
 use hyper_util::rt::TokioIo;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
@@ -10,13 +9,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::ConnectionIo;
 use crate::web::manager::{
-    ManagerError, WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection,
+    WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection,
 };
 use crate::web::session::{WebSession, WebSocketLaneReservation};
 use crate::web::trace::{TraceDirection, TraceWebSocketContext};
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+// Cancellation-safe message I/O and budget retries remain separate from carrier loops.
+mod io;
+use io::{flush, process_lane, process_multiplex, read_message, record_message, reserve_data, send};
 
 pub(super) async fn run_upgraded(
     on_upgrade: hyper::upgrade::OnUpgrade,
@@ -25,6 +28,7 @@ pub(super) async fn run_upgraded(
     connection: WebSocketConnection,
     mut lane_reservation: Option<WebSocketLaneReservation>,
     trace: Option<TraceWebSocketContext>,
+    acknowledge_commit: bool,
 ) {
     let Ok(upgraded) = on_upgrade.await else {
         return;
@@ -57,6 +61,7 @@ pub(super) async fn run_upgraded(
             reservation,
             cancellation.clone(),
             trace.as_ref(),
+            acknowledge_commit,
         )
         .await;
     } else {
@@ -67,6 +72,7 @@ pub(super) async fn run_upgraded(
             &connection,
             cancellation.clone(),
             trace.as_ref(),
+            acknowledge_commit,
         )
         .await;
     }
@@ -82,7 +88,7 @@ pub(super) async fn run_upgraded(
     if let Some(reservation) = lane_reservation {
         session.close_websocket_lane(reservation.lane_id());
         drop(reservation);
-    } else {
+    } else if !acknowledge_commit || session.is_carrier_committed() {
         session.close();
     }
 }
@@ -96,6 +102,7 @@ async fn run_multiplex(
     connection: &WebSocketConnection,
     cancellation: CancellationToken,
     trace: Option<&TraceWebSocketContext>,
+    acknowledge_commit: bool,
 ) -> Result<(), ()> {
     let mut sequence = 1u64;
     let mut cursor = 0u64;
@@ -136,6 +143,18 @@ async fn run_multiplex(
                         started,
                     );
                     result?;
+                    if acknowledge_commit && sequence == 1 && session.is_carrier_committed() {
+                        let started = Instant::now();
+                        send(socket, runtime, Message::Binary(Bytes::new())).await?;
+                        record_message(
+                            runtime,
+                            trace,
+                            TraceDirection::Response,
+                            "carrier-ack",
+                            &[],
+                            started,
+                        );
+                    }
                     sequence = sequence.checked_add(1).ok_or(())?;
                     connection.mark_peer_activity();
                     next_ping = Instant::now() + liveness_interval;
@@ -255,6 +274,7 @@ async fn run_multiplex(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_lane(
     socket: &mut CarrierSocket,
     runtime: &Arc<WebProcessRuntime>,
@@ -263,6 +283,7 @@ async fn run_lane(
     reservation: &mut WebSocketLaneReservation,
     cancellation: CancellationToken,
     trace: Option<&TraceWebSocketContext>,
+    acknowledge_commit: bool,
 ) -> Result<(), ()> {
     let mut sequence = 1u64;
     let mut cursor = 0u64;
@@ -309,6 +330,18 @@ async fn run_lane(
                         started,
                     );
                     result?;
+                    if acknowledge_commit && sequence == 1 && session.is_carrier_committed() {
+                        let started = Instant::now();
+                        send(socket, runtime, Message::Binary(Bytes::new())).await?;
+                        record_message(
+                            runtime,
+                            trace,
+                            TraceDirection::Response,
+                            "carrier-ack",
+                            &[],
+                            started,
+                        );
+                    }
                     sequence = sequence.checked_add(1).ok_or(())?;
                     connection.mark_peer_activity();
                     next_ping = Instant::now() + liveness_interval;
@@ -435,204 +468,4 @@ enum DriverEvent {
     Incoming((Message, Option<WebSocketBudgetLease>)),
     Down(crate::web::session::PollResult),
     Liveness,
-}
-
-async fn read_message(
-    socket: &mut CarrierSocket,
-    runtime: &Arc<WebProcessRuntime>,
-    owner: crate::web::manager::ProfileKey,
-    cancellation: &CancellationToken,
-    retained_budget: &mut Option<WebSocketBudgetLease>,
-) -> Result<(Message, Option<WebSocketBudgetLease>), ()> {
-    tokio::select! {
-        _ = cancellation.cancelled() => return Err(()),
-        ready = socket.get_ref().readable() => ready.map_err(|_| ())?,
-    }
-    if retained_budget.is_none() {
-        let maximum = runtime
-            .active_generation()
-            .config()
-            .web
-            .limits
-            .carrier_batch_bytes;
-        *retained_budget = Some(reserve_data(runtime, owner, maximum, cancellation).await?);
-    }
-    let message = tokio::select! {
-        _ = cancellation.cancelled() => return Err(()),
-        message = socket.next() => message.ok_or(())?.map_err(|_| ())?,
-    };
-    if socket.get_ref().websocket_fragmented_message() {
-        return Ok((message, None));
-    }
-    let mut budget = retained_budget.take().ok_or(())?;
-    budget.shrink_to(message.len());
-    Ok((message, Some(budget)))
-}
-
-async fn reserve_data(
-    runtime: &Arc<WebProcessRuntime>,
-    owner: crate::web::manager::ProfileKey,
-    bytes: usize,
-    cancellation: &CancellationToken,
-) -> Result<WebSocketBudgetLease, ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_backpressure_secs,
-    );
-    tokio::time::timeout(timeout, async {
-        loop {
-            let notify = runtime.budget_notify();
-            let notified = notify.notified();
-            if let Some(budget) = runtime.try_websocket_data_budget(owner, bytes.max(1)) {
-                return Ok(budget);
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(()),
-                _ = notified => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| ())?
-}
-
-async fn process_multiplex(
-    runtime: &Arc<WebProcessRuntime>,
-    session: &Arc<WebSession>,
-    sequence: u64,
-    body: &[u8],
-    cancellation: &CancellationToken,
-) -> Result<(), ()> {
-    retry_backpressure(runtime, cancellation, || {
-        session.process_up(sequence, body).map(|_| ())
-    })
-    .await
-}
-
-async fn process_lane(
-    runtime: &Arc<WebProcessRuntime>,
-    session: &Arc<WebSession>,
-    reservation: &mut WebSocketLaneReservation,
-    sequence: u64,
-    body: &[u8],
-    cancellation: &CancellationToken,
-) -> Result<(), ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_backpressure_secs,
-    );
-    tokio::time::timeout(timeout, async {
-        loop {
-            let notify = runtime.budget_notify();
-            let notified = notify.notified();
-            match session.process_websocket_lane(reservation, sequence, body) {
-                Ok(()) => return Ok(()),
-                Err(ManagerError::Backpressure) => {}
-                Err(_) => return Err(()),
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(()),
-                _ = notified => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| ())?
-}
-
-async fn retry_backpressure<F>(
-    runtime: &Arc<WebProcessRuntime>,
-    cancellation: &CancellationToken,
-    mut operation: F,
-) -> Result<(), ()>
-where
-    F: FnMut() -> Result<(), ManagerError>,
-{
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_backpressure_secs,
-    );
-    tokio::time::timeout(timeout, async {
-        loop {
-            let notify = runtime.budget_notify();
-            let notified = notify.notified();
-            match operation() {
-                Ok(()) => return Ok(()),
-                Err(ManagerError::Backpressure) => {}
-                Err(_) => return Err(()),
-            }
-            tokio::select! {
-                _ = cancellation.cancelled() => return Err(()),
-                _ = notified => {}
-            }
-        }
-    })
-    .await
-    .map_err(|_| ())?
-}
-
-async fn send(
-    socket: &mut CarrierSocket,
-    runtime: &WebProcessRuntime,
-    message: Message,
-) -> Result<(), ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_write_secs,
-    );
-    tokio::time::timeout(timeout, socket.send(message))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
-}
-
-async fn flush(socket: &mut CarrierSocket, runtime: &WebProcessRuntime) -> Result<(), ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_write_secs,
-    );
-    tokio::time::timeout(timeout, socket.flush())
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
-}
-
-fn record_message(
-    runtime: &WebProcessRuntime,
-    trace: Option<&TraceWebSocketContext>,
-    direction: TraceDirection,
-    message_type: &'static str,
-    payload: &[u8],
-    started: Instant,
-) {
-    let Some(trace) = trace else {
-        return;
-    };
-    runtime.trace().record_websocket_message(
-        trace,
-        direction,
-        message_type,
-        payload,
-        started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-    );
 }

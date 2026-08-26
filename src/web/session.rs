@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebTimeoutsConfig};
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::{ProfileKey, TokenHash, WebProcessRuntime};
+use crate::web::manager::CarrierLearningContext;
 
 // Backend tasks own generation admission and authenticated MTProxy relay lifetimes.
 mod backend;
@@ -25,6 +26,8 @@ mod lanes;
 // WebSocket carrier state owns pre-OPEN lane reservations and failure isolation.
 mod websocket;
 pub(crate) use websocket::WebSocketLaneReservation;
+// Session closure and carrier-attempt transitions share one cancellation boundary.
+mod lifecycle;
 // Uplink batches own exactly-once sequencing and client-frame validation.
 mod uplink;
 
@@ -116,7 +119,17 @@ struct SessionState {
     pending_control_bytes: usize,
     pending_control_items: usize,
     last_activity: Instant,
+    negotiation_phase: SessionNegotiationPhase,
+    close_requested: bool,
     closed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionNegotiationPhase {
+    Uncommitted,
+    Replacing,
+    Committed,
+    Superseded,
 }
 
 /// One bounded WEB carrier session containing logical MTProxy streams.
@@ -127,6 +140,10 @@ pub(crate) struct WebSession {
     trace_session_id: u64,
     profile: Arc<WebRuntimeProfile>,
     profile_key: ProfileKey,
+    selected_carrier: WebCarrier,
+    carrier_attempt: u8,
+    bootstrap_hash: TokenHash,
+    learning_context: Option<CarrierLearningContext>,
     limits: WebLimitsConfig,
     timeouts: WebTimeoutsConfig,
     state: Mutex<SessionState>,
@@ -158,11 +175,15 @@ impl WebSession {
         trace_session_id: u64,
         profile: Arc<WebRuntimeProfile>,
         profile_key: ProfileKey,
+        selected_carrier: WebCarrier,
+        carrier_attempt: u8,
+        bootstrap_hash: TokenHash,
+        learning_context: Option<CarrierLearningContext>,
         limits: WebLimitsConfig,
         timeouts: WebTimeoutsConfig,
     ) -> Arc<Self> {
         let mut carrier_lanes = HashMap::new();
-        if profile.carrier == WebCarrier::HttpsLanes {
+        if selected_carrier == WebCarrier::HttpsLanes {
             carrier_lanes.insert(0, CarrierLane::new());
         }
         Arc::new(Self {
@@ -172,6 +193,10 @@ impl WebSession {
             trace_session_id,
             profile,
             profile_key,
+            selected_carrier,
+            carrier_attempt,
+            bootstrap_hash,
+            learning_context,
             limits,
             timeouts,
             state: Mutex::new(SessionState {
@@ -193,6 +218,8 @@ impl WebSession {
                 pending_control_bytes: 0,
                 pending_control_items: 0,
                 last_activity: Instant::now(),
+                negotiation_phase: SessionNegotiationPhase::Uncommitted,
+                close_requested: false,
                 closed: false,
             }),
             down_notify: Arc::new(Notify::new()),
@@ -216,7 +243,7 @@ impl WebSession {
 
     /// Returns the immutable carrier selected when this session was created.
     pub(crate) fn carrier(&self) -> WebCarrier {
-        self.profile.carrier
+        self.selected_carrier
     }
 
     /// Returns the stable quota owner without exposing profile credentials.
@@ -227,6 +254,11 @@ impl WebSession {
     /// Returns the process-unique non-secret trace identifier.
     pub(crate) fn trace_session_id(&self) -> u64 {
         self.trace_session_id
+    }
+
+    /// Returns whether accepted carrier progress made this attempt immutable.
+    pub(crate) fn is_carrier_committed(&self) -> bool {
+        self.state.lock().negotiation_phase == SessionNegotiationPhase::Committed
     }
 
     /// Returns a cloned non-secret identity only for enabled debug capture.
@@ -253,80 +285,45 @@ impl WebSession {
         }
     }
 
-    /// Closes carrier state while relay tasks retain their admission until exit.
-    pub(crate) fn close(&self) {
-        let (data_bytes, data_items, control_bytes, control_items) = {
-            let mut state = self.state.lock();
-            if state.closed {
-                return;
+    fn ensure_carrier_active_locked(
+        &self,
+        state: &SessionState,
+    ) -> Result<(), crate::web::manager::ManagerError> {
+        match state.negotiation_phase {
+            SessionNegotiationPhase::Uncommitted | SessionNegotiationPhase::Committed => Ok(()),
+            SessionNegotiationPhase::Replacing | SessionNegotiationPhase::Superseded => {
+                Err(crate::web::manager::ManagerError::Closed)
             }
-            state.closed = true;
-            for stream in state.streams.values_mut() {
-                if let Some(waker) = stream.read_waker.take() {
-                    waker.wake();
-                }
-                if let Some(waker) = stream.write_waker.take() {
-                    waker.wake();
-                }
-            }
-            state.streams.clear();
-            state.pending_frames.clear();
-            state.pending_windows.clear();
-            state.unacked = None;
-            for lane in state.carrier_lanes.values() {
-                lane.notify.notify_waiters();
-            }
-            state.carrier_lanes.clear();
-            let control_bytes = state.pending_control_bytes;
-            let control_items = state.pending_control_items;
-            let data_bytes = state.pending_bytes.saturating_sub(control_bytes);
-            let data_items = state.pending_items.saturating_sub(control_items);
-            state.pending_bytes = 0;
-            state.pending_items = 0;
-            state.pending_control_bytes = 0;
-            state.pending_control_items = 0;
-            (data_bytes, data_items, control_bytes, control_items)
-        };
-        self.cancel.cancel();
-        if self.carrier().is_multiplexed() {
-            self.down_notify.notify_waiters();
         }
+    }
+
+    fn commit_carrier_locked(&self, state: &mut SessionState, progress: bool) -> bool {
+        if !progress {
+            return false;
+        }
+        match state.negotiation_phase {
+            SessionNegotiationPhase::Uncommitted => {
+                state.negotiation_phase = SessionNegotiationPhase::Committed;
+                true
+            }
+            SessionNegotiationPhase::Committed
+            | SessionNegotiationPhase::Replacing
+            | SessionNegotiationPhase::Superseded => false,
+        }
+    }
+
+    fn finish_carrier_commit(&self) {
         if let Some(manager) = self.manager.upgrade() {
-            manager.release_pending(self.profile_key, data_bytes, data_items, false);
-            manager.release_pending(self.profile_key, control_bytes, control_items, true);
-            if !self.finished.swap(true, Ordering::AcqRel) {
-                self.trace_lifecycle(
-                    crate::web::trace::TraceLifecycleEvent::SessionClosed,
-                    None,
-                    Some("closed"),
-                );
-                manager.session_finished(
-                    self.token_hash,
-                    self.client_ip,
-                    self.profile_key,
-                    &self.profile.host,
-                );
-            }
+            manager.carrier_committed(
+                self.bootstrap_hash,
+                self.token_hash,
+                self.carrier_attempt,
+                self.selected_carrier,
+                self.learning_context,
+                self.client_ip,
+                self.trace_identity(),
+            );
         }
-    }
-
-    /// Waits for all logical-stream tasks after admission has closed.
-    pub(crate) async fn wait(&self) {
-        loop {
-            let notified = self.tasks_done.notified();
-            if self.tasks_live.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    /// Returns whether reconnect grace elapsed without activity.
-    pub(crate) fn is_idle(&self, now: Instant) -> bool {
-        let state = self.state.lock();
-        !state.closed
-            && now.saturating_duration_since(state.last_activity)
-                >= Duration::from_secs(self.timeouts.reconnect_grace_secs)
     }
 
     /// Polls client-to-server bytes and returns consumed flow-control credit.

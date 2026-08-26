@@ -228,6 +228,16 @@ pub(crate) enum TraceLifecycleEvent {
     BridgeIssued,
     /// Bootstrap or bridge admission was rejected.
     BootstrapRejected,
+    /// A session request was classified for legacy or automatic negotiation.
+    CarrierClassified,
+    /// One carrier candidate was selected for an attempt.
+    CarrierSelected,
+    /// A provisional carrier was reported failed by the bridge.
+    CarrierFailed,
+    /// An uncommitted carrier session was atomically superseded.
+    CarrierSuperseded,
+    /// The first OPEN or DATA batch made a carrier immutable.
+    CarrierCommitted,
     /// A new session was created.
     SessionCreated,
     /// An idempotent session creation was replayed.
@@ -264,6 +274,11 @@ impl TraceLifecycleEvent {
         match self {
             Self::BridgeIssued => "bridge_issued",
             Self::BootstrapRejected => "bootstrap_rejected",
+            Self::CarrierClassified => "carrier_classified",
+            Self::CarrierSelected => "carrier_selected",
+            Self::CarrierFailed => "carrier_failed",
+            Self::CarrierSuperseded => "carrier_superseded",
+            Self::CarrierCommitted => "carrier_committed",
             Self::SessionCreated => "session_created",
             Self::SessionReplayed => "session_replayed",
             Self::SessionRejected => "session_rejected",
@@ -282,6 +297,19 @@ impl TraceLifecycleEvent {
     }
 }
 
+/// Non-sensitive carrier-negotiation fields attached to lifecycle records.
+#[derive(Debug)]
+pub(crate) struct TraceCarrierDetail {
+    /// Stable client classification; never a raw User-Agent.
+    pub(crate) client_class: &'static str,
+    /// Candidate associated with the lifecycle transition.
+    pub(crate) carrier: crate::config::WebCarrier,
+    /// One-based candidate attempt.
+    pub(crate) attempt: u8,
+    /// Weighted learning scores indexed by the canonical carrier order.
+    pub(crate) scores: [i16; 4],
+}
+
 /// One typed WEB lifecycle observation.
 #[derive(Debug)]
 pub(crate) struct TraceLifecycleRecord {
@@ -291,6 +319,8 @@ pub(crate) struct TraceLifecycleRecord {
     pub(crate) stream_id: Option<u32>,
     /// Closed outcome or rejection reason.
     pub(crate) reason: Option<&'static str>,
+    /// Carrier negotiation detail when this is a carrier lifecycle event.
+    pub(crate) carrier: Option<TraceCarrierDetail>,
 }
 
 /// Trace record payload variant.

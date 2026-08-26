@@ -121,12 +121,17 @@ impl WebSession {
             return Err(ManagerError::Protocol);
         }
         let digest = Sha256::digest(body).into();
+        let progress = frames
+            .iter()
+            .any(|frame| matches!(frame.frame_type, frame::FrameType::Open | frame::FrameType::Data));
         let mut opened = Vec::new();
+        let mut committed = false;
         let result = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(ManagerError::Closed);
             }
+            self.ensure_carrier_active_locked(&state)?;
             if !reservation.transferred
                 && state.websocket_lane_reservations.get(&lane_id) != Some(&reservation.peer_port)
             {
@@ -181,9 +186,15 @@ impl WebSession {
                 }
             }
             state.last_activity = Instant::now();
+            if applied {
+                committed = self.commit_carrier_locked(&mut state, progress);
+            }
             applied.then_some(()).ok_or(ManagerError::Protocol)
         };
         result?;
+        if committed {
+            self.finish_carrier_commit();
+        }
         for (stream_id, peer_port) in opened {
             if stream_id != lane_id || peer_port != reservation.peer_port {
                 return Err(ManagerError::Protocol);

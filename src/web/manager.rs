@@ -16,8 +16,14 @@ use crate::web::trace::WebTraceStore;
 
 // Credential maps, quotas, and token-bucket helpers remain private to the manager.
 mod state;
+// Carrier attempt metadata remains explicit and independent from HTTP parsing.
+mod negotiation;
+// Bounded process-local carrier evidence is isolated from session registries.
+mod learning;
 // Bootstrap credentials and idempotent session creation are isolated from queue accounting.
 mod credentials;
+// First-session admission and bounded carrier replacement share one state machine.
+mod session_creation;
 // Stream admission and synthetic tuple ownership are process-scoped.
 mod admission;
 // Shutdown and expiry work remain outside request-path coordination.
@@ -29,6 +35,9 @@ mod websocket;
 pub(crate) use budget::WebSocketBudgetLease;
 use budget::{WebDataBudget, WebSocketBudgetClass};
 use state::ManagerState;
+pub(crate) use negotiation::{
+    CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierLearningContext, CarrierRequest,
+};
 pub(crate) use websocket::{WebSocketConnection, WebSocketKind};
 
 const TOKEN_BYTES: usize = 32;
@@ -56,12 +65,28 @@ pub(crate) enum ManagerError {
     Closed,
 }
 
+impl ManagerError {
+    /// Returns the stable non-sensitive failure token used by WEB diagnostics.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Backpressure => "backpressure",
+            Self::Limit => "limit",
+            Self::Protocol => "protocol",
+            Self::Concurrent => "concurrent",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 /// Successful idempotent session creation result.
 pub(crate) struct CreateResult {
     /// Opaque bearer token for the created or replayed session.
     pub(crate) token: String,
     /// Carrier frozen into the created or replayed session.
     pub(crate) carrier: WebCarrier,
+    /// One-based carrier attempt echoed only for negotiated sessions.
+    pub(crate) attempt: Option<u8>,
 }
 
 /// Successful bridge bootstrap issuance result.
@@ -78,6 +103,7 @@ pub(crate) struct WebProcessRuntime {
     trace: Arc<WebTraceStore>,
     limits: WebLimitsConfig,
     state: Mutex<ManagerState>,
+    learning: Mutex<learning::CarrierLearning>,
     http_connections: Arc<Semaphore>,
     http_handlers: Arc<Semaphore>,
     lane_polls: Arc<Semaphore>,
@@ -116,6 +142,7 @@ impl WebProcessRuntime {
         trace: Arc<WebTraceStore>,
     ) -> Arc<Self> {
         let limits = active_runtime.load().config().web.limits.clone();
+        let learning_capacity = limits.max_carrier_learning_entries;
         let websocket_connections = limits
             .max_http_connections
             .saturating_sub(limits.websocket_http_connection_reserve);
@@ -136,6 +163,7 @@ impl WebProcessRuntime {
             data_budget: WebDataBudget::new(limits.clone()),
             limits,
             state: Mutex::new(ManagerState::default()),
+            learning: Mutex::new(learning::CarrierLearning::new(learning_capacity)),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
             sessions_created: AtomicU64::new(0),
@@ -307,6 +335,7 @@ impl WebProcessRuntime {
     }
 
     /// Admits one WebSocket with owner-first bounded replacement.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_websocket(
         self: &Arc<Self>,
         owner: ProfileKey,

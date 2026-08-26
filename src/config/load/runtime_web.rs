@@ -27,6 +27,7 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
     let mut static_files = 0usize;
     let mut static_bytes = 0usize;
 
+    let carrier_candidates: Arc<[WebCarrier]> = config.web.carrier_candidates().into();
     for vhost in &config.web.vhosts {
         let decoy = build_decoy(
             vhost,
@@ -63,6 +64,13 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
                 user: profile.user.clone(),
                 secret_mode: profile.secret_mode,
                 carrier: config.web.carrier,
+                carrier_negotiation_enabled: config.web.carrier_negotiation_enabled(),
+                carrier_learning: config.web.carrier_learning,
+                carriers: Arc::clone(&carrier_candidates),
+                carrier_negotiation_deadlines_secs: config
+                    .web
+                    .timeouts
+                    .carrier_negotiation_deadlines_secs,
                 capability,
                 key_fingerprint,
                 max_sessions: profile

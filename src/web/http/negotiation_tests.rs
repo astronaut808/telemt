@@ -1,0 +1,176 @@
+use super::*;
+
+use sha2::{Digest, Sha256};
+
+const CAPABILITIES: &str = "https,https-lanes,websocket,websocket-lanes";
+
+fn issue_bootstrap(runtime: &Arc<WebProcessRuntime>, client_ip: &str) -> String {
+    let profile = runtime
+        .active_generation()
+        .config()
+        .web
+        .runtime
+        .as_ref()
+        .unwrap()
+        .profiles[0]
+        .clone();
+    runtime
+        .issue_bootstrap(profile, client_ip.parse().unwrap())
+        .unwrap()
+        .token
+}
+
+fn create_request(
+    bootstrap: &str,
+    hello: &[u8],
+    attempt: Option<u8>,
+    failure: Option<&str>,
+) -> Vec<u8> {
+    let negotiation = attempt.map_or_else(String::new, |attempt| {
+        let failure = failure
+            .map(|failure| format!("X-Carrier-Failure: {failure}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "X-Carrier-Capabilities: {CAPABILITIES}\r\nX-Carrier-Attempt: {attempt}\r\n{failure}"
+        )
+    });
+    let mut request = format!(
+        "POST /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {bootstrap}\r\nContent-Type: application/octet-stream\r\n{negotiation}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        hello.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(hello);
+    request
+}
+
+fn optional_response_header<'a>(headers: &'a [u8], name: &str) -> Option<&'a str> {
+    std::str::from_utf8(headers)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(header, value)| header.eq_ignore_ascii_case(name).then_some(value.trim()))
+}
+
+fn token_hash(token: &str) -> crate::web::manager::TokenHash {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .unwrap();
+    Sha256::digest(raw).into()
+}
+
+#[tokio::test]
+async fn absent_carriers_reject_negotiation_and_preserve_legacy_creation() {
+    let capability = [41; 32];
+    let generation = test_runtime_generation(1, runtime_config(capability, WebCarrier::Https));
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+
+    let rejected = request(
+        &listener,
+        &runtime,
+        create_request(&bootstrap, &hello, Some(1), None),
+    )
+    .await;
+    let (rejected_headers, _) = split_response(&rejected);
+    assert!(optional_response_header(rejected_headers, "x-session-token").is_none());
+
+    let legacy = request(
+        &listener,
+        &runtime,
+        create_request(&bootstrap, &hello, None, None),
+    )
+    .await;
+    let (legacy_headers, _) = split_response(&legacy);
+    assert!(legacy_headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(response_header(legacy_headers, "x-carrier-mode"), "https");
+    assert!(optional_response_header(legacy_headers, "x-carrier-attempt").is_none());
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
+    let capability = [42; 32];
+    let config = negotiation_runtime_config(
+        capability,
+        WebCarrier::Websocket,
+        false,
+        Arc::from([
+            WebCarrier::Https,
+            WebCarrier::HttpsLanes,
+            WebCarrier::Websocket,
+        ]),
+    );
+    let generation = test_runtime_generation(1, config);
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+
+    let first_request = create_request(&bootstrap, &hello, Some(1), None);
+    let first = request(&listener, &runtime, first_request.clone()).await;
+    let (first_headers, _) = split_response(&first);
+    assert_eq!(response_header(first_headers, "x-carrier-mode"), "https");
+    assert_eq!(response_header(first_headers, "x-carrier-attempt"), "1");
+    let first_token = response_header(first_headers, "x-session-token").to_string();
+
+    let replay = request(&listener, &runtime, first_request).await;
+    let (replay_headers, _) = split_response(&replay);
+    assert_eq!(response_header(replay_headers, "x-session-token"), first_token);
+
+    let second_request = create_request(&bootstrap, &hello, Some(2), Some("timeout"));
+    let second = request(&listener, &runtime, second_request.clone()).await;
+    let (second_headers, _) = split_response(&second);
+    assert_eq!(
+        response_header(second_headers, "x-carrier-mode"),
+        "https-lanes"
+    );
+    assert_eq!(response_header(second_headers, "x-carrier-attempt"), "2");
+    let second_token = response_header(second_headers, "x-session-token").to_string();
+    assert_ne!(first_token, second_token);
+    assert!(
+        runtime
+            .get_session(token_hash(&first_token), "proxy.example.com")
+            .is_err()
+    );
+
+    let second_replay = request(&listener, &runtime, second_request).await;
+    let (second_replay_headers, _) = split_response(&second_replay);
+    assert_eq!(
+        response_header(second_replay_headers, "x-session-token"),
+        second_token
+    );
+
+    let open = frame::encode(FrameType::Open, 7, &[]);
+    let mut uplink = format!(
+        "POST /api/v1/up HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {second_token}\r\nContent-Type: application/octet-stream\r\nX-Up-Seq: 1\r\nX-Lane-ID: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        open.len()
+    )
+    .into_bytes();
+    uplink.extend_from_slice(&open);
+    let committed = request(&listener, &runtime, uplink).await;
+    assert!(committed.starts_with(b"HTTP/1.1 204"));
+
+    let third = request(
+        &listener,
+        &runtime,
+        create_request(&bootstrap, &hello, Some(3), Some("http")),
+    )
+    .await;
+    let (third_headers, _) = split_response(&third);
+    assert!(optional_response_header(third_headers, "x-session-token").is_none());
+    assert!(
+        runtime
+            .get_session(token_hash(&second_token), "proxy.example.com")
+            .unwrap()
+            .is_carrier_committed()
+    );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}

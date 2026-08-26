@@ -16,6 +16,7 @@
 //! | `general` | `telemetry` / `me_*_policy`    | Applied immediately                            |
 //! | `network` | `dns_overrides`                | Applied immediately                            |
 //! | `access`  | All user/quota fields          | Effective immediately                          |
+//! | `web`     | Carrier, timing, and debug policy | Applied to newly issued sessions             |
 //! Fields that require re-binding sockets (`server.listeners`, legacy
 //! `server.port`, `censorship.*`, `network.*`, `use_middle_proxy`) are **not**
 //! applied; a warning is emitted. SYN limiter rules are process-owned and are

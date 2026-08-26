@@ -260,7 +260,14 @@ const LISTENER_CONFIG_KEYS: &[&str] = &[
 ];
 
 const WEB_CONFIG_KEYS: &[&str] = &[
-    "enabled", "carrier", "debug", "limits", "timeouts", "vhosts",
+    "enabled",
+    "carrier",
+    "carriers",
+    "carrier_learning",
+    "debug",
+    "limits",
+    "timeouts",
+    "vhosts",
 ];
 
 const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
@@ -275,6 +282,7 @@ const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "websocket_admission_watermark_pct",
     "websocket_eviction_watermark_pct",
     "websocket_http_connection_reserve",
+    "max_carrier_learning_entries",
     "max_body_readers",
     "max_body_bytes_global",
     "max_sessions_global",
@@ -328,6 +336,8 @@ const WEB_TIMEOUTS_CONFIG_KEYS: &[&str] = &[
     "websocket_write_secs",
     "websocket_backpressure_secs",
     "websocket_eviction_secs",
+    "carrier_negotiation_deadlines_secs",
+    "carrier_learning_secs",
     "bootstrap_lifetime_secs",
     "reconnect_grace_secs",
     "http_idle_secs",

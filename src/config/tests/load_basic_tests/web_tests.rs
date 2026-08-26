@@ -49,6 +49,87 @@ fn web_config_builds_canonical_runtime_snapshot() {
     assert_eq!(vhost.profiles[0].max_streams_per_session, 16);
     assert_eq!(vhost.profiles[0].key_fingerprint.len(), 16);
     assert_ne!(vhost.profiles[0].key_fingerprint, "0001020304050607");
+    assert!(!vhost.profiles[0].carrier_negotiation_enabled);
+    assert_eq!(vhost.profiles[0].carriers.as_ref(), [WebCarrier::HttpsLanes]);
+}
+
+#[test]
+fn web_carriers_missing_or_false_disable_negotiation() {
+    let missing = load_config_from_temp_toml(WEB_CONFIG);
+    assert!(!missing.web.carrier_negotiation_enabled());
+
+    let disabled = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"https-lanes\"\ncarriers = false",
+    );
+    let disabled = load_config_from_temp_toml(&disabled);
+    assert!(!disabled.web.carrier_negotiation_enabled());
+    assert_eq!(
+        disabled.web.runtime.unwrap().profiles[0].carriers.as_ref(),
+        [WebCarrier::HttpsLanes]
+    );
+}
+
+#[test]
+fn web_carrier_array_enables_ordered_negotiation_and_appends_fallback() {
+    let configured = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"https-lanes\"\ncarriers = [\"websocket\", \"https\"]\ncarrier_learning = false",
+    );
+    let config = load_config_from_temp_toml(&configured);
+    assert!(config.web.carrier_negotiation_enabled());
+    assert!(!config.web.carrier_learning);
+    let profile = &config.web.runtime.unwrap().profiles[0];
+    assert_eq!(
+        profile.carriers.as_ref(),
+        [
+            WebCarrier::Websocket,
+            WebCarrier::Https,
+            WebCarrier::HttpsLanes
+        ]
+    );
+    assert!(!profile.carrier_learning);
+}
+
+#[test]
+fn web_carriers_reject_true_empty_and_duplicates() {
+    for value in [
+        "true",
+        "[]",
+        "[\"https\", \"https\"]",
+    ] {
+        let invalid = WEB_CONFIG.replace(
+            "carrier = \"https-lanes\"",
+            &format!("carrier = \"https-lanes\"\ncarriers = {value}"),
+        );
+        assert!(load_config_error_from_temp_toml(&invalid).contains("web.carriers"));
+    }
+}
+
+#[test]
+fn web_carrier_deadlines_and_learning_window_are_configurable() {
+    let configured = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.timeouts]\ncarrier_negotiation_deadlines_secs = [1, 2, 4, 9]\ncarrier_learning_secs = 30\n\n[[web.vhosts]]",
+    );
+    let config = load_config_from_temp_toml(&configured);
+    assert_eq!(
+        config.web.timeouts.carrier_negotiation_deadlines_secs,
+        [1, 2, 4, 9]
+    );
+    assert_eq!(config.web.timeouts.carrier_learning_secs, 30);
+}
+
+#[test]
+fn web_carrier_learning_capacity_must_remain_nonzero() {
+    let invalid = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.limits]\nmax_carrier_learning_entries = 0\n\n[[web.vhosts]]",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&invalid)
+            .contains("web.limits.max_carrier_learning_entries")
+    );
 }
 
 #[test]
@@ -106,7 +187,7 @@ fn https_lanes_requires_separate_poll_and_control_handler_capacity() {
         "carrier = \"https-lanes\"\n\n[web.limits]\nmax_http_handlers = 1\nmax_body_readers = 1",
     );
     let error = load_config_error_from_temp_toml(&invalid);
-    assert!(error.contains("web.carrier=https-lanes requires"));
+    assert!(error.contains("WEB https-lanes candidates require"));
 }
 
 #[test]

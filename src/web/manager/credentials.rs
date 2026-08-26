@@ -3,19 +3,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use super::state::{
-    Bootstrap, allow_rate, decrement_map, evict_oldest_unused_bootstrap, matching_profile,
-    new_unique_token, profile_key, remove_expired_locked,
+    Bootstrap, allow_rate, evict_oldest_unused_bootstrap, matching_profile, new_unique_token,
+    remove_expired_locked,
 };
-use super::{
-    BootstrapResult, CreateResult, ManagerError, TOKEN_BYTES, TokenHash, WebProcessRuntime,
-};
+use super::{BootstrapResult, ManagerError, TOKEN_BYTES, TokenHash, WebProcessRuntime};
 use crate::config::WebRuntimeProfile;
-use crate::web::frame;
 use crate::web::session::WebSession;
 
 impl WebProcessRuntime {
@@ -78,6 +73,13 @@ impl WebProcessRuntime {
                 body_digest: [0; TOKEN_BYTES],
                 session_token: Zeroizing::new(String::new()),
                 session: None,
+                carrier_request: None,
+                carrier_candidates: Arc::from([]),
+                carrier_scores: [0; 4],
+                carrier_attempt: 0,
+                carrier_transitioning: false,
+                carrier_committed: false,
+                session_client_ip: None,
                 used: false,
             },
         );
@@ -115,128 +117,6 @@ impl WebProcessRuntime {
             .get(&hash)
             .filter(|entry| entry.profile.host == host && now <= entry.expires_at)
             .map(|entry| (entry.trace_session_id, Arc::clone(&entry.profile)))
-    }
-
-    /// Creates a session exactly once or replays the original successful result.
-    pub(crate) fn create_session(
-        self: &Arc<Self>,
-        bootstrap_hash: TokenHash,
-        host: &str,
-        client_ip: IpAddr,
-        body: &[u8],
-    ) -> std::result::Result<CreateResult, ManagerError> {
-        if !frame::validate_hello(body, &self.limits) {
-            return Err(ManagerError::Protocol);
-        }
-        let body_digest: TokenHash = Sha256::digest(body).into();
-        let generation = self.active_generation();
-        let config = generation.config();
-        let now = Instant::now();
-        let mut state = self.state.lock();
-        remove_expired_locked(&mut state, now);
-        let Some(entry) = state.bootstraps.get(&bootstrap_hash) else {
-            return Err(ManagerError::Authentication);
-        };
-        if entry.profile.host != host || now > entry.expires_at {
-            return Err(ManagerError::Authentication);
-        }
-        if entry.used {
-            let digest_matches = bool::from(entry.body_digest.ct_eq(&body_digest));
-            if !digest_matches {
-                return Err(ManagerError::Authentication);
-            }
-            let session = entry.session.as_ref().ok_or(ManagerError::Authentication)?;
-            let result = CreateResult {
-                token: entry.session_token.as_str().to_owned(),
-                carrier: session.carrier(),
-            };
-            let identity = session.trace_identity();
-            drop(state);
-            self.trace.record_lifecycle(
-                None,
-                Some(client_ip),
-                identity,
-                crate::web::trace::TraceLifecycleEvent::SessionReplayed,
-                None,
-                None,
-            );
-            return Ok(result);
-        }
-        let trace_session_id = entry.trace_session_id;
-        let issued_profile = Arc::clone(&entry.profile);
-        if state.closed || !config.web.enabled {
-            return Err(ManagerError::Closed);
-        }
-        let profile = config
-            .web
-            .runtime
-            .as_ref()
-            .and_then(|runtime| matching_profile(runtime, &issued_profile))
-            .filter(|profile| generation.proxy_shared.is_user_enabled(&profile.user))
-            .ok_or(ManagerError::Authentication)?;
-        let profile_key = profile_key(&profile);
-        if state.sessions.len() >= self.limits.max_sessions_global
-            || state.sessions_per_ip.get(&client_ip).copied().unwrap_or(0)
-                >= self.limits.max_sessions_per_ip
-            || state
-                .sessions_per_profile
-                .get(&profile_key)
-                .copied()
-                .unwrap_or(0)
-                >= profile.max_sessions
-            || !allow_rate(
-                &mut state.session_rate,
-                now,
-                self.limits.new_sessions_per_minute,
-                self.limits.new_sessions_burst,
-            )
-        {
-            self.limit_hits.fetch_add(1, Ordering::Relaxed);
-            return Err(ManagerError::Limit);
-        }
-        let Some((session_token, session_hash)) = new_unique_token(&generation, &state) else {
-            self.limit_hits.fetch_add(1, Ordering::Relaxed);
-            return Err(ManagerError::Limit);
-        };
-        let session = WebSession::new(
-            Arc::downgrade(self),
-            session_hash,
-            client_ip,
-            trace_session_id,
-            profile,
-            profile_key,
-            self.limits.clone(),
-            config.web.timeouts.clone(),
-        );
-        state.sessions.insert(session_hash, Arc::clone(&session));
-        *state.sessions_per_ip.entry(client_ip).or_insert(0) += 1;
-        *state.sessions_per_profile.entry(profile_key).or_insert(0) += 1;
-        let entry = state
-            .bootstraps
-            .get_mut(&bootstrap_hash)
-            .ok_or(ManagerError::Authentication)?;
-        entry.used = true;
-        entry.body_digest = body_digest;
-        entry.session_token = Zeroizing::new(session_token.clone());
-        entry.session = Some(Arc::clone(&session));
-        let issuance_ip = entry.issuance_ip;
-        decrement_map(&mut state.bootstraps_per_ip, &issuance_ip);
-        self.sessions_created.fetch_add(1, Ordering::Relaxed);
-        let identity = session.trace_identity();
-        let result = CreateResult {
-            token: session_token,
-            carrier: session.carrier(),
-        };
-        drop(state);
-        self.trace.record_lifecycle(
-            None,
-            Some(client_ip),
-            identity,
-            crate::web::trace::TraceLifecycleEvent::SessionCreated,
-            None,
-            None,
-        );
-        Ok(result)
     }
 
     /// Resolves an authenticated session token.

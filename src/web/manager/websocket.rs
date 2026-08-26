@@ -98,6 +98,7 @@ impl Drop for WebSocketConnection {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn admit(
     runtime: &Arc<WebProcessRuntime>,
     owner: ProfileKey,

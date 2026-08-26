@@ -6,6 +6,10 @@ use super::*;
 mod debug;
 // Memory-envelope arithmetic remains isolated from protocol validation.
 mod memory;
+// Carrier ordering, cumulative deadlines, and fallback identity are validated together.
+mod negotiation;
+// Request and lifecycle timeout relationships are validated together.
+mod timeouts;
 // WebSocket transport policy is validated independently from HTTP body policy.
 mod websocket;
 
@@ -67,11 +71,14 @@ pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
 
     validate_limits(&config.web.limits)?;
     debug::validate(&config.web.debug, &config.web.limits)?;
-    if config.web.carrier == WebCarrier::HttpsLanes && config.web.limits.max_http_handlers < 2 {
-        return config_error("web.carrier=https-lanes requires web.limits.max_http_handlers >= 2");
+    let carriers = negotiation::validate(&config.web)?;
+    if carriers.contains(&WebCarrier::HttpsLanes) && config.web.limits.max_http_handlers < 2 {
+        return config_error(
+            "WEB https-lanes candidates require web.limits.max_http_handlers >= 2",
+        );
     }
-    validate_timeouts(&config.web.timeouts)?;
-    websocket::validate(config.web.carrier, &config.web.limits, &config.web.timeouts)?;
+    timeouts::validate(&config.web.timeouts)?;
+    websocket::validate(&carriers, &config.web.limits, &config.web.timeouts)?;
     validate_vhosts(config)?;
     Ok(())
 }
@@ -155,6 +162,10 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
     let positive = [
         ("max_http_connections", limits.max_http_connections),
         ("max_http_handlers", limits.max_http_handlers),
+        (
+            "max_carrier_learning_entries",
+            limits.max_carrier_learning_entries,
+        ),
         ("max_body_readers", limits.max_body_readers),
         ("max_body_bytes_global", limits.max_body_bytes_global),
         ("max_sessions_global", limits.max_sessions_global),
@@ -321,41 +332,6 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         );
     }
     memory::validate(limits)?;
-    Ok(())
-}
-
-fn validate_timeouts(timeouts: &WebTimeoutsConfig) -> Result<()> {
-    let values = [
-        ("header_secs", timeouts.header_secs),
-        ("body_secs", timeouts.body_secs),
-        ("stream_handshake_secs", timeouts.stream_handshake_secs),
-        ("long_poll_secs", timeouts.long_poll_secs),
-        ("websocket_write_secs", timeouts.websocket_write_secs),
-        (
-            "websocket_backpressure_secs",
-            timeouts.websocket_backpressure_secs,
-        ),
-        ("websocket_eviction_secs", timeouts.websocket_eviction_secs),
-        ("bootstrap_lifetime_secs", timeouts.bootstrap_lifetime_secs),
-        ("reconnect_grace_secs", timeouts.reconnect_grace_secs),
-        ("http_idle_secs", timeouts.http_idle_secs),
-        ("shutdown_secs", timeouts.shutdown_secs),
-        ("decoy_header_secs", timeouts.decoy_header_secs),
-    ];
-    if let Some((field, _)) = values
-        .into_iter()
-        .find(|(_, value)| !(1..=3600).contains(value))
-    {
-        return config_error(&format!("web.timeouts.{field} must be within [1, 3600]"));
-    }
-    let request_deadline = timeouts
-        .header_secs
-        .max(timeouts.body_secs)
-        .max(timeouts.long_poll_secs)
-        .max(timeouts.decoy_header_secs);
-    if request_deadline >= timeouts.http_idle_secs {
-        return config_error("web.timeouts request deadlines must be lower than http_idle_secs");
-    }
     Ok(())
 }
 

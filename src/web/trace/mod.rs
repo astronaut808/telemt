@@ -13,5 +13,6 @@ pub(crate) use exchange::HttpTraceExchange;
 pub(crate) use store::{StoredTraceRecord, WebTraceStore, epoch_millis as store_epoch_millis};
 pub(crate) use types::{
     TraceBodySnapshot, TraceBodyState, TraceDirection, TraceFrame, TraceHeader, TraceIdentity,
-    TraceLifecycleEvent, TraceRecord, TraceRecordKind, TraceRoute, TraceWebSocketContext,
+    TraceLifecycleEvent, TraceLifecycleRecord, TraceRecord, TraceRecordKind, TraceRoute,
+    TraceWebSocketContext,
 };

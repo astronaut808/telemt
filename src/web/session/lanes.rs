@@ -41,12 +41,17 @@ impl WebSession {
             return Err(ManagerError::Protocol);
         }
         let digest: TokenHash = Sha256::digest(body).into();
+        let progress = frames
+            .iter()
+            .any(|frame| matches!(frame.frame_type, FrameType::Open | FrameType::Data));
         let mut opened = Vec::new();
+        let mut committed = false;
         let result = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(ManagerError::Closed);
             }
+            self.ensure_carrier_active_locked(&state)?;
             state.last_activity = Instant::now();
             if !state.carrier_lanes.contains_key(&lane_id) {
                 if lane_id != 0
@@ -125,6 +130,9 @@ impl WebSession {
                     lane.last_up_digest = digest;
                 }
             }
+            if applied {
+                committed = self.commit_carrier_locked(&mut state, progress);
+            }
             applied.then_some(sequence).ok_or(ManagerError::Closed)
         };
         if matches!(result, Err(ManagerError::Backpressure)) {
@@ -136,6 +144,9 @@ impl WebSession {
                 self.release_stream_reservation(peer_port);
             }
             return result;
+        }
+        if committed {
+            self.finish_carrier_commit();
         }
         for (stream_id, peer_port) in opened {
             self.spawn_stream(stream_id, peer_port, false);

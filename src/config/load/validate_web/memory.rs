@@ -3,9 +3,13 @@ use super::*;
 const WEB_DEBUG_RENDERERS: usize = 2;
 const WEB_DEBUG_STATUS_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const WEB_DEBUG_GROUP_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+const WEB_CARRIER_LEARNING_ENTRY_BYTES: usize = 256;
 
 /// Validates process-wide body, header, queue, static, and debug reservations.
 pub(super) fn validate(limits: &WebLimitsConfig) -> Result<()> {
+    if limits.max_carrier_learning_entries == 0 {
+        return config_error("web.limits.max_carrier_learning_entries must be > 0");
+    }
     let body_reservation = limits
         .max_body_readers
         .checked_mul(limits.max_body_bytes)
@@ -47,6 +51,12 @@ pub(super) fn validate(limits: &WebLimitsConfig) -> Result<()> {
                 .and_then(|scratch| value.checked_add(scratch))
         })
         .ok_or_else(|| ProxyError::Config("web.debug reservations overflowed usize".to_string()))?;
+    let carrier_learning_reservation = limits
+        .max_carrier_learning_entries
+        .checked_mul(WEB_CARRIER_LEARNING_ENTRY_BYTES)
+        .ok_or_else(|| {
+            ProxyError::Config("web.carrier learning reservation overflowed usize".to_string())
+        })?;
     let reserved = limits
         .pending_bytes_global
         .checked_add(limits.max_body_bytes_global)
@@ -54,6 +64,7 @@ pub(super) fn validate(limits: &WebLimitsConfig) -> Result<()> {
         .and_then(|value| value.checked_add(debug_ring_index))
         .and_then(|value| value.checked_add(status_pages))
         .and_then(|value| value.checked_add(debug_reservation))
+        .and_then(|value| value.checked_add(carrier_learning_reservation))
         .and_then(|value| value.checked_add(http_header_reservation))
         .ok_or_else(|| ProxyError::Config("web.limits byte ceilings overflow usize".to_string()))?;
     if reserved > limits.memory_envelope_bytes

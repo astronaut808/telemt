@@ -84,3 +84,37 @@ pub(super) fn push_body(
     }
     html.push_str("</pre>");
 }
+
+pub(super) fn push_lifecycle(
+    html: &mut String,
+    event: &crate::web::trace::TraceLifecycleRecord,
+) {
+    html.push_str("<pre>event: ");
+    html.push_str(event.event.as_str());
+    html.push_str("\nstream: ");
+    html.push_str(
+        &event
+            .stream_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    html.push_str("\nreason: ");
+    html.push_str(event.reason.unwrap_or("-"));
+    if let Some(carrier) = &event.carrier {
+        html.push_str("\nclient class: ");
+        html.push_str(carrier.client_class);
+        html.push_str("\ncarrier: ");
+        html.push_str(carrier.carrier.as_str());
+        html.push_str("\nattempt: ");
+        html.push_str(&carrier.attempt.to_string());
+        html.push_str("\nscores: https=");
+        html.push_str(&carrier.scores[0].to_string());
+        html.push_str(" https-lanes=");
+        html.push_str(&carrier.scores[1].to_string());
+        html.push_str(" websocket=");
+        html.push_str(&carrier.scores[2].to_string());
+        html.push_str(" websocket-lanes=");
+        html.push_str(&carrier.scores[3].to_string());
+    }
+    html.push_str("</pre>");
+}
