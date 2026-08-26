@@ -189,9 +189,7 @@ impl CarrierRequest {
 
     /// Checks the complete idempotent identity of one exact attempt request.
     pub(crate) fn matches_attempt(self, other: Self) -> bool {
-        self.matches_client(other)
-            && self.attempt == other.attempt
-            && self.failure == other.failure
+        self.matches_client(other) && self.attempt == other.attempt && self.failure == other.failure
     }
 
     fn capabilities_bits(self) -> Option<u8> {
@@ -252,7 +250,10 @@ mod tests {
     #[test]
     fn invalid_candidate_or_attempt_counts_have_no_deadline_slot() {
         for (candidate_count, attempt) in [(0, 1), (5, 1), (1, 0), (1, 2), (3, 4)] {
-            assert_eq!(carrier_attempt_deadline_index(candidate_count, attempt), None);
+            assert_eq!(
+                carrier_attempt_deadline_index(candidate_count, attempt),
+                None
+            );
         }
     }
 }

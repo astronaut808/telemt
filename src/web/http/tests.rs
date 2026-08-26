@@ -134,8 +134,7 @@ fn runtime_config_with_carriers_and_deadlines(
         WebCarriers::Disabled
     };
     config.web.carrier_learning = carrier_learning;
-    config.web.timeouts.carrier_negotiation_deadlines_secs =
-        carrier_negotiation_deadlines_secs;
+    config.web.timeouts.carrier_negotiation_deadlines_secs = carrier_negotiation_deadlines_secs;
     config.web.limits.max_bootstraps_per_ip = 1;
     config.web.timeouts.shutdown_secs = 1;
     config.web.runtime = Some(Arc::new(WebRuntimeConfig {
@@ -260,9 +259,11 @@ async fn https_carrier_bootstraps_and_closes_one_session() {
             .windows(11)
             .any(|value| value == b"bootstrap=\"")
     );
-    assert!(next_root_body
-        .windows(b"const negotiationEnabled=false".len())
-        .any(|value| value == b"const negotiationEnabled=false"));
+    assert!(
+        next_root_body
+            .windows(b"const negotiationEnabled=false".len())
+            .any(|value| value == b"const negotiationEnabled=false")
+    );
 
     let close = format!(
         "DELETE /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {session}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

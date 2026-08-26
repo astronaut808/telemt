@@ -43,8 +43,10 @@ impl ResidentCounters {
     }
 
     fn add(&self, counts: PendingCounts) {
-        self.data_bytes.fetch_add(counts.data_bytes, Ordering::AcqRel);
-        self.data_items.fetch_add(counts.data_items, Ordering::AcqRel);
+        self.data_bytes
+            .fetch_add(counts.data_bytes, Ordering::AcqRel);
+        self.data_items
+            .fetch_add(counts.data_items, Ordering::AcqRel);
         self.control_bytes
             .fetch_add(counts.control_bytes, Ordering::AcqRel);
         self.control_items
@@ -52,8 +54,10 @@ impl ResidentCounters {
     }
 
     fn remove(&self, counts: PendingCounts) {
-        self.data_bytes.fetch_sub(counts.data_bytes, Ordering::AcqRel);
-        self.data_items.fetch_sub(counts.data_items, Ordering::AcqRel);
+        self.data_bytes
+            .fetch_sub(counts.data_bytes, Ordering::AcqRel);
+        self.data_items
+            .fetch_sub(counts.data_items, Ordering::AcqRel);
         self.control_bytes
             .fetch_sub(counts.control_bytes, Ordering::AcqRel);
         self.control_items

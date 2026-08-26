@@ -139,8 +139,7 @@ impl WebSession {
             } else {
                 state.last_up_sequence = sequence;
                 state.last_up_digest = digest;
-                (committed, healthy) =
-                    self.record_uplink_progress_locked(&mut state, progress);
+                (committed, healthy) = self.record_uplink_progress_locked(&mut state, progress);
                 Ok((sequence, progress.any()))
             }
         };
@@ -532,7 +531,10 @@ mod tests {
         let session = session_with_automatic(true);
         let body = frame::encode(FrameType::Pong, 0, &[]);
 
-        assert_eq!(session.process_up(1, &body), Err(ManagerError::Backpressure));
+        assert_eq!(
+            session.process_up(1, &body),
+            Err(ManagerError::Backpressure)
+        );
         assert!(!session.is_carrier_committed());
         assert!(!session.state.lock().closed);
     }

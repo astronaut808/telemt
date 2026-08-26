@@ -152,12 +152,9 @@ pub(super) async fn handle_session(
         }
         Err(ManagerError::Committed) => {
             let mut response = carrier_empty(StatusCode::CONFLICT);
-            if let Some(echo) = runtime.carrier_echo(
-                token_hash,
-                &vhost.host,
-                client_ip,
-                carrier_request,
-            ) {
+            if let Some(echo) =
+                runtime.carrier_echo(token_hash, &vhost.host, client_ip, carrier_request)
+            {
                 response.headers_mut().insert(
                     HeaderName::from_static("x-carrier-mode"),
                     HeaderValue::from_static(echo.carrier.as_str()),

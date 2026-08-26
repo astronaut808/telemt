@@ -6,8 +6,7 @@ use bytes::BytesMut;
 
 use super::*;
 use crate::config::{
-    ProxyConfig, WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode,
-    WebTimeoutsConfig,
+    ProxyConfig, WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
 };
 use crate::maestro::generation::test_runtime_generation;
 use crate::web::manager::WebProcessRuntime;
@@ -187,7 +186,9 @@ fn lane_uplink_sequences_are_independent_and_exactly_once() {
     {
         let mut state = session.state.lock();
         for lane_id in [51, 52] {
-            state.carrier_lanes.insert(lane_id, CarrierLane::new(u64::from(lane_id)));
+            state
+                .carrier_lanes
+                .insert(lane_id, CarrierLane::new(u64::from(lane_id)));
             state.closed_streams.insert(lane_id);
         }
     }
@@ -274,11 +275,8 @@ fn tombstone_eviction_releases_lane_budget_and_accepts_late_frames() {
 
 #[test]
 fn automatic_lane_does_not_ack_a_missing_lane_without_real_progress() {
-    let session = new_session_with_automatic(
-        WebLimitsConfig::default(),
-        std::sync::Weak::new(),
-        true,
-    );
+    let session =
+        new_session_with_automatic(WebLimitsConfig::default(), std::sync::Weak::new(), true);
     let late = frame::encode(FrameType::Data, 7, b"late");
 
     assert_eq!(

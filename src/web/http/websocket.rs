@@ -389,21 +389,20 @@ fn parse_upgrade<B>(request: &Request<B>) -> Option<ParsedUpgrade> {
     {
         return None;
     }
-    let (token, carrier, acknowledge_commit) = if let Some(token) =
-        protocol.strip_prefix("tproxy-auto-v1.")
-    {
-        (token, ParsedCarrier::Multiplex, true)
-    } else if let Some(lane) = protocol.strip_prefix("tproxy-auto-lane-v1.") {
-        let (token, lane_id) = parse_lane_protocol(lane)?;
-        (token, ParsedCarrier::Lane(lane_id), true)
-    } else if let Some(token) = protocol.strip_prefix("tproxy-v1.") {
-        (token, ParsedCarrier::Multiplex, false)
-    } else if let Some(lane) = protocol.strip_prefix("tproxy-lane-v1.") {
-        let (token, lane_id) = parse_lane_protocol(lane)?;
-        (token, ParsedCarrier::Lane(lane_id), false)
-    } else {
-        return None;
-    };
+    let (token, carrier, acknowledge_commit) =
+        if let Some(token) = protocol.strip_prefix("tproxy-auto-v1.") {
+            (token, ParsedCarrier::Multiplex, true)
+        } else if let Some(lane) = protocol.strip_prefix("tproxy-auto-lane-v1.") {
+            let (token, lane_id) = parse_lane_protocol(lane)?;
+            (token, ParsedCarrier::Lane(lane_id), true)
+        } else if let Some(token) = protocol.strip_prefix("tproxy-v1.") {
+            (token, ParsedCarrier::Multiplex, false)
+        } else if let Some(lane) = protocol.strip_prefix("tproxy-lane-v1.") {
+            let (token, lane_id) = parse_lane_protocol(lane)?;
+            (token, ParsedCarrier::Lane(lane_id), false)
+        } else {
+            return None;
+        };
     let raw_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .ok()?;
@@ -441,10 +440,7 @@ fn parse_lane_protocol(value: &str) -> Option<(&str, u32)> {
     Some((token, lane_id))
 }
 
-fn single_header<B>(
-    request: &Request<B>,
-    name: impl hyper::header::AsHeaderName,
-) -> Option<&str> {
+fn single_header<B>(request: &Request<B>, name: impl hyper::header::AsHeaderName) -> Option<&str> {
     let mut values = request.headers().get_all(name).iter();
     let value = values.next()?.to_str().ok()?;
     values.next().is_none().then_some(value)

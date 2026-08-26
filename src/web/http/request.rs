@@ -15,9 +15,7 @@ const USER_AGENT_CONTEXT: &[u8] = b"telemt-web-carrier-user-agent-v1\0";
 
 // Canonical host and forwarded-address provenance remain isolated from credentials.
 mod identity;
-pub(super) use identity::{
-    canonical_request_host, carrier_ip_learning_eligible, client_ip,
-};
+pub(super) use identity::{canonical_request_host, carrier_ip_learning_eligible, client_ip};
 
 /// Decodes an exact canonical bridge query without allocating credential strings.
 pub(super) fn bridge_candidate(query: Option<&str>) -> ([u8; 32], bool) {
@@ -205,17 +203,13 @@ fn parse_capabilities(value: &str) -> Option<CarrierCapabilities> {
 }
 
 fn strict_browser_hint<B>(request: &Request<B>, host: &str) -> bool {
-    single_header(request, header::ORIGIN)
-        .is_some_and(|value| value == format!("https://{host}"))
+    single_header(request, header::ORIGIN).is_some_and(|value| value == format!("https://{host}"))
         && single_header(request, "sec-fetch-site") == Some("same-origin")
         && single_header(request, "sec-fetch-mode") == Some("cors")
         && single_header(request, "sec-fetch-dest") == Some("empty")
 }
 
-fn optional_canonical_u8_header<B>(
-    request: &Request<B>,
-    name: &'static str,
-) -> Option<Option<u8>> {
+fn optional_canonical_u8_header<B>(request: &Request<B>, name: &'static str) -> Option<Option<u8>> {
     if !request.headers().contains_key(name) {
         return Some(None);
     }
@@ -452,9 +446,11 @@ mod tests {
             .header(header::USER_AGENT, "Native")
             .body(())
             .unwrap();
-        assert!(!carrier_request(&legacy, "proxy.example.com")
-            .unwrap()
-            .is_automatic());
+        assert!(
+            !carrier_request(&legacy, "proxy.example.com")
+                .unwrap()
+                .is_automatic()
+        );
 
         let reordered = Request::builder()
             .header("x-carrier-capabilities", "websocket,https")
@@ -479,10 +475,7 @@ mod tests {
         assert!(!parsed.uses_capabilities());
 
         let automatic = Request::builder()
-            .header(
-                "x-carrier-capabilities",
-                "https,https-lanes",
-            )
+            .header("x-carrier-capabilities", "https,https-lanes")
             .header("x-carrier-attempt", "1")
             .header(
                 header::USER_AGENT,

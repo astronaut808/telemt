@@ -138,12 +138,7 @@ impl WebSession {
         if let Some(batch) = state.unacked.take() {
             batch.lease.detach();
             self.release_local_locked(&mut state, batch.data_bytes, batch.data_items, false);
-            self.release_local_locked(
-                &mut state,
-                batch.control_bytes,
-                batch.control_items,
-                true,
-            );
+            self.release_local_locked(&mut state, batch.control_bytes, batch.control_items, true);
         }
         let mut lane_data_bytes = 0usize;
         let mut lane_data_items = 0usize;
@@ -160,12 +155,7 @@ impl WebSession {
             }
         }
         self.release_local_locked(&mut state, lane_data_bytes, lane_data_items, false);
-        self.release_local_locked(
-            &mut state,
-            lane_control_bytes,
-            lane_control_items,
-            true,
-        );
+        self.release_local_locked(&mut state, lane_control_bytes, lane_control_items, true);
         state.carrier_lanes.clear();
         let control_bytes = state.pending_control_bytes;
         let control_items = state.pending_control_items;

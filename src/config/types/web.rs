@@ -234,8 +234,7 @@ impl Default for WebLimitsConfig {
             websocket_admission_watermark_pct: default_web_websocket_admission_watermark_pct(),
             websocket_eviction_watermark_pct: default_web_websocket_eviction_watermark_pct(),
             websocket_http_connection_reserve: default_web_websocket_http_connection_reserve(),
-            max_websocket_evictions_in_flight:
-                default_web_max_websocket_evictions_in_flight(),
+            max_websocket_evictions_in_flight: default_web_max_websocket_evictions_in_flight(),
             max_carrier_learning_entries: default_web_max_carrier_learning_entries(),
             max_body_readers: default_web_max_body_readers(),
             max_body_bytes_global: default_web_max_body_bytes_global(),
@@ -348,8 +347,7 @@ impl Default for WebTimeoutsConfig {
             websocket_write_secs: default_web_websocket_write_secs(),
             websocket_backpressure_secs: default_web_websocket_backpressure_secs(),
             websocket_eviction_secs: default_web_websocket_eviction_secs(),
-            carrier_negotiation_deadlines_secs:
-                default_web_carrier_negotiation_deadlines_secs(),
+            carrier_negotiation_deadlines_secs: default_web_carrier_negotiation_deadlines_secs(),
             carrier_learning_secs: default_web_carrier_learning_secs(),
             bootstrap_lifetime_secs: default_web_bootstrap_lifetime_secs(),
             reconnect_grace_secs: default_web_reconnect_grace_secs(),
@@ -436,8 +434,7 @@ impl Default for WebConfig {
             carrier: WebCarrier::default(),
             carriers: WebCarriers::default(),
             carrier_learning: default_web_carrier_learning(),
-            carrier_negotiation_aggressiveness:
-                WebCarrierNegotiationAggressiveness::default(),
+            carrier_negotiation_aggressiveness: WebCarrierNegotiationAggressiveness::default(),
             limits: WebLimitsConfig::default(),
             debug: WebDebugConfig::default(),
             timeouts: WebTimeoutsConfig::default(),

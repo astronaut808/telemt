@@ -43,9 +43,7 @@ pub(super) fn validate(timeouts: &WebTimeoutsConfig) -> Result<()> {
         return config_error("web.timeouts.websocket_open_secs must be within [1, 300]");
     }
     if timeouts.lane_open_wait_secs > timeouts.long_poll_secs {
-        return config_error(
-            "web.timeouts.lane_open_wait_secs must not exceed long_poll_secs",
-        );
+        return config_error("web.timeouts.lane_open_wait_secs must not exceed long_poll_secs");
     }
     if timeouts.carrier_health_secs > timeouts.reconnect_grace_secs {
         return config_error(

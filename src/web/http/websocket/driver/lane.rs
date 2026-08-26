@@ -7,9 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::CarrierSocket;
 use super::io::{flush, process_lane, read_message, record_message, reserve_data, send};
-use crate::web::manager::{
-    WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection,
-};
+use crate::web::manager::{WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection};
 use crate::web::session::{WebSession, WebSocketLaneReservation};
 use crate::web::trace::{TraceDirection, TraceWebSocketContext};
 
@@ -32,8 +30,7 @@ pub(super) async fn run_lane(
     let mut next_ping = Instant::now() + liveness_interval;
     let open_deadline =
         Instant::now() + Duration::from_secs(session.timeouts().websocket_open_secs);
-    let backpressure_timeout =
-        Duration::from_secs(session.timeouts().websocket_backpressure_secs);
+    let backpressure_timeout = Duration::from_secs(session.timeouts().websocket_backpressure_secs);
     let write_timeout = Duration::from_secs(session.timeouts().websocket_write_secs);
     let maximum_message = session.limits().carrier_batch_bytes;
     let mut active = false;
@@ -232,13 +229,7 @@ pub(super) async fn run_lane(
                             started,
                         );
                     } else {
-                        send(
-                            socket,
-                            Message::Binary(body),
-                            &cancellation,
-                            write_timeout,
-                        )
-                        .await?;
+                        send(socket, Message::Binary(body), &cancellation, write_timeout).await?;
                     }
                     connection.mark_progress();
                 }

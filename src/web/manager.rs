@@ -39,10 +39,10 @@ mod budget;
 mod websocket;
 pub(crate) use budget::WebSocketBudgetLease;
 use budget::{WebDataBudget, WebSocketBudgetClass};
-use state::{ManagerState, StreamAdmissionState};
 pub(crate) use negotiation::{
     CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierLearningContext, CarrierRequest,
 };
+use state::{ManagerState, StreamAdmissionState};
 pub(crate) use websocket::{WebSocketConnection, WebSocketKind};
 
 const TOKEN_BYTES: usize = 32;
@@ -327,10 +327,7 @@ impl WebProcessRuntime {
     }
 
     /// Reserves transient bytes while one downlink batch replaces queued frames.
-    pub(crate) fn try_downlink_staging_budget(
-        &self,
-        bytes: usize,
-    ) -> Option<OwnedSemaphorePermit> {
+    pub(crate) fn try_downlink_staging_budget(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let bytes = u32::try_from(bytes).ok()?;
         let permit = Arc::clone(&self.body_bytes)
             .try_acquire_many_owned(bytes)

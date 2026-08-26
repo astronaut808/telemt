@@ -273,8 +273,7 @@ impl WebSession {
             }
             state.last_activity = Instant::now();
             if applied {
-                (committed, healthy) =
-                    self.record_uplink_progress_locked(&mut state, progress);
+                (committed, healthy) = self.record_uplink_progress_locked(&mut state, progress);
             }
             applied
                 .then_some(progress.any())

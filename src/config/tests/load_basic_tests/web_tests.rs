@@ -50,7 +50,10 @@ fn web_config_builds_canonical_runtime_snapshot() {
     assert_eq!(vhost.profiles[0].key_fingerprint.len(), 16);
     assert_ne!(vhost.profiles[0].key_fingerprint, "0001020304050607");
     assert!(!vhost.profiles[0].carrier_negotiation_enabled);
-    assert_eq!(vhost.profiles[0].carriers.as_ref(), [WebCarrier::HttpsLanes]);
+    assert_eq!(
+        vhost.profiles[0].carriers.as_ref(),
+        [WebCarrier::HttpsLanes]
+    );
 }
 
 #[test]
@@ -95,11 +98,7 @@ fn web_carrier_array_enables_ordered_negotiation_and_appends_fallback() {
 
 #[test]
 fn web_carriers_reject_true_empty_and_duplicates() {
-    for value in [
-        "true",
-        "[]",
-        "[\"https\", \"https\"]",
-    ] {
+    for value in ["true", "[]", "[\"https\", \"https\"]"] {
         let invalid = WEB_CONFIG.replace(
             "carrier = \"https-lanes\"",
             &format!("carrier = \"https-lanes\"\ncarriers = {value}"),

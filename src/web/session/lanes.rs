@@ -119,8 +119,7 @@ impl WebSession {
                         return Err(ManagerError::Closed);
                     }
                     let carrier_health_eligible = lane_id != 0
-                        && state.negotiation_phase
-                            == super::SessionNegotiationPhase::Committed;
+                        && state.negotiation_phase == super::SessionNegotiationPhase::Committed;
                     let Some(lane) = state.carrier_lanes.get_mut(&lane_id) else {
                         return Ok(PollResult {
                             body: Bytes::new(),
@@ -231,11 +230,7 @@ impl WebSession {
         }
     }
 
-    async fn wait_for_lane_open(
-        &self,
-        lane_id: u32,
-        cursor: u64,
-    ) -> Result<bool, ManagerError> {
+    async fn wait_for_lane_open(&self, lane_id: u32, cursor: u64) -> Result<bool, ManagerError> {
         let wait = {
             let mut state = self.state.lock();
             if state.closed {
@@ -355,10 +350,10 @@ impl WebSession {
                 let resident = lane.resident.snapshot();
                 payload.len() > self.limits.pending_bytes_per_lane
                     || lane.pending_bytes.saturating_add(resident.data_bytes)
-                    > self
-                        .limits
-                        .pending_bytes_per_lane
-                        .saturating_sub(payload.len())
+                        > self
+                            .limits
+                            .pending_bytes_per_lane
+                            .saturating_sub(payload.len())
             }) {
                 return false;
             }

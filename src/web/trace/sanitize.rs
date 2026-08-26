@@ -49,7 +49,7 @@ pub(super) fn response_dynamic_bytes<B>(
     } else {
         0
     }
-        .saturating_add(sensitive_value_bytes(response.headers(), None))
+    .saturating_add(sensitive_value_bytes(response.headers(), None))
 }
 
 /// Copies header names and only allowlisted bounded values.

@@ -356,11 +356,7 @@ async fn handle_up(
         }
     };
     if let Some(trace) = request_trace(&request) {
-        trace.record_frames(
-            TraceDirection::Request,
-            &body,
-            session.limits(),
-        );
+        trace.record_frames(TraceDirection::Request, &body, session.limits());
     }
     let result = match lane_id {
         Some(lane_id) => session.process_up_lane(lane_id, sequence, &body),

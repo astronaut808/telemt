@@ -93,9 +93,8 @@ impl WebSession {
         let now = Instant::now();
         let committed = if state.negotiation_phase == SessionNegotiationPhase::Uncommitted {
             state.negotiation_phase = SessionNegotiationPhase::Committed;
-            state.carrier_health_due_at = Some(
-                now + Duration::from_secs(self.timeouts.carrier_health_secs),
-            );
+            state.carrier_health_due_at =
+                Some(now + Duration::from_secs(self.timeouts.carrier_health_secs));
             true
         } else {
             false

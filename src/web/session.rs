@@ -482,7 +482,6 @@ impl WebSession {
             .upgrade()
             .map(|manager| manager.budget_notify())
     }
-
 }
 
 fn inbound_queue_cost(queue: &VecDeque<InboundChunk>) -> (usize, usize) {

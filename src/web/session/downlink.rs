@@ -156,10 +156,8 @@ impl WebSession {
         let fits = if control {
             bytes <= self.limits.control_bytes_per_session
                 && items <= item_reserve
-                && pending_bytes
-                    <= self.limits.pending_bytes_per_session.saturating_sub(bytes)
-                && pending_items
-                    <= self.limits.pending_items_per_session.saturating_sub(items)
+                && pending_bytes <= self.limits.pending_bytes_per_session.saturating_sub(bytes)
+                && pending_items <= self.limits.pending_items_per_session.saturating_sub(items)
                 && pending_control_bytes
                     <= self.limits.control_bytes_per_session.saturating_sub(bytes)
                 && pending_control_items <= item_reserve.saturating_sub(items)

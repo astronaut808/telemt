@@ -56,8 +56,7 @@ impl WebSession {
                     && only_late_frames(&frames)
                 {
                     return if self.automatic_carrier
-                        && state.negotiation_phase
-                            != super::SessionNegotiationPhase::Committed
+                        && state.negotiation_phase != super::SessionNegotiationPhase::Committed
                     {
                         Err(ManagerError::Backpressure)
                     } else {
@@ -154,8 +153,7 @@ impl WebSession {
                 }
             }
             if applied {
-                (committed, healthy) =
-                    self.record_uplink_progress_locked(&mut state, progress);
+                (committed, healthy) = self.record_uplink_progress_locked(&mut state, progress);
             }
             applied.then_some(sequence).ok_or(ManagerError::Closed)
         };

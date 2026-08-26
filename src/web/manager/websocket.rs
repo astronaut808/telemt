@@ -357,9 +357,7 @@ fn select_victim(
     let requester_usage = runtime.data_budget.owner_usage(owner);
     let now = runtime.websocket_tick();
     let mut registry = runtime.websockets.lock();
-    if claim
-        && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight
-    {
+    if claim && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight {
         return None;
     }
     let selected = registry
@@ -408,9 +406,7 @@ fn select_pressure_victim(
     claim: bool,
 ) -> Option<Arc<WebSocketEntry>> {
     let mut registry = runtime.websockets.lock();
-    if claim
-        && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight
-    {
+    if claim && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight {
         return None;
     }
     let selected = registry
@@ -447,8 +443,7 @@ fn claim_stale_victims(runtime: &WebProcessRuntime, now: u64) -> Vec<Arc<WebSock
         .values()
         .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .filter(|entry| {
-            now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire))
-                >= dead_after(entry)
+            now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire)) >= dead_after(entry)
         })
         .take(available)
         .cloned()

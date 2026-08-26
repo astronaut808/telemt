@@ -24,16 +24,8 @@ pub(super) async fn read_message(
         ready = socket.get_ref().readable() => ready.map_err(|_| ())?,
     }
     if retained_budget.is_none() {
-        *retained_budget = Some(
-            reserve_data(
-                runtime,
-                owner,
-                maximum,
-                cancellation,
-                backpressure_timeout,
-            )
-            .await?,
-        );
+        *retained_budget =
+            Some(reserve_data(runtime, owner, maximum, cancellation, backpressure_timeout).await?);
     }
     let message = tokio::select! {
         _ = cancellation.cancelled() => return Err(()),

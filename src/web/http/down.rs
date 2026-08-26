@@ -89,11 +89,7 @@ pub(super) async fn handle_down(
         }
         Ok(result) => {
             if let Some(trace) = request_trace(&request) {
-                trace.record_frames(
-                    TraceDirection::Response,
-                    &result.body,
-                    session.limits(),
-                );
+                trace.record_frames(TraceDirection::Response, &result.body, session.limits());
             }
             let mut response = full_response(StatusCode::OK, result.body);
             carrier_headers(&mut response);

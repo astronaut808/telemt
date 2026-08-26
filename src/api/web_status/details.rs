@@ -85,10 +85,7 @@ pub(super) fn push_body(
     html.push_str("</pre>");
 }
 
-pub(super) fn push_lifecycle(
-    html: &mut String,
-    event: &crate::web::trace::TraceLifecycleRecord,
-) {
+pub(super) fn push_lifecycle(html: &mut String, event: &crate::web::trace::TraceLifecycleRecord) {
     html.push_str("<pre>event: ");
     html.push_str(event.event.as_str());
     html.push_str("\nstream: ");

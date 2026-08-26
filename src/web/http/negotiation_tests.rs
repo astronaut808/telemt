@@ -130,13 +130,7 @@ async fn metadata_free_native_client_can_use_each_fixed_carrier() {
         let response = request(
             &listener,
             &runtime,
-            create_request_with_headers(
-                &bootstrap,
-                &hello,
-                None,
-                None,
-                NATIVE_USER_AGENT_HEADER,
-            ),
+            create_request_with_headers(&bootstrap, &hello, None, None, NATIVE_USER_AGENT_HEADER),
         )
         .await;
         let (headers, _) = split_response(&response);
@@ -170,13 +164,7 @@ async fn metadata_free_native_client_uses_fallback_when_candidates_are_enabled()
     let response = request(
         &listener,
         &runtime,
-        create_request_with_headers(
-            &bootstrap,
-            &hello,
-            None,
-            None,
-            NATIVE_USER_AGENT_HEADER,
-        ),
+        create_request_with_headers(&bootstrap, &hello, None, None, NATIVE_USER_AGENT_HEADER),
     )
     .await;
     let (headers, _) = split_response(&response);
@@ -209,13 +197,7 @@ async fn explicit_native_capabilities_participate_in_automatic_selection() {
     let response = request(
         &listener,
         &runtime,
-        create_request_with_headers(
-            &bootstrap,
-            &hello,
-            Some(1),
-            None,
-            NATIVE_USER_AGENT_HEADER,
-        ),
+        create_request_with_headers(&bootstrap, &hello, Some(1), None, NATIVE_USER_AGENT_HEADER),
     )
     .await;
     let (headers, _) = split_response(&response);
@@ -261,9 +243,18 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
 
     let replay = request(&listener, &runtime, first_request).await;
     let (replay_headers, _) = split_response(&replay);
-    assert_eq!(response_header(replay_headers, "x-session-token"), first_token);
-    assert_eq!(response_header(replay_headers, "x-carrier-candidate-count"), "3");
-    assert_eq!(response_header(replay_headers, "x-carrier-state"), "provisional");
+    assert_eq!(
+        response_header(replay_headers, "x-session-token"),
+        first_token
+    );
+    assert_eq!(
+        response_header(replay_headers, "x-carrier-candidate-count"),
+        "3"
+    );
+    assert_eq!(
+        response_header(replay_headers, "x-carrier-state"),
+        "provisional"
+    );
 
     let second_request = create_request(&bootstrap, &hello, Some(2), Some("timeout"));
     let second = request(&listener, &runtime, second_request.clone()).await;
@@ -346,11 +337,20 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
     let (third_headers, _) = split_response(&third);
     assert!(third_headers.starts_with(b"HTTP/1.1 409"));
     assert!(optional_response_header(third_headers, "x-session-token").is_none());
-    assert_eq!(response_header(third_headers, "x-carrier-mode"), "https-lanes");
+    assert_eq!(
+        response_header(third_headers, "x-carrier-mode"),
+        "https-lanes"
+    );
     assert_eq!(response_header(third_headers, "x-carrier-attempt"), "2");
-    assert_eq!(response_header(third_headers, "x-carrier-candidate-count"), "3");
+    assert_eq!(
+        response_header(third_headers, "x-carrier-candidate-count"),
+        "3"
+    );
     assert_eq!(response_header(third_headers, "x-carrier-deadline"), "12");
-    assert_eq!(response_header(third_headers, "x-carrier-state"), "committed");
+    assert_eq!(
+        response_header(third_headers, "x-carrier-state"),
+        "committed"
+    );
     assert!(
         runtime
             .get_session(token_hash(&second_token), "proxy.example.com")
@@ -397,7 +397,10 @@ async fn timed_out_attempt_replays_before_successor_own_deadline() {
         response_header(replay_headers, "x-session-token"),
         first_token
     );
-    assert_eq!(response_header(replay_headers, "x-carrier-state"), "provisional");
+    assert_eq!(
+        response_header(replay_headers, "x-carrier-state"),
+        "provisional"
+    );
 
     let second = request(
         &listener,
@@ -453,9 +456,8 @@ async fn https_lane_downlink_can_arrive_before_its_uplink_open() {
     .into_bytes();
     let down_listener = Arc::clone(&listener);
     let down_runtime = Arc::clone(&runtime);
-    let down = tokio::spawn(async move {
-        request(&down_listener, &down_runtime, down_request).await
-    });
+    let down =
+        tokio::spawn(async move { request(&down_listener, &down_runtime, down_request).await });
     tokio::task::yield_now().await;
 
     let open = frame::encode(FrameType::Open, 7, &[]);
@@ -477,10 +479,7 @@ async fn https_lane_downlink_can_arrive_before_its_uplink_open() {
         .unwrap()
         .unwrap();
     let (down_headers, _) = split_response(&down);
-    assert!(
-        down_headers.starts_with(b"HTTP/1.1 200")
-            || down_headers.starts_with(b"HTTP/1.1 204")
-    );
+    assert!(down_headers.starts_with(b"HTTP/1.1 200") || down_headers.starts_with(b"HTTP/1.1 204"));
     assert!(optional_response_header(down_headers, "x-down-cursor").is_some());
 
     runtime.shutdown().await;

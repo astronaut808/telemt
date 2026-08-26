@@ -7,14 +7,15 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use super::negotiation::carrier_attempt_deadline_index;
+use super::session_admission::admit_initial;
 use super::state::{
     CarrierChainPhase, decrement_map, matching_profile, new_unique_token, profile_key,
     remember_closed_token_locked, remove_expired_locked,
 };
-use super::negotiation::carrier_attempt_deadline_index;
-use super::session_admission::admit_initial;
 use super::{
-    CarrierLearningContext, CarrierRequest, CreateResult, ManagerError, TokenHash, WebProcessRuntime,
+    CarrierLearningContext, CarrierRequest, CreateResult, ManagerError, TokenHash,
+    WebProcessRuntime,
 };
 use crate::config::{WebCarrier, WebRuntimeProfile};
 use crate::web::frame;
@@ -62,7 +63,9 @@ impl WebProcessRuntime {
             return Err(ManagerError::Authentication);
         }
         if entry.used {
-            if entry.carrier_deadline_at.is_some_and(|deadline| now >= deadline)
+            if entry
+                .carrier_deadline_at
+                .is_some_and(|deadline| now >= deadline)
                 && entry
                     .session
                     .as_ref()
@@ -112,9 +115,8 @@ impl WebProcessRuntime {
                     token: entry.session_token.as_str().to_owned(),
                     carrier: session.carrier(),
                     attempt: carrier_request.attempt(),
-                    candidate_count: automatic.then(|| {
-                        u8::try_from(entry.carrier_candidates.len()).unwrap_or(4)
-                    }),
+                    candidate_count: automatic
+                        .then(|| u8::try_from(entry.carrier_candidates.len()).unwrap_or(4)),
                     deadline_secs: automatic
                         .then_some(entry.profile.carrier_negotiation_deadlines_secs[3]),
                     carrier_state: automatic.then_some(carrier_state),
@@ -139,14 +141,16 @@ impl WebProcessRuntime {
                     CarrierChainPhase::CommittedPendingHealth | CarrierChainPhase::Healthy
                 )
             {
-                return Err(if matches!(
-                    entry.carrier_phase,
-                    CarrierChainPhase::CommittedPendingHealth | CarrierChainPhase::Healthy
-                ) {
-                    ManagerError::Committed
-                } else {
-                    ManagerError::Protocol
-                });
+                return Err(
+                    if matches!(
+                        entry.carrier_phase,
+                        CarrierChainPhase::CommittedPendingHealth | CarrierChainPhase::Healthy
+                    ) {
+                        ManagerError::Committed
+                    } else {
+                        ManagerError::Protocol
+                    },
+                );
             }
             let Some(carrier) = entry
                 .carrier_candidates
@@ -155,8 +159,8 @@ impl WebProcessRuntime {
             else {
                 return Err(ManagerError::Protocol);
             };
-            let candidate_count = u8::try_from(entry.carrier_candidates.len())
-                .map_err(|_| ManagerError::Protocol)?;
+            let candidate_count =
+                u8::try_from(entry.carrier_candidates.len()).map_err(|_| ManagerError::Protocol)?;
             let deadline_index = carrier_attempt_deadline_index(candidate_count, next_attempt)
                 .ok_or(ManagerError::Protocol)?;
             if entry.carrier_started_at.is_some_and(|started| {
@@ -211,8 +215,8 @@ impl WebProcessRuntime {
         if carrier_request.is_automatic() && !profile.carrier_negotiation_enabled {
             return Err(ManagerError::Protocol);
         }
-        let capability_selection = carrier_request.uses_capabilities()
-            && profile.carrier_negotiation_enabled;
+        let capability_selection =
+            carrier_request.uses_capabilities() && profile.carrier_negotiation_enabled;
         let learning_policy = (
             config.web.carrier_negotiation_enabled() && config.web.carrier_learning,
             config.web.carrier_negotiation_aggressiveness,
@@ -222,11 +226,9 @@ impl WebProcessRuntime {
             && profile.carrier_learning
         {
             let learning = self.learning.lock();
-            if let Some(epoch) = learning.epoch_for_policy(
-                learning_policy.0,
-                learning_policy.1,
-                learning_policy.2,
-            ) {
+            if let Some(epoch) =
+                learning.epoch_for_policy(learning_policy.0, learning_policy.1, learning_policy.2)
+            {
                 let (candidates, scores) = learning.rank(
                     now,
                     &profile.carriers,
@@ -259,8 +261,7 @@ impl WebProcessRuntime {
                 [0; 4],
                 None,
             )
-        } else if carrier_request.uses_capabilities()
-            && !carrier_request.supports(profile.carrier)
+        } else if carrier_request.uses_capabilities() && !carrier_request.supports(profile.carrier)
         {
             return Err(ManagerError::Protocol);
         } else {
@@ -276,9 +277,9 @@ impl WebProcessRuntime {
             self.limit_hits.fetch_add(1, Ordering::Relaxed);
             return Err(ManagerError::Limit);
         };
-        let carrier_deadline_at = carrier_request.is_automatic().then_some(
-            now + Duration::from_secs(profile.carrier_negotiation_deadlines_secs[3]),
-        );
+        let carrier_deadline_at = carrier_request
+            .is_automatic()
+            .then_some(now + Duration::from_secs(profile.carrier_negotiation_deadlines_secs[3]));
         let learning_context = learning_epoch.map(|epoch| CarrierLearningContext {
             profile_key,
             client_ip,
@@ -336,9 +337,7 @@ impl WebProcessRuntime {
             token: session_token,
             carrier,
             attempt: carrier_request.attempt(),
-            candidate_count: carrier_request
-                .is_automatic()
-                .then_some(candidate_count),
+            candidate_count: carrier_request.is_automatic().then_some(candidate_count),
             deadline_secs: carrier_request
                 .is_automatic()
                 .then_some(profile.carrier_negotiation_deadlines_secs[3]),
@@ -494,9 +493,7 @@ impl WebProcessRuntime {
             token: session_token,
             carrier: replacement.carrier,
             attempt: Some(replacement.attempt),
-            candidate_count: Some(
-                u8::try_from(entry.carrier_candidates.len()).unwrap_or(4),
-            ),
+            candidate_count: Some(u8::try_from(entry.carrier_candidates.len()).unwrap_or(4)),
             deadline_secs: Some(entry.profile.carrier_negotiation_deadlines_secs[3]),
             carrier_state: Some(CarrierChainPhase::Provisional.as_str()),
         };
@@ -512,7 +509,10 @@ impl WebProcessRuntime {
             replacement.old_session.carrier(),
             replacement.attempt - 1,
             replacement.scores,
-            replacement.request.failure().map(|failure| failure.as_str()),
+            replacement
+                .request
+                .failure()
+                .map(|failure| failure.as_str()),
         );
         self.trace.record_carrier_lifecycle(
             client_ip,
@@ -522,7 +522,10 @@ impl WebProcessRuntime {
             replacement.old_session.carrier(),
             replacement.attempt - 1,
             replacement.scores,
-            replacement.request.failure().map(|failure| failure.as_str()),
+            replacement
+                .request
+                .failure()
+                .map(|failure| failure.as_str()),
         );
         self.trace.record_carrier_lifecycle(
             client_ip,
@@ -540,7 +543,10 @@ impl WebProcessRuntime {
             identity,
             TraceLifecycleEvent::SessionCreated,
             None,
-            replacement.request.failure().map(|failure| failure.as_str()),
+            replacement
+                .request
+                .failure()
+                .map(|failure| failure.as_str()),
         );
         Ok(result)
     }

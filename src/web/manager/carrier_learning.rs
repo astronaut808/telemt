@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use super::negotiation::{CarrierClientClass, CarrierLearningContext};
 use super::ProfileKey;
+use super::negotiation::{CarrierClientClass, CarrierLearningContext};
 use crate::config::{WebCarrier, WebCarrierNegotiationAggressiveness};
 
 const PROFILE_WEIGHT: i16 = 32;
@@ -85,9 +85,7 @@ impl Evidence {
             }
             aggregate.outcomes = aggregate.outcomes.saturating_add(bucket.outcomes);
             for (score, value) in aggregate.scores.iter_mut().zip(bucket.scores) {
-                *score = score
-                    .saturating_add(value)
-                    .clamp(SCORE_MIN, SCORE_MAX);
+                *score = score.saturating_add(value).clamp(SCORE_MIN, SCORE_MAX);
             }
             for cohort in bucket.cohorts.iter().flatten() {
                 if !aggregate.cohorts.contains(&Some(*cohort))
@@ -262,10 +260,9 @@ impl CarrierLearning {
         let user_agent_ready = user_agent
             .as_ref()
             .is_some_and(|entry| entry.outcomes >= thresholds.user_agent);
-        let ip_ready = thresholds.ip.is_some_and(|minimum| {
-            ip.as_ref()
-                .is_some_and(|entry| entry.outcomes >= minimum)
-        });
+        let ip_ready = thresholds
+            .ip
+            .is_some_and(|minimum| ip.as_ref().is_some_and(|entry| entry.outcomes >= minimum));
         let mut scores = [0i16; 4];
         for carrier in WebCarrier::ALL {
             let index = carrier.index();
@@ -274,11 +271,9 @@ impl CarrierLearning {
                     * PROFILE_WEIGHT;
             }
             if user_agent_ready {
-                scores[index] += i16::from(
-                    user_agent
-                        .as_ref()
-                        .map_or(0, |value| value.scores[index]),
-                ) * USER_AGENT_WEIGHT;
+                scores[index] +=
+                    i16::from(user_agent.as_ref().map_or(0, |value| value.scores[index]))
+                        * USER_AGENT_WEIGHT;
             }
             if ip_ready {
                 scores[index] +=
@@ -362,7 +357,11 @@ impl CarrierLearning {
             if !current {
                 continue;
             }
-            if self.entries.get(&key).is_some_and(|entry| entry.is_live(slot)) {
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.is_live(slot))
+            {
                 self.insertion_order.push_back((key, sequence));
             } else {
                 self.entries.remove(&key);
@@ -411,8 +410,7 @@ impl CarrierLearning {
         let Some(insertion_sequence) = self.next_insertion_sequence() else {
             return;
         };
-        self.entries
-            .insert(key, Evidence::new(insertion_sequence));
+        self.entries.insert(key, Evidence::new(insertion_sequence));
         self.insertion_order.push_back((key, insertion_sequence));
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.update(slot, deltas, cohort);

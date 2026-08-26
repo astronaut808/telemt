@@ -56,12 +56,12 @@ pub use web::{
     WebCarrierNegotiationAggressiveness, WebConfig, WebDecoyConfig, WebLimitsConfig,
     WebProfileConfig, WebSecretMode, WebTimeoutsConfig, WebVhostConfig,
 };
-#[allow(unused_imports)]
-pub use web_carrier::{WebCarrier, WebCarriers};
 pub(crate) use web::{
     WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile, WebRuntimeVhost, WebStaticAsset,
     WebStaticSite,
 };
+#[allow(unused_imports)]
+pub use web_carrier::{WebCarrier, WebCarriers};
 pub(crate) use web_debug::web_debug_fits_limits;
 pub use web_debug::{WebDebugBodyCapture, WebDebugConfig};
 

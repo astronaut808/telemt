@@ -452,8 +452,7 @@ async fn failed_automatic_multiplex_socket_remains_supersedable() {
         Arc::from([WebCarrier::Websocket, WebCarrier::Https]),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (bootstrap_hash, hello, session, session_hash) =
-        create_automatic_session(&live.runtime);
+    let (bootstrap_hash, hello, session, session_hash) = create_automatic_session(&live.runtime);
     let protocol = format!("tproxy-auto-v1.{session}");
     let mut socket = upgrade(&listener, &live.runtime, &protocol).await;
     socket.close(None).await.unwrap();

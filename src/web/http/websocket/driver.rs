@@ -8,12 +8,8 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::ConnectionIo;
-use crate::web::manager::{
-    WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection,
-};
-use crate::web::session::{
-    WebSession, WebSocketLaneReservation, WebSocketProbeReservation,
-};
+use crate::web::manager::{WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection};
+use crate::web::session::{WebSession, WebSocketLaneReservation, WebSocketProbeReservation};
 use crate::web::trace::{TraceDirection, TraceWebSocketContext};
 
 const READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -126,8 +122,7 @@ async fn run_multiplex(
     let mut next_ping = Instant::now() + liveness_interval;
     let open_deadline =
         Instant::now() + Duration::from_secs(session.timeouts().websocket_open_secs);
-    let backpressure_timeout =
-        Duration::from_secs(session.timeouts().websocket_backpressure_secs);
+    let backpressure_timeout = Duration::from_secs(session.timeouts().websocket_backpressure_secs);
     let write_timeout = Duration::from_secs(session.timeouts().websocket_write_secs);
     let maximum_message = session.limits().carrier_batch_bytes;
     let mut active = false;
@@ -317,13 +312,7 @@ async fn run_multiplex(
                             started,
                         );
                     } else {
-                        send(
-                            socket,
-                            Message::Binary(body),
-                            &cancellation,
-                            write_timeout,
-                        )
-                        .await?;
+                        send(socket, Message::Binary(body), &cancellation, write_timeout).await?;
                     }
                     connection.mark_progress();
                 }

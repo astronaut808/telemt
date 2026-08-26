@@ -5,8 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::config::{
-    ProxyConfig, WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode,
-    WebTimeoutsConfig,
+    ProxyConfig, WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
 };
 use crate::maestro::generation::test_runtime_generation;
 use crate::web::manager::WebProcessRuntime;
