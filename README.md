@@ -7,6 +7,7 @@
 > [!NOTE]
 >
 > From August 22nd, 2026: we're drafting MTProxy WEB Implementation in Telemt!
+> 
 > It uses WebView on your device to create a datachannel!
 
 <p align="center">
