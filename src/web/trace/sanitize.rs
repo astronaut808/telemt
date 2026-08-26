@@ -28,12 +28,11 @@ pub(super) fn request_dynamic_bytes<B>(
                     lossy_text_reservation(value.as_bytes(), USER_AGENT_MAX_BYTES)
                 }),
         )
-        .saturating_add(
-            policy
-                .capture_headers
-                .then(|| sanitized_header_bytes(request.headers()))
-                .unwrap_or(0),
-        )
+        .saturating_add(if policy.capture_headers {
+            sanitized_header_bytes(request.headers())
+        } else {
+            0
+        })
         .saturating_add(sensitive_value_bytes(
             request.headers(),
             request.uri().query(),
@@ -45,11 +44,12 @@ pub(super) fn response_dynamic_bytes<B>(
     response: &hyper::Response<B>,
     policy: &WebDebugConfig,
 ) -> usize {
-    policy
-        .capture_headers
-        .then(|| sanitized_header_bytes(response.headers()))
-        .unwrap_or(0)
-        .saturating_add(sensitive_value_bytes(response.headers(), None))
+    if policy.capture_headers {
+        sanitized_header_bytes(response.headers())
+    } else {
+        0
+    }
+    .saturating_add(sensitive_value_bytes(response.headers(), None))
 }
 
 /// Copies header names and only allowlisted bounded values.
@@ -173,11 +173,11 @@ fn sanitized_header_bytes(headers: &hyper::HeaderMap) -> usize {
         total
             .saturating_add(std::mem::size_of::<TraceHeader>())
             .saturating_add(name.as_str().len())
-            .saturating_add(
-                header_value_allowed(name)
-                    .then(|| lossy_text_reservation(value.as_bytes(), 4096))
-                    .unwrap_or(0),
-            )
+            .saturating_add(if header_value_allowed(name) {
+                lossy_text_reservation(value.as_bytes(), 4096)
+            } else {
+                0
+            })
     })
 }
 
@@ -195,6 +195,8 @@ fn header_value_allowed(name: &hyper::header::HeaderName) -> bool {
             | "x-down-cursor"
             | "x-lane-id"
             | "x-lane-closed"
+            | "x-carrier-attempt"
+            | "x-carrier-failure"
             | "x-carrier-mode"
             | "retry-after"
             | "cache-control"
@@ -273,9 +275,11 @@ mod tests {
 
     #[test]
     fn full_capture_keeps_decoy_bodies_prefix_bounded() {
-        let mut policy = WebDebugConfig::default();
-        policy.body_capture = WebDebugBodyCapture::Full;
-        policy.decoy_body_prefix_bytes = 123;
+        let policy = WebDebugConfig {
+            body_capture: WebDebugBodyCapture::Full,
+            decoy_body_prefix_bytes: 123,
+            ..Default::default()
+        };
         assert_eq!(capture_limit(&policy, TraceRoute::Decoy, 4096), Some(123));
         assert_eq!(capture_limit(&policy, TraceRoute::Uplink, 4096), Some(4096));
     }

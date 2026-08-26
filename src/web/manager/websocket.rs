@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::OwnedSemaphorePermit;
@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use super::{ManagerError, ProfileKey, WebProcessRuntime, WebSocketBudgetLease};
 
 /// One process-owned WebSocket carrier class used for eviction priority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WebSocketKind {
     /// One connection multiplexes every logical stream in a session.
     Multiplex,
@@ -18,23 +18,42 @@ pub(crate) enum WebSocketKind {
     Lane(u32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct WebSocketClaimKey {
+    session_hash: super::TokenHash,
+    kind: WebSocketKind,
+}
+
+#[repr(u8)]
+enum WebSocketPhase {
+    Claimed,
+    Upgraded,
+    Active,
+    Closing,
+}
+
 pub(super) struct WebSocketEntry {
     id: u64,
     owner: ProfileKey,
     session_id: u64,
+    claim: WebSocketClaimKey,
     client_ip: IpAddr,
     kind: WebSocketKind,
     liveness_interval_ms: u64,
     created_tick: u64,
     last_peer_tick: AtomicU64,
     last_progress_tick: AtomicU64,
-    opened: AtomicBool,
+    phase: AtomicU8,
+    closing: AtomicBool,
     cancel: CancellationToken,
+    released: CancellationToken,
 }
 
 #[derive(Default)]
 pub(super) struct WebSocketRegistry {
     entries: HashMap<u64, Arc<WebSocketEntry>>,
+    claims: HashMap<WebSocketClaimKey, u64>,
+    evictions_in_flight: usize,
     closed: bool,
 }
 
@@ -63,9 +82,45 @@ impl WebSocketConnection {
     }
 
     /// Marks successful ownership transfer from HTTP to the WebSocket codec.
-    pub(crate) fn mark_opened(&self) {
-        self.entry.opened.store(true, Ordering::Release);
+    pub(crate) fn mark_opened(&self) -> bool {
+        if self.entry.closing.load(Ordering::Acquire)
+            || self
+                .entry
+                .phase
+                .compare_exchange(
+                    WebSocketPhase::Claimed as u8,
+                    WebSocketPhase::Upgraded as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            || self.entry.closing.load(Ordering::Acquire)
+        {
+            return false;
+        }
         self.mark_progress();
+        true
+    }
+
+    /// Marks the first validated carrier binary message as active progress.
+    pub(crate) fn mark_active(&self) -> bool {
+        if self.entry.closing.load(Ordering::Acquire)
+            || self
+                .entry
+                .phase
+                .compare_exchange(
+                    WebSocketPhase::Upgraded as u8,
+                    WebSocketPhase::Active as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            || self.entry.closing.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.mark_peer_activity();
+        true
     }
 
     /// Refreshes the peer-liveness deadline after any received WebSocket message.
@@ -90,93 +145,167 @@ impl WebSocketConnection {
 impl Drop for WebSocketConnection {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.upgrade() {
-            runtime.websockets.lock().entries.remove(&self.entry.id);
+            let mut registry = runtime.websockets.lock();
+            registry.entries.remove(&self.entry.id);
+            if registry.claims.get(&self.entry.claim) == Some(&self.entry.id) {
+                registry.claims.remove(&self.entry.claim);
+            }
+            if self.entry.closing.load(Ordering::Acquire) {
+                if registry.evictions_in_flight == 0 {
+                    registry.closed = true;
+                } else {
+                    registry.evictions_in_flight -= 1;
+                }
+            }
+            drop(registry);
             drop(self.base_budget.take());
             drop(self.slot.take());
+            self.entry.released.cancel();
             runtime.websocket_notify.notify_waiters();
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn admit(
     runtime: &Arc<WebProcessRuntime>,
     owner: ProfileKey,
     session_id: u64,
+    session_hash: super::TokenHash,
     client_ip: IpAddr,
     kind: WebSocketKind,
     base_bytes: usize,
     liveness_interval: Duration,
     eviction_timeout: Duration,
+    parent_cancellation: CancellationToken,
 ) -> Result<WebSocketConnection, ManagerError> {
+    if parent_cancellation.is_cancelled() {
+        return Err(ManagerError::Closed);
+    }
     let liveness_interval_ms = liveness_interval.as_millis().min(u128::from(u64::MAX)) as u64;
-    if let Some(connection) = try_admit(
+    match try_admit(
         runtime,
         owner,
         session_id,
+        session_hash,
         client_ip,
         kind,
         base_bytes,
         liveness_interval_ms,
+        &parent_cancellation,
     ) {
-        return Ok(connection);
+        Ok(connection) => return Ok(connection),
+        Err(TryAdmitError::Conflict) => return Err(ManagerError::Concurrent),
+        Err(TryAdmitError::Closed) => return Err(ManagerError::Closed),
+        Err(TryAdmitError::Capacity) => {}
     }
-    let Some(victim) = select_victim(runtime, owner, session_id, client_ip, None) else {
+    let Some(victim) = select_victim(runtime, owner, session_id, client_ip, None, true) else {
         runtime.record_limit_hit();
         return Err(ManagerError::Limit);
     };
-    let released = runtime.websocket_notify.notified();
+    let released = victim.released.cancelled();
     victim.cancel.cancel();
-    let _ = tokio::time::timeout(eviction_timeout, released).await;
-    try_admit(
+    tokio::select! {
+        _ = parent_cancellation.cancelled() => return Err(ManagerError::Closed),
+        _ = tokio::time::timeout(eviction_timeout, released) => {}
+    }
+    if parent_cancellation.is_cancelled() {
+        return Err(ManagerError::Closed);
+    }
+    match try_admit(
         runtime,
         owner,
         session_id,
+        session_hash,
         client_ip,
         kind,
         base_bytes,
         liveness_interval_ms,
-    )
-    .ok_or_else(|| {
-        runtime.record_limit_hit();
-        ManagerError::Limit
-    })
+        &parent_cancellation,
+    ) {
+        Ok(connection) => Ok(connection),
+        Err(TryAdmitError::Conflict) => Err(ManagerError::Concurrent),
+        Err(TryAdmitError::Closed) => Err(ManagerError::Closed),
+        Err(TryAdmitError::Capacity) => {
+            runtime.record_limit_hit();
+            Err(ManagerError::Limit)
+        }
+    }
+}
+
+enum TryAdmitError {
+    Capacity,
+    Conflict,
+    Closed,
 }
 
 fn try_admit(
     runtime: &Arc<WebProcessRuntime>,
     owner: ProfileKey,
     session_id: u64,
+    session_hash: super::TokenHash,
     client_ip: IpAddr,
     kind: WebSocketKind,
     base_bytes: usize,
     liveness_interval_ms: u64,
-) -> Option<WebSocketConnection> {
+    parent_cancellation: &CancellationToken,
+) -> Result<WebSocketConnection, TryAdmitError> {
+    if parent_cancellation.is_cancelled() {
+        return Err(TryAdmitError::Closed);
+    }
+    let claim = WebSocketClaimKey { session_hash, kind };
+    {
+        let registry = runtime.websockets.lock();
+        if registry.closed {
+            return Err(TryAdmitError::Closed);
+        }
+        if registry.claims.contains_key(&claim) {
+            return Err(TryAdmitError::Conflict);
+        }
+    }
     let slot = Arc::clone(&runtime.websocket_connections)
         .try_acquire_owned()
-        .ok()?;
-    let base_budget = runtime.try_websocket_base_budget(owner, base_bytes)?;
-    let id = runtime.websocket_next_id.fetch_add(1, Ordering::Relaxed);
+        .map_err(|_| TryAdmitError::Capacity)?;
+    let base_budget = runtime
+        .try_websocket_base_budget(owner, base_bytes)
+        .ok_or(TryAdmitError::Capacity)?;
+    if parent_cancellation.is_cancelled() {
+        return Err(TryAdmitError::Closed);
+    }
+    let id = runtime
+        .websocket_next_id
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| TryAdmitError::Capacity)?;
     let now = runtime.websocket_tick();
     let entry = Arc::new(WebSocketEntry {
         id,
         owner,
         session_id,
+        claim,
         client_ip,
         kind,
         liveness_interval_ms,
         created_tick: now,
         last_peer_tick: AtomicU64::new(now),
         last_progress_tick: AtomicU64::new(now),
-        opened: AtomicBool::new(false),
-        cancel: CancellationToken::new(),
+        phase: AtomicU8::new(WebSocketPhase::Claimed as u8),
+        closing: AtomicBool::new(false),
+        cancel: parent_cancellation.child_token(),
+        released: CancellationToken::new(),
     });
     let mut registry = runtime.websockets.lock();
-    if registry.closed {
-        return None;
+    if registry.closed || parent_cancellation.is_cancelled() {
+        return Err(TryAdmitError::Closed);
     }
+    if registry.claims.contains_key(&claim) {
+        return Err(TryAdmitError::Conflict);
+    }
+    registry.claims.insert(claim, id);
     registry.entries.insert(id, Arc::clone(&entry));
     drop(registry);
-    Some(WebSocketConnection {
+    Ok(WebSocketConnection {
         runtime: Arc::downgrade(runtime),
         entry,
         slot: Some(slot),
@@ -191,22 +320,13 @@ impl WebProcessRuntime {
 
     pub(super) fn cleanup_websockets(&self) {
         let now = self.websocket_tick();
-        let mut victims = self
-            .websockets
-            .lock()
-            .entries
-            .values()
-            .filter(|entry| {
-                now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire))
-                    >= dead_after(entry)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if victims.is_empty()
-            && self.data_budget.take_pressure()
-            && let Some(victim) = select_pressure_victim(self, now)
-        {
-            victims.push(victim);
+        let mut victims = claim_stale_victims(self, now);
+        if victims.is_empty() && self.data_budget.take_pressure() {
+            if let Some(victim) = select_pressure_victim(self, now, true) {
+                victims.push(victim);
+            } else {
+                self.data_budget.restore_pressure();
+            }
         }
         for victim in victims {
             victim.cancel.cancel();
@@ -231,16 +351,20 @@ fn select_victim(
     session_id: u64,
     client_ip: IpAddr,
     excluded_id: Option<u64>,
+    claim: bool,
 ) -> Option<Arc<WebSocketEntry>> {
     let fair_share = runtime.data_budget.fair_share(Some(owner));
     let requester_usage = runtime.data_budget.owner_usage(owner);
     let now = runtime.websocket_tick();
-    runtime
-        .websockets
-        .lock()
+    let mut registry = runtime.websockets.lock();
+    if claim && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight {
+        return None;
+    }
+    let selected = registry
         .entries
         .values()
         .filter(|entry| Some(entry.id) != excluded_id)
+        .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .filter_map(|entry| {
             let owner_rank = if entry.session_id == session_id {
                 0
@@ -269,15 +393,26 @@ fn select_victim(
             ))
         })
         .min_by_key(|(key, _)| *key)
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| entry)?;
+    if claim && !claim_entry(&mut registry, &selected, runtime) {
+        return None;
+    }
+    Some(selected)
 }
 
-fn select_pressure_victim(runtime: &WebProcessRuntime, now: u64) -> Option<Arc<WebSocketEntry>> {
-    runtime
-        .websockets
-        .lock()
+fn select_pressure_victim(
+    runtime: &WebProcessRuntime,
+    now: u64,
+    claim: bool,
+) -> Option<Arc<WebSocketEntry>> {
+    let mut registry = runtime.websockets.lock();
+    if claim && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight {
+        return None;
+    }
+    let selected = registry
         .entries
         .values()
+        .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .map(|entry| {
             (
                 (
@@ -290,11 +425,57 @@ fn select_pressure_victim(runtime: &WebProcessRuntime, now: u64) -> Option<Arc<W
             )
         })
         .min_by_key(|(key, _)| *key)
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| entry)?;
+    if claim && !claim_entry(&mut registry, &selected, runtime) {
+        return None;
+    }
+    Some(selected)
+}
+
+fn claim_stale_victims(runtime: &WebProcessRuntime, now: u64) -> Vec<Arc<WebSocketEntry>> {
+    let mut registry = runtime.websockets.lock();
+    let available = runtime
+        .limits
+        .max_websocket_evictions_in_flight
+        .saturating_sub(registry.evictions_in_flight);
+    let candidates = registry
+        .entries
+        .values()
+        .filter(|entry| !entry.closing.load(Ordering::Acquire))
+        .filter(|entry| {
+            now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire)) >= dead_after(entry)
+        })
+        .take(available)
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates
+        .into_iter()
+        .filter(|entry| claim_entry(&mut registry, entry, runtime))
+        .collect()
+}
+
+fn claim_entry(
+    registry: &mut WebSocketRegistry,
+    entry: &Arc<WebSocketEntry>,
+    runtime: &WebProcessRuntime,
+) -> bool {
+    if registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight
+        || entry
+            .closing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return false;
+    }
+    entry
+        .phase
+        .store(WebSocketPhase::Closing as u8, Ordering::Release);
+    registry.evictions_in_flight += 1;
+    true
 }
 
 fn entry_priority(entry: &WebSocketEntry, now: u64) -> u8 {
-    if !entry.opened.load(Ordering::Acquire)
+    if entry.phase.load(Ordering::Acquire) < WebSocketPhase::Active as u8
         || now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire)) >= dead_after(entry)
     {
         0

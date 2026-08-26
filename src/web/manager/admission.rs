@@ -15,7 +15,7 @@ impl WebProcessRuntime {
         public_addr: SocketAddr,
     ) -> Option<u16> {
         let now = Instant::now();
-        let mut state = self.state.lock();
+        let mut state = self.stream_admission.lock();
         if state.closed
             || state.streams_live >= self.limits.max_streams_global
             || state
@@ -54,7 +54,7 @@ impl WebProcessRuntime {
         public_addr: SocketAddr,
         peer_port: u16,
     ) {
-        let mut state = self.state.lock();
+        let mut state = self.stream_admission.lock();
         if !release_stream_port(&mut state, client_ip, public_addr, peer_port) {
             return;
         }

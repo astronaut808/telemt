@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -14,17 +14,30 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebTimeoutsConfig};
 use crate::web::frame::{self, FrameType};
-use crate::web::manager::{ProfileKey, TokenHash, WebProcessRuntime};
+use crate::web::manager::{
+    CarrierClientClass, CarrierLearningContext, ProfileKey, TokenHash, WebProcessRuntime,
+};
 
 // Backend tasks own generation admission and authenticated MTProxy relay lifetimes.
 mod backend;
 // Downlink queues own cursor replay, flow control, and memory reservations.
 mod downlink;
+// Response ownership keeps detached batches charged until the last body clone drops.
+mod resident;
 // Lane carrier state isolates request sequencing and downlink replay per logical stream.
 mod lanes;
+// Lane batch staging transfers queue ownership without escaping process budgets.
+mod lane_downlink;
+// Lane uplink creation remains transactional across validation and queue reservations.
+mod lane_uplink;
 // WebSocket carrier state owns pre-OPEN lane reservations and failure isolation.
 mod websocket;
 pub(crate) use websocket::WebSocketLaneReservation;
+pub(crate) use websocket::WebSocketProbeReservation;
+// Carrier commit and health evidence share one session-locked state machine.
+mod negotiation;
+// Session closure and carrier-attempt transitions share one cancellation boundary.
+mod lifecycle;
 // Uplink batches own exactly-once sequencing and client-frame validation.
 mod uplink;
 
@@ -43,7 +56,14 @@ struct InboundChunk {
     offset: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StreamIdentity {
+    pub(crate) id: u32,
+    pub(crate) instance: u64,
+}
+
 struct StreamState {
+    instance: u64,
     inbound: VecDeque<InboundChunk>,
     receive_window: u32,
     send_credit: u64,
@@ -61,15 +81,21 @@ struct QueuedFrame {
 
 struct DownBatch {
     body: Bytes,
+    lease: Arc<resident::PendingResponseLease>,
     base_cursor: u64,
     next_cursor: u64,
     data_bytes: usize,
     data_items: usize,
     control_bytes: usize,
     control_items: usize,
+    carrier_health_eligible: bool,
 }
 
 struct CarrierLane {
+    instance: u64,
+    pending_bytes: usize,
+    pending_items: usize,
+    resident: Arc<resident::ResidentCounters>,
     pending_frames: VecDeque<QueuedFrame>,
     pending_windows: HashMap<u32, usize>,
     unacked: Option<DownBatch>,
@@ -82,8 +108,12 @@ struct CarrierLane {
 }
 
 impl CarrierLane {
-    fn new() -> Self {
+    fn new(instance: u64) -> Self {
         Self {
+            instance,
+            pending_bytes: 0,
+            pending_items: 0,
+            resident: Arc::new(resident::ResidentCounters::default()),
             pending_frames: VecDeque::new(),
             pending_windows: HashMap::new(),
             unacked: None,
@@ -99,6 +129,8 @@ impl CarrierLane {
 
 struct SessionState {
     streams: HashMap<u32, StreamState>,
+    closing_streams: HashMap<u32, u64>,
+    next_stream_instance: u64,
     active_peer_ports: HashSet<u16>,
     closed_streams: HashSet<u32>,
     closed_order: VecDeque<u32>,
@@ -110,13 +142,36 @@ struct SessionState {
     last_up_sequence: u64,
     last_up_digest: TokenHash,
     carrier_lanes: HashMap<u32, CarrierLane>,
+    lane_open_waits: usize,
+    next_lane_instance: u64,
     websocket_lane_reservations: HashMap<u32, u16>,
     pending_bytes: usize,
     pending_items: usize,
     pending_control_bytes: usize,
     pending_control_items: usize,
     last_activity: Instant,
+    negotiation_phase: SessionNegotiationPhase,
+    carrier_health_due_at: Option<Instant>,
+    carrier_health_activity_at: Option<Instant>,
+    carrier_health_uplink: bool,
+    carrier_health_downlink: bool,
+    carrier_commit_published: bool,
+    carrier_health_reported: bool,
+    websocket_carrier_active: bool,
+    websocket_commit_ack_pending: bool,
+    websocket_commit_ack_owner: Option<u64>,
+    websocket_commit_ack_written: bool,
+    websocket_probe_claimed: bool,
+    close_requested: bool,
     closed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionNegotiationPhase {
+    Uncommitted,
+    Replacing,
+    Committed,
+    Superseded,
 }
 
 /// One bounded WEB carrier session containing logical MTProxy streams.
@@ -127,13 +182,22 @@ pub(crate) struct WebSession {
     trace_session_id: u64,
     profile: Arc<WebRuntimeProfile>,
     profile_key: ProfileKey,
+    selected_carrier: WebCarrier,
+    carrier_attempt: u8,
+    bootstrap_hash: TokenHash,
+    carrier_deadline_at: Option<Instant>,
+    carrier_class: CarrierClientClass,
+    learning_context: Option<CarrierLearningContext>,
+    automatic_carrier: bool,
     limits: WebLimitsConfig,
     timeouts: WebTimeoutsConfig,
     state: Mutex<SessionState>,
     down_notify: Arc<Notify>,
+    lane_open_notify: Arc<Notify>,
     cancel: CancellationToken,
     tasks_live: AtomicUsize,
     tasks_done: Arc<Notify>,
+    resident: Arc<resident::ResidentCounters>,
     finished: AtomicBool,
     up_active: AtomicBool,
 }
@@ -158,12 +222,21 @@ impl WebSession {
         trace_session_id: u64,
         profile: Arc<WebRuntimeProfile>,
         profile_key: ProfileKey,
+        selected_carrier: WebCarrier,
+        carrier_attempt: u8,
+        bootstrap_hash: TokenHash,
+        carrier_deadline_at: Option<Instant>,
+        carrier_class: CarrierClientClass,
+        learning_context: Option<CarrierLearningContext>,
+        automatic_carrier: bool,
         limits: WebLimitsConfig,
         timeouts: WebTimeoutsConfig,
     ) -> Arc<Self> {
         let mut carrier_lanes = HashMap::new();
-        if profile.carrier == WebCarrier::HttpsLanes {
-            carrier_lanes.insert(0, CarrierLane::new());
+        let mut next_lane_instance = 1;
+        if selected_carrier == WebCarrier::HttpsLanes {
+            carrier_lanes.insert(0, CarrierLane::new(next_lane_instance));
+            next_lane_instance += 1;
         }
         Arc::new(Self {
             manager,
@@ -172,10 +245,19 @@ impl WebSession {
             trace_session_id,
             profile,
             profile_key,
+            selected_carrier,
+            carrier_attempt,
+            bootstrap_hash,
+            carrier_deadline_at,
+            carrier_class,
+            learning_context,
+            automatic_carrier,
             limits,
             timeouts,
             state: Mutex::new(SessionState {
                 streams: HashMap::new(),
+                closing_streams: HashMap::new(),
+                next_stream_instance: 1,
                 active_peer_ports: HashSet::new(),
                 closed_streams: HashSet::new(),
                 closed_order: VecDeque::new(),
@@ -187,18 +269,35 @@ impl WebSession {
                 last_up_sequence: 0,
                 last_up_digest: [0; 32],
                 carrier_lanes,
+                lane_open_waits: 0,
+                next_lane_instance,
                 websocket_lane_reservations: HashMap::new(),
                 pending_bytes: 0,
                 pending_items: 0,
                 pending_control_bytes: 0,
                 pending_control_items: 0,
                 last_activity: Instant::now(),
+                negotiation_phase: SessionNegotiationPhase::Uncommitted,
+                carrier_health_due_at: None,
+                carrier_health_activity_at: None,
+                carrier_health_uplink: false,
+                carrier_health_downlink: false,
+                carrier_commit_published: false,
+                carrier_health_reported: false,
+                websocket_carrier_active: false,
+                websocket_commit_ack_pending: false,
+                websocket_commit_ack_owner: None,
+                websocket_commit_ack_written: false,
+                websocket_probe_claimed: false,
+                close_requested: false,
                 closed: false,
             }),
             down_notify: Arc::new(Notify::new()),
+            lane_open_notify: Arc::new(Notify::new()),
             cancel: CancellationToken::new(),
             tasks_live: AtomicUsize::new(0),
             tasks_done: Arc::new(Notify::new()),
+            resident: Arc::new(resident::ResidentCounters::default()),
             finished: AtomicBool::new(false),
             up_active: AtomicBool::new(false),
         })
@@ -216,7 +315,7 @@ impl WebSession {
 
     /// Returns the immutable carrier selected when this session was created.
     pub(crate) fn carrier(&self) -> WebCarrier {
-        self.profile.carrier
+        self.selected_carrier
     }
 
     /// Returns the stable quota owner without exposing profile credentials.
@@ -227,6 +326,11 @@ impl WebSession {
     /// Returns the process-unique non-secret trace identifier.
     pub(crate) fn trace_session_id(&self) -> u64 {
         self.trace_session_id
+    }
+
+    /// Creates a child cancellation boundary for one owned carrier task.
+    pub(crate) fn carrier_cancellation(&self) -> CancellationToken {
+        self.cancel.child_token()
     }
 
     /// Returns a cloned non-secret identity only for enabled debug capture.
@@ -253,96 +357,34 @@ impl WebSession {
         }
     }
 
-    /// Closes carrier state while relay tasks retain their admission until exit.
-    pub(crate) fn close(&self) {
-        let (data_bytes, data_items, control_bytes, control_items) = {
-            let mut state = self.state.lock();
-            if state.closed {
-                return;
-            }
-            state.closed = true;
-            for stream in state.streams.values_mut() {
-                if let Some(waker) = stream.read_waker.take() {
-                    waker.wake();
-                }
-                if let Some(waker) = stream.write_waker.take() {
-                    waker.wake();
-                }
-            }
-            state.streams.clear();
-            state.pending_frames.clear();
-            state.pending_windows.clear();
-            state.unacked = None;
-            for lane in state.carrier_lanes.values() {
-                lane.notify.notify_waiters();
-            }
-            state.carrier_lanes.clear();
-            let control_bytes = state.pending_control_bytes;
-            let control_items = state.pending_control_items;
-            let data_bytes = state.pending_bytes.saturating_sub(control_bytes);
-            let data_items = state.pending_items.saturating_sub(control_items);
-            state.pending_bytes = 0;
-            state.pending_items = 0;
-            state.pending_control_bytes = 0;
-            state.pending_control_items = 0;
-            (data_bytes, data_items, control_bytes, control_items)
-        };
-        self.cancel.cancel();
-        if self.carrier().is_multiplexed() {
-            self.down_notify.notify_waiters();
-        }
-        if let Some(manager) = self.manager.upgrade() {
-            manager.release_pending(self.profile_key, data_bytes, data_items, false);
-            manager.release_pending(self.profile_key, control_bytes, control_items, true);
-            if !self.finished.swap(true, Ordering::AcqRel) {
-                self.trace_lifecycle(
-                    crate::web::trace::TraceLifecycleEvent::SessionClosed,
-                    None,
-                    Some("closed"),
-                );
-                manager.session_finished(
-                    self.token_hash,
-                    self.client_ip,
-                    self.profile_key,
-                    &self.profile.host,
-                );
-            }
-        }
+    /// Returns the immutable limits frozen when this carrier chain was created.
+    pub(crate) fn limits(&self) -> &WebLimitsConfig {
+        &self.limits
     }
 
-    /// Waits for all logical-stream tasks after admission has closed.
-    pub(crate) async fn wait(&self) {
-        loop {
-            let notified = self.tasks_done.notified();
-            if self.tasks_live.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    /// Returns whether reconnect grace elapsed without activity.
-    pub(crate) fn is_idle(&self, now: Instant) -> bool {
-        let state = self.state.lock();
-        !state.closed
-            && now.saturating_duration_since(state.last_activity)
-                >= Duration::from_secs(self.timeouts.reconnect_grace_secs)
+    /// Returns the immutable timeouts frozen when this carrier chain was created.
+    pub(crate) fn timeouts(&self) -> &WebTimeoutsConfig {
+        &self.timeouts
     }
 
     /// Polls client-to-server bytes and returns consumed flow-control credit.
     pub(super) fn poll_read(
         &self,
-        stream_id: u32,
+        stream: StreamIdentity,
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut state = self.state.lock();
         let (count, finished) = {
-            let Some(stream) = state.streams.get_mut(&stream_id) else {
+            let Some(stream_state) = state
+                .streams
+                .get_mut(&stream.id)
+                .filter(|state| state.instance == stream.instance)
+            else {
                 return Poll::Ready(Ok(()));
             };
-            let Some(chunk) = stream.inbound.front_mut() else {
-                stream.read_waker = Some(cx.waker().clone());
+            let Some(chunk) = stream_state.inbound.front_mut() else {
+                stream_state.read_waker = Some(cx.waker().clone());
                 return Poll::Pending;
             };
             let available = &chunk.bytes[chunk.offset..];
@@ -351,14 +393,14 @@ impl WebSession {
             chunk.offset += count;
             let finished = chunk.offset == chunk.bytes.len();
             if finished {
-                stream.inbound.pop_front();
+                stream_state.inbound.pop_front();
             }
-            stream.receive_window = stream.receive_window.saturating_add(count as u32);
+            stream_state.receive_window = stream_state.receive_window.saturating_add(count as u32);
             (count, finished)
         };
         let overhead = if finished { QUEUE_ITEM_COST } else { 0 };
         self.release_locked(&mut state, count + overhead, usize::from(finished), false);
-        if !self.queue_window_locked(&mut state, stream_id, count as u32) {
+        if !self.queue_window_locked(&mut state, stream.id, count as u32) {
             drop(state);
             self.close();
             return Poll::Ready(Err(io::Error::other(
@@ -371,7 +413,7 @@ impl WebSession {
     /// Polls server-to-client writes against stream credit and bounded queues.
     pub(super) fn poll_write(
         &self,
-        stream_id: u32,
+        stream: StreamIdentity,
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
@@ -379,7 +421,11 @@ impl WebSession {
             return Poll::Ready(Ok(0));
         }
         let mut state = self.state.lock();
-        let Some(stream) = state.streams.get_mut(&stream_id) else {
+        let Some(stream_state) = state
+            .streams
+            .get_mut(&stream.id)
+            .filter(|state| state.instance == stream.instance)
+        else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WEB logical stream is closed",
@@ -389,24 +435,39 @@ impl WebSession {
             .len()
             .min(frame::DATA_CHUNK_BYTES)
             .min(self.limits.max_frame_payload_bytes)
-            .min(stream.send_credit as usize);
+            .min(if self.carrier().uses_lanes() {
+                self.limits
+                    .pending_bytes_per_lane
+                    .saturating_sub(frame::HEADER_BYTES + QUEUE_ITEM_COST)
+            } else {
+                usize::MAX
+            })
+            .min(stream_state.send_credit as usize);
         if count == 0 {
-            stream.write_waker = Some(cx.waker().clone());
+            stream_state.write_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        if !self.queue_data_locked(&mut state, stream_id, &input[..count]) {
-            if let Some(stream) = state.streams.get_mut(&stream_id) {
-                stream.write_waker = Some(cx.waker().clone());
+        if !self.queue_data_locked(&mut state, stream.id, &input[..count]) {
+            if let Some(stream_state) = state
+                .streams
+                .get_mut(&stream.id)
+                .filter(|state| state.instance == stream.instance)
+            {
+                stream_state.write_waker = Some(cx.waker().clone());
             }
             return Poll::Pending;
         }
-        let Some(stream) = state.streams.get_mut(&stream_id) else {
+        let Some(stream_state) = state
+            .streams
+            .get_mut(&stream.id)
+            .filter(|state| state.instance == stream.instance)
+        else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "WEB logical stream is closed",
             )));
         };
-        stream.send_credit -= count as u64;
+        stream_state.send_credit -= count as u64;
         state.last_activity = Instant::now();
         drop(state);
         if self.carrier().is_multiplexed() {
@@ -420,18 +481,6 @@ impl WebSession {
         self.manager
             .upgrade()
             .map(|manager| manager.budget_notify())
-    }
-
-    fn release_stream_reservation(&self, peer_port: u16) {
-        let removed = self.state.lock().active_peer_ports.remove(&peer_port);
-        if removed && let Some(manager) = self.manager.upgrade() {
-            manager.release_stream(
-                self.profile_key,
-                self.client_ip,
-                self.profile.public_addr,
-                peer_port,
-            );
-        }
     }
 }
 
@@ -455,4 +504,13 @@ fn remember_closed(state: &mut SessionState, stream_id: u32, limit: usize) -> Op
         }
     }
     evicted
+}
+
+fn insert_carrier_lane(state: &mut SessionState, lane_id: u32) -> Option<u64> {
+    let instance = state.next_lane_instance;
+    state.next_lane_instance = instance.checked_add(1)?;
+    state
+        .carrier_lanes
+        .insert(lane_id, CarrierLane::new(instance));
+    Some(instance)
 }

@@ -7,7 +7,7 @@ const WEBSOCKET_FRAME_OVERHEAD_BYTES: usize = 14;
 
 /// Validates WebSocket admission, memory, and deadline invariants.
 pub(super) fn validate(
-    carrier: WebCarrier,
+    carriers: &[WebCarrier],
     limits: &WebLimitsConfig,
     timeouts: &WebTimeoutsConfig,
 ) -> Result<()> {
@@ -27,7 +27,7 @@ pub(super) fn validate(
             "web.timeouts.websocket_eviction_secs must not exceed websocket_write_secs",
         );
     }
-    if !carrier.uses_websocket() {
+    if !carriers.iter().any(|carrier| carrier.uses_websocket()) {
         return Ok(());
     }
     if limits.carrier_batch_bytes > MAX_WEBSOCKET_BATCH_BYTES {
@@ -40,6 +40,14 @@ pub(super) fn validate(
     {
         return config_error(
             "WebSocket carriers require websocket_http_connection_reserve within [1, max_http_connections)",
+        );
+    }
+    let websocket_capacity = limits
+        .max_http_connections
+        .saturating_sub(limits.websocket_http_connection_reserve);
+    if limits.max_websocket_evictions_in_flight > websocket_capacity {
+        return config_error(
+            "web.limits.max_websocket_evictions_in_flight must not exceed WebSocket connection capacity",
         );
     }
     let socket_base = WEBSOCKET_IO_BUFFER_BYTES

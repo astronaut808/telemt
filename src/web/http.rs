@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::error::Error;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{WebClientIpSource, WebRuntimeVhost};
 use crate::web::bridge;
-use crate::web::frame::{self, FrameType};
 use crate::web::manager::{ManagerError, WebProcessRuntime};
 
 // Response-body activity keeps connection idle accounting lifecycle-correct.
@@ -34,6 +33,8 @@ mod down;
 mod request;
 // Carrier response construction and lane-header helpers are shared by handlers.
 mod response;
+// Session creation and replacement negotiation remain separate from request routing.
+mod session;
 // RFC 6455 upgrade validation and carrier drivers remain isolated from HTTP routing.
 #[cfg(test)]
 mod tests;
@@ -56,12 +57,12 @@ use response::{
     bad_gateway, carrier_empty, carrier_headers, carrier_lane, full_response, generic_not_found,
     insert_header, service_unavailable,
 };
+use session::handle_session;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, BoxError>;
 type HttpResponse = Response<HttpBody>;
 
-const CREATE_BODY_LIMIT: usize = 64;
 const TRANSPORT_PATHS: [&str; 3] = ["/api/v1/session", "/api/v1/up", "/api/v1/down"];
 const WEBSOCKET_PATH: &str = "/api/v1/ws";
 
@@ -224,7 +225,6 @@ async fn handle_root(
         trace.set_route(TraceRoute::Bridge);
         trace.set_effective_ip(client_ip);
     }
-    let carrier = profile.carrier;
     let bootstrap = match runtime.issue_bootstrap(Arc::clone(&profile), client_ip) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
@@ -234,7 +234,7 @@ async fn handle_root(
                 &profile,
                 TraceLifecycleEvent::BootstrapRejected,
                 None,
-                Some(manager_error_reason(error)),
+                Some(error.as_str()),
             );
             strip_query(&mut request);
             return serve_decoy(request, vhost, true, &runtime).await;
@@ -251,7 +251,9 @@ async fn handle_root(
         generation.config().web.limits.carrier_batch_bytes,
         generation.config().web.limits.pending_bytes_per_session,
         generation.config().web.limits.pending_items_per_session,
-        carrier,
+        profile.carrier_negotiation_enabled,
+        profile.carriers.len(),
+        profile.carrier_negotiation_deadlines_secs,
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));
@@ -315,127 +317,6 @@ async fn handle_api(
     }
 }
 
-async fn handle_session(
-    request: Request<RequestBody>,
-    runtime: Arc<WebProcessRuntime>,
-    vhost: Arc<WebRuntimeVhost>,
-    token_hash: crate::web::manager::TokenHash,
-    client_ip: IpAddr,
-) -> HttpResponse {
-    if request.headers().contains_key("x-lane-id") {
-        return serve_decoy(request, vhost, true, &runtime).await;
-    }
-    if request.method() == Method::DELETE {
-        if request.headers().contains_key(header::CONTENT_TYPE) {
-            return serve_decoy(request, vhost, true, &runtime).await;
-        }
-        if let Some(trace) = request_trace(&request)
-            && let Ok(session) = runtime.get_session(token_hash, &vhost.host)
-        {
-            trace.set_route(TraceRoute::Session);
-            trace.bind_identity(session.trace_identity());
-        }
-        let CollectedBody {
-            request,
-            body,
-            _body_budget,
-        } = match collect_body(request, &runtime, 1, true).await {
-            Ok(result) => result,
-            Err(CollectBodyError::Limit) => return service_unavailable(),
-            Err(CollectBodyError::Invalid(request)) => {
-                return serve_decoy(request, vhost, true, &runtime).await;
-            }
-        };
-        if !body.is_empty() || runtime.close_token(token_hash, &vhost.host).is_err() {
-            return serve_decoy(request, vhost, true, &runtime).await;
-        }
-        return carrier_empty(StatusCode::NO_CONTENT);
-    }
-    if request.method() != Method::POST || !binary_content_type(&request) {
-        return serve_decoy(request, vhost, true, &runtime).await;
-    }
-    let Some((trace_session_id, profile)) =
-        runtime.bootstrap_trace_identity(token_hash, &vhost.host)
-    else {
-        return serve_decoy(request, vhost, true, &runtime).await;
-    };
-    if let Some(trace) = request_trace(&request) {
-        trace.set_route(TraceRoute::Session);
-        trace.bind_profile(&profile, trace_session_id);
-    }
-    let CollectedBody {
-        request,
-        body,
-        _body_budget,
-    } = match collect_body(request, &runtime, CREATE_BODY_LIMIT, false).await {
-        Ok(result) => result,
-        Err(CollectBodyError::Limit) => return service_unavailable(),
-        Err(CollectBodyError::Invalid(request)) => {
-            return serve_decoy(request, vhost, true, &runtime).await;
-        }
-    };
-    if let Some(trace) = request_trace(&request) {
-        trace.record_frames(
-            TraceDirection::Request,
-            &body,
-            &runtime.active_generation().config().web.limits,
-        );
-    }
-    match runtime.create_session(token_hash, &vhost.host, client_ip, &body) {
-        Ok(result) => {
-            let welcome = frame::encode(FrameType::Welcome, 0, &[]);
-            if let Some(trace) = request_trace(&request) {
-                trace.register_redaction(result.token.as_bytes());
-                trace.record_frames(
-                    TraceDirection::Response,
-                    &welcome,
-                    &runtime.active_generation().config().web.limits,
-                );
-            }
-            let mut response = full_response(StatusCode::OK, welcome);
-            carrier_headers(&mut response);
-            insert_header(
-                &mut response,
-                HeaderName::from_static("x-session-token"),
-                &result.token,
-            );
-            response.headers_mut().insert(
-                HeaderName::from_static("x-carrier-mode"),
-                HeaderValue::from_static(result.carrier.as_str()),
-            );
-            response.headers_mut().insert(
-                HeaderName::from_static("x-down-cursor"),
-                HeaderValue::from_static("0"),
-            );
-            response
-        }
-        Err(
-            error @ (ManagerError::Limit | ManagerError::Backpressure | ManagerError::Concurrent),
-        ) => {
-            runtime.trace().record_profile_lifecycle(
-                client_ip,
-                Some(trace_session_id),
-                &profile,
-                TraceLifecycleEvent::SessionRejected,
-                None,
-                Some(manager_error_reason(error)),
-            );
-            service_unavailable()
-        }
-        Err(error) => {
-            runtime.trace().record_profile_lifecycle(
-                client_ip,
-                Some(trace_session_id),
-                &profile,
-                TraceLifecycleEvent::SessionRejected,
-                None,
-                Some(manager_error_reason(error)),
-            );
-            serve_decoy(request, vhost, true, &runtime).await
-        }
-    }
-}
-
 async fn handle_up(
     request: Request<RequestBody>,
     runtime: Arc<WebProcessRuntime>,
@@ -462,12 +343,7 @@ async fn handle_up(
     let Some(lane_id) = carrier_lane(&request, session.carrier()) else {
         return serve_decoy(request, vhost, true, &runtime).await;
     };
-    let limit = runtime
-        .active_generation()
-        .config()
-        .web
-        .limits
-        .max_body_bytes;
+    let limit = session.limits().max_body_bytes;
     let CollectedBody {
         request,
         body,
@@ -480,11 +356,7 @@ async fn handle_up(
         }
     };
     if let Some(trace) = request_trace(&request) {
-        trace.record_frames(
-            TraceDirection::Request,
-            &body,
-            &runtime.active_generation().config().web.limits,
-        );
+        trace.record_frames(TraceDirection::Request, &body, session.limits());
     }
     let result = match lane_id {
         Some(lane_id) => session.process_up_lane(lane_id, sequence, &body),
@@ -522,16 +394,5 @@ fn request_trace<B>(request: &Request<B>) -> Option<&Arc<HttpTraceExchange>> {
 fn set_trace_route<B>(request: &Request<B>, route: TraceRoute) {
     if let Some(trace) = request_trace(request) {
         trace.set_route(route);
-    }
-}
-
-fn manager_error_reason(error: ManagerError) -> &'static str {
-    match error {
-        ManagerError::Authentication => "authentication",
-        ManagerError::Backpressure => "backpressure",
-        ManagerError::Limit => "limit",
-        ManagerError::Protocol => "protocol",
-        ManagerError::Concurrent => "concurrent",
-        ManagerError::Closed => "closed",
     }
 }

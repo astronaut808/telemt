@@ -9,7 +9,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::exchange::HttpTraceExchange;
 use super::types::{
-    TraceIdentity, TraceLifecycleEvent, TraceLifecycleRecord, TraceRecord, TraceRecordKind,
+    TraceCarrierDetail, TraceIdentity, TraceLifecycleEvent, TraceLifecycleRecord, TraceRecord,
+    TraceRecordKind,
 };
 use crate::config::{WebDebugConfig, WebLimitsConfig};
 
@@ -167,6 +168,57 @@ impl WebTraceStore {
         stream_id: Option<u32>,
         reason: Option<&'static str>,
     ) {
+        self.record_lifecycle_detail(
+            peer_ip,
+            effective_ip,
+            identity,
+            event,
+            stream_id,
+            reason,
+            None,
+        );
+    }
+
+    /// Records one carrier transition with structured, non-secret negotiation fields.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_carrier_lifecycle(
+        &self,
+        effective_ip: IpAddr,
+        identity: TraceIdentity,
+        event: TraceLifecycleEvent,
+        client_class: &'static str,
+        carrier: crate::config::WebCarrier,
+        attempt: u8,
+        scores: [i16; 4],
+        reason: Option<&'static str>,
+    ) {
+        self.record_lifecycle_detail(
+            None,
+            Some(effective_ip),
+            identity,
+            event,
+            None,
+            reason,
+            Some(TraceCarrierDetail {
+                client_class,
+                carrier,
+                attempt,
+                scores,
+            }),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_lifecycle_detail(
+        &self,
+        peer_ip: Option<IpAddr>,
+        effective_ip: Option<IpAddr>,
+        identity: TraceIdentity,
+        event: TraceLifecycleEvent,
+        stream_id: Option<u32>,
+        reason: Option<&'static str>,
+        carrier: Option<TraceCarrierDetail>,
+    ) {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
@@ -197,6 +249,7 @@ impl WebTraceStore {
                 event,
                 stream_id,
                 reason,
+                carrier,
             }),
         };
         if !self.try_commit(record, reservation, epoch) {
@@ -378,11 +431,15 @@ mod tests {
     use super::*;
 
     fn store(records_capacity: usize, bytes_capacity: usize) -> Arc<WebTraceStore> {
-        let mut policy = WebDebugConfig::default();
-        policy.enabled = true;
-        let mut limits = WebLimitsConfig::default();
-        limits.debug_records_capacity = records_capacity;
-        limits.debug_bytes_global = bytes_capacity;
+        let policy = WebDebugConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let limits = WebLimitsConfig {
+            debug_records_capacity: records_capacity,
+            debug_bytes_global: bytes_capacity,
+            ..Default::default()
+        };
         WebTraceStore::new(policy, &limits)
     }
 
@@ -427,9 +484,11 @@ mod tests {
             .begin_http(&request, "192.0.2.20".parse().unwrap())
             .unwrap();
 
-        let mut changed = WebDebugConfig::default();
-        changed.enabled = true;
-        changed.capture_headers = false;
+        let changed = WebDebugConfig {
+            enabled: true,
+            capture_headers: false,
+            ..Default::default()
+        };
         store.apply_policy(&changed);
         exchange.commit();
 

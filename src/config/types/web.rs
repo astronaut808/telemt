@@ -6,7 +6,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::web_carrier::{WebCarrier, WebCarriers};
 use super::web_debug::WebDebugConfig;
+
+// Serialized WEB defaults remain separate from the runtime data model.
+mod defaults;
+use defaults::*;
 
 /// Client-facing secret representation used to derive a WEB capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -16,48 +21,6 @@ pub enum WebSecretMode {
     Plain,
     /// Prefix the existing access secret with `0xdd` for capability derivation.
     Dd,
-}
-
-/// Carrier selected for newly issued WEB bridge sessions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WebCarrier {
-    /// Serialize all logical streams through one uplink and one downlink sequence.
-    #[default]
-    Https,
-    /// Give every logical stream independent HTTPS sequencing and polling state.
-    HttpsLanes,
-    /// Multiplex all logical streams over one ordered WebSocket.
-    Websocket,
-    /// Give every logical stream an independently owned WebSocket lane.
-    WebsocketLanes,
-}
-
-impl WebCarrier {
-    /// Returns the exact carrier token advertised to the browser bridge.
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Https => "https",
-            Self::HttpsLanes => "https-lanes",
-            Self::Websocket => "websocket",
-            Self::WebsocketLanes => "websocket-lanes",
-        }
-    }
-
-    /// Returns whether one carrier owns independent state per logical stream.
-    pub(crate) const fn uses_lanes(self) -> bool {
-        matches!(self, Self::HttpsLanes | Self::WebsocketLanes)
-    }
-
-    /// Returns whether carrier messages use RFC 6455 instead of HTTP bodies.
-    pub(crate) const fn uses_websocket(self) -> bool {
-        matches!(self, Self::Websocket | Self::WebsocketLanes)
-    }
-
-    /// Returns whether all logical streams share one carrier state machine.
-    pub(crate) const fn is_multiplexed(self) -> bool {
-        matches!(self, Self::Https | Self::Websocket)
-    }
 }
 
 /// One access user explicitly exposed through a WEB virtual host.
@@ -135,6 +98,15 @@ pub struct WebLimitsConfig {
     /// Process-wide concurrently executing HTTP handler ceiling.
     #[serde(default = "default_web_max_http_handlers")]
     pub max_http_handlers: usize,
+    /// Per-session ceiling for downlink polls waiting for a lane OPEN.
+    #[serde(default = "default_web_max_lane_open_waits_per_session")]
+    pub max_lane_open_waits_per_session: usize,
+    /// Queued and resident DATA bytes allowed for one independent lane.
+    #[serde(default = "default_web_pending_bytes_per_lane")]
+    pub pending_bytes_per_lane: usize,
+    /// Queued and resident DATA items allowed for one independent lane.
+    #[serde(default = "default_web_pending_items_per_lane")]
+    pub pending_items_per_lane: usize,
     /// Process-wide transient WebSocket byte sub-budget inside pending bytes.
     #[serde(default = "default_web_websocket_bytes_global")]
     pub websocket_bytes_global: usize,
@@ -147,6 +119,12 @@ pub struct WebLimitsConfig {
     /// Accepted HTTP connections that WebSocket upgrades must leave available.
     #[serde(default = "default_web_websocket_http_connection_reserve")]
     pub websocket_http_connection_reserve: usize,
+    /// Concurrent pressure-eviction claims allowed process-wide.
+    #[serde(default = "default_web_max_websocket_evictions_in_flight")]
+    pub max_websocket_evictions_in_flight: usize,
+    /// Process-wide bounded carrier-learning evidence entry ceiling.
+    #[serde(default = "default_web_max_carrier_learning_entries")]
+    pub max_carrier_learning_entries: usize,
     /// Process-wide concurrently collected request body ceiling.
     #[serde(default = "default_web_max_body_readers")]
     pub max_body_readers: usize,
@@ -216,7 +194,7 @@ pub struct WebLimitsConfig {
     /// Process-wide retained and in-flight WEB debug byte ceiling.
     #[serde(default = "default_web_debug_bytes_global")]
     pub debug_bytes_global: usize,
-    /// Declared process envelope for HTTP heads, bodies, queues, and static snapshots.
+    /// Declared process envelope for HTTP, queues, lane state, learning, and static snapshots.
     #[serde(default = "default_web_memory_envelope_bytes")]
     pub memory_envelope_bytes: usize,
     /// Sustained process-wide bootstrap issuance rate.
@@ -249,10 +227,15 @@ impl Default for WebLimitsConfig {
             max_frames_per_body: default_web_max_frames_per_body(),
             max_http_connections: default_web_max_http_connections(),
             max_http_handlers: default_web_max_http_handlers(),
+            max_lane_open_waits_per_session: default_web_max_lane_open_waits_per_session(),
+            pending_bytes_per_lane: default_web_pending_bytes_per_lane(),
+            pending_items_per_lane: default_web_pending_items_per_lane(),
             websocket_bytes_global: default_web_websocket_bytes_global(),
             websocket_admission_watermark_pct: default_web_websocket_admission_watermark_pct(),
             websocket_eviction_watermark_pct: default_web_websocket_eviction_watermark_pct(),
             websocket_http_connection_reserve: default_web_websocket_http_connection_reserve(),
+            max_websocket_evictions_in_flight: default_web_max_websocket_evictions_in_flight(),
+            max_carrier_learning_entries: default_web_max_carrier_learning_entries(),
             max_body_readers: default_web_max_body_readers(),
             max_body_bytes_global: default_web_max_body_bytes_global(),
             max_sessions_global: default_web_max_sessions_global(),
@@ -299,9 +282,24 @@ pub struct WebTimeoutsConfig {
     /// Deadline from the first inner byte through MTProxy authentication.
     #[serde(default = "default_web_stream_handshake_timeout_secs")]
     pub stream_handshake_secs: u64,
+    /// Absolute deadline for receiving the first inner MTProxy byte.
+    #[serde(default = "default_web_stream_first_byte_secs")]
+    pub stream_first_byte_secs: u64,
     /// Maximum wait for one empty downlink long poll.
     #[serde(default = "default_web_long_poll_timeout_secs")]
     pub long_poll_secs: u64,
+    /// Grace for a canonical downlink poll that races its lane OPEN.
+    #[serde(default = "default_web_lane_open_wait_secs")]
+    pub lane_open_wait_secs: u64,
+    /// Post-commit observation interval required before learning succeeds.
+    #[serde(default = "default_web_carrier_health_secs")]
+    pub carrier_health_secs: u64,
+    /// Maximum wait for Hyper to transfer an accepted WebSocket upgrade.
+    #[serde(default = "default_web_websocket_upgrade_secs")]
+    pub websocket_upgrade_secs: u64,
+    /// Absolute deadline for the first carrier binary message after upgrade.
+    #[serde(default = "default_web_websocket_open_secs")]
+    pub websocket_open_secs: u64,
     /// Maximum wait for one WebSocket write to complete.
     #[serde(default = "default_web_websocket_write_secs")]
     pub websocket_write_secs: u64,
@@ -311,6 +309,12 @@ pub struct WebTimeoutsConfig {
     /// Maximum graceful close wait for an evicted WebSocket.
     #[serde(default = "default_web_websocket_eviction_secs")]
     pub websocket_eviction_secs: u64,
+    /// Cumulative carrier-attempt deadlines for up to four unique candidates.
+    #[serde(default = "default_web_carrier_negotiation_deadlines_secs")]
+    pub carrier_negotiation_deadlines_secs: [u64; 4],
+    /// Fixed process-local carrier-learning evidence lifetime.
+    #[serde(default = "default_web_carrier_learning_secs")]
+    pub carrier_learning_secs: u64,
     /// Lifetime of an unused bootstrap credential and closed-token replay marker.
     #[serde(default = "default_web_bootstrap_lifetime_secs")]
     pub bootstrap_lifetime_secs: u64,
@@ -334,10 +338,17 @@ impl Default for WebTimeoutsConfig {
             header_secs: default_web_header_timeout_secs(),
             body_secs: default_web_body_timeout_secs(),
             stream_handshake_secs: default_web_stream_handshake_timeout_secs(),
+            stream_first_byte_secs: default_web_stream_first_byte_secs(),
             long_poll_secs: default_web_long_poll_timeout_secs(),
+            lane_open_wait_secs: default_web_lane_open_wait_secs(),
+            carrier_health_secs: default_web_carrier_health_secs(),
+            websocket_upgrade_secs: default_web_websocket_upgrade_secs(),
+            websocket_open_secs: default_web_websocket_open_secs(),
             websocket_write_secs: default_web_websocket_write_secs(),
             websocket_backpressure_secs: default_web_websocket_backpressure_secs(),
             websocket_eviction_secs: default_web_websocket_eviction_secs(),
+            carrier_negotiation_deadlines_secs: default_web_carrier_negotiation_deadlines_secs(),
+            carrier_learning_secs: default_web_carrier_learning_secs(),
             bootstrap_lifetime_secs: default_web_bootstrap_lifetime_secs(),
             reconnect_grace_secs: default_web_reconnect_grace_secs(),
             http_idle_secs: default_web_http_idle_secs(),
@@ -347,15 +358,37 @@ impl Default for WebTimeoutsConfig {
     }
 }
 
+/// Sensitivity of process-local carrier-learning evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebCarrierNegotiationAggressiveness {
+    /// Require broad evidence and never rank by client IP.
+    #[default]
+    Conservative,
+    /// Use moderate User-Agent, client-IP, and profile thresholds.
+    Balanced,
+    /// React to the first bounded evidence sample.
+    Aggressive,
+}
+
 /// WEB ingress, carrier, fallback, and lifecycle configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebConfig {
     /// Enables issuance of new WEB bridge and session credentials.
     #[serde(default)]
     pub enabled: bool,
-    /// Carrier selected for newly issued WEB bridge sessions.
+    /// Sole carrier when negotiation is disabled and final fallback when enabled.
     #[serde(default)]
     pub carrier: WebCarrier,
+    /// Ordered carriers considered by server-side negotiation before the fallback carrier.
+    #[serde(default)]
+    pub carriers: WebCarriers,
+    /// Enables bounded process-local carrier learning for automatic sessions.
+    #[serde(default = "default_web_carrier_learning")]
+    pub carrier_learning: bool,
+    /// Controls the evidence thresholds used by automatic carrier ranking.
+    #[serde(default)]
+    pub carrier_negotiation_aggressiveness: WebCarrierNegotiationAggressiveness,
     /// Hard process and protocol limits.
     #[serde(default)]
     pub limits: WebLimitsConfig,
@@ -371,6 +404,44 @@ pub struct WebConfig {
     /// Validated immutable runtime snapshot built during configuration loading.
     #[serde(skip)]
     pub(crate) runtime: Option<Arc<WebRuntimeConfig>>,
+}
+
+impl WebConfig {
+    /// Returns the configured negotiation order with the fallback appended once.
+    pub(crate) fn carrier_candidates(&self) -> Vec<WebCarrier> {
+        let Some(configured) = self.carriers.enabled() else {
+            return vec![self.carrier];
+        };
+        let mut candidates = configured
+            .iter()
+            .copied()
+            .filter(|carrier| *carrier != self.carrier)
+            .collect::<Vec<_>>();
+        candidates.push(self.carrier);
+        candidates
+    }
+
+    /// Returns whether the explicit candidate list enables auto-negotiation.
+    pub(crate) fn carrier_negotiation_enabled(&self) -> bool {
+        self.carriers.enabled().is_some()
+    }
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            carrier: WebCarrier::default(),
+            carriers: WebCarriers::default(),
+            carrier_learning: default_web_carrier_learning(),
+            carrier_negotiation_aggressiveness: WebCarrierNegotiationAggressiveness::default(),
+            limits: WebLimitsConfig::default(),
+            debug: WebDebugConfig::default(),
+            timeouts: WebTimeoutsConfig::default(),
+            vhosts: Vec::new(),
+            runtime: None,
+        }
+    }
 }
 
 /// Precomputed WEB configuration consumed by listener hot paths.
@@ -406,8 +477,16 @@ pub(crate) struct WebRuntimeProfile {
     pub(crate) user: String,
     /// Client secret representation and inner protocol policy.
     pub(crate) secret_mode: WebSecretMode,
-    /// Carrier frozen into bridge and session state at issuance time.
+    /// Sole carrier or final fallback frozen into the issued bridge policy.
     pub(crate) carrier: WebCarrier,
+    /// Whether an explicit carrier list enabled automatic negotiation.
+    pub(crate) carrier_negotiation_enabled: bool,
+    /// Whether automatic outcomes consult and update process-local evidence.
+    pub(crate) carrier_learning: bool,
+    /// Ordered negotiation candidates including the fallback carrier exactly once.
+    pub(crate) carriers: Arc<[WebCarrier]>,
+    /// Cumulative carrier-attempt deadlines frozen when the bridge is issued.
+    pub(crate) carrier_negotiation_deadlines_secs: [u64; 4],
     /// HMAC-derived bridge capability.
     pub(crate) capability: [u8; 32],
     /// Non-secret domain-separated client-secret fingerprint for debugging.
@@ -446,93 +525,3 @@ pub(crate) struct WebStaticAsset {
     /// Strong SHA-256 entity tag.
     pub(crate) etag: String,
 }
-
-fn default_web_static_index() -> String {
-    "index.html".to_string()
-}
-
-macro_rules! usize_default {
-    ($name:ident, $value:expr) => {
-        fn $name() -> usize {
-            $value
-        }
-    };
-}
-
-macro_rules! u32_default {
-    ($name:ident, $value:expr) => {
-        fn $name() -> u32 {
-            $value
-        }
-    };
-}
-
-macro_rules! u8_default {
-    ($name:ident, $value:expr) => {
-        fn $name() -> u8 {
-            $value
-        }
-    };
-}
-
-macro_rules! u64_default {
-    ($name:ident, $value:expr) => {
-        fn $name() -> u64 {
-            $value
-        }
-    };
-}
-
-usize_default!(default_web_max_header_bytes, 16 * 1024);
-usize_default!(default_web_max_body_bytes, 2 * 1024 * 1024);
-usize_default!(default_web_max_frame_payload_bytes, 1024 * 1024);
-usize_default!(default_web_carrier_batch_bytes, 2 * 1024 * 1024);
-usize_default!(default_web_max_frames_per_body, 4096);
-usize_default!(default_web_max_http_connections, 1024);
-usize_default!(default_web_max_http_handlers, 512);
-usize_default!(default_web_websocket_bytes_global, 256 * 1024 * 1024);
-u8_default!(default_web_websocket_admission_watermark_pct, 75);
-u8_default!(default_web_websocket_eviction_watermark_pct, 90);
-usize_default!(default_web_websocket_http_connection_reserve, 64);
-usize_default!(default_web_max_body_readers, 32);
-usize_default!(default_web_max_body_bytes_global, 64 * 1024 * 1024);
-usize_default!(default_web_max_sessions_global, 128);
-usize_default!(default_web_max_sessions_per_ip, 16);
-usize_default!(default_web_max_streams_per_session, 128);
-usize_default!(default_web_max_streams_global, 4096);
-usize_default!(default_web_max_stream_handshakes, 256);
-usize_default!(default_web_max_tombstones, 4096);
-usize_default!(default_web_pending_bytes_per_session, 32 * 1024 * 1024);
-usize_default!(default_web_pending_bytes_global, 512 * 1024 * 1024);
-usize_default!(default_web_pending_items_per_session, 16 * 1024);
-usize_default!(default_web_pending_items_global, 256 * 1024);
-usize_default!(default_web_control_bytes_per_session, 256 * 1024);
-usize_default!(default_web_control_bytes_global, 16 * 1024 * 1024);
-usize_default!(default_web_max_bootstraps_global, 512);
-usize_default!(default_web_max_bootstraps_per_ip, 64);
-usize_default!(default_web_max_vhosts, 8);
-usize_default!(default_web_max_profiles, 32);
-usize_default!(default_web_max_static_files, 4096);
-usize_default!(default_web_max_static_file_bytes, 8 * 1024 * 1024);
-usize_default!(default_web_max_static_bytes, 64 * 1024 * 1024);
-usize_default!(default_web_debug_records_capacity, 65_536);
-usize_default!(default_web_debug_bytes_global, 64 * 1024 * 1024);
-usize_default!(default_web_memory_envelope_bytes, 768 * 1024 * 1024);
-u32_default!(default_web_new_bootstraps_per_minute, 1200);
-u32_default!(default_web_new_bootstraps_burst, 256);
-u32_default!(default_web_new_sessions_per_minute, 600);
-u32_default!(default_web_new_sessions_burst, 128);
-u32_default!(default_web_new_streams_per_minute, 6000);
-u32_default!(default_web_new_streams_burst, 512);
-u64_default!(default_web_header_timeout_secs, 10);
-u64_default!(default_web_body_timeout_secs, 30);
-u64_default!(default_web_stream_handshake_timeout_secs, 10);
-u64_default!(default_web_long_poll_timeout_secs, 25);
-u64_default!(default_web_websocket_write_secs, 30);
-u64_default!(default_web_websocket_backpressure_secs, 30);
-u64_default!(default_web_websocket_eviction_secs, 1);
-u64_default!(default_web_bootstrap_lifetime_secs, 120);
-u64_default!(default_web_reconnect_grace_secs, 120);
-u64_default!(default_web_http_idle_secs, 75);
-u64_default!(default_web_shutdown_secs, 15);
-u64_default!(default_web_decoy_header_timeout_secs, 30);

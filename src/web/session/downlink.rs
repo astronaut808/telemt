@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+use super::resident::{OwnedBatchBody, PendingCounts, PendingResponseLease};
 use super::{
     DownBatch, PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState, WebSession,
 };
@@ -14,7 +16,7 @@ impl WebSession {
         if !self.carrier().is_multiplexed() {
             return Err(ManagerError::Protocol);
         }
-        let epoch = {
+        let (epoch, healthy) = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(ManagerError::Closed);
@@ -33,15 +35,29 @@ impl WebSession {
                     self.close();
                     return Err(ManagerError::Protocol);
                 }
+                let carrier_health_eligible = unacked.carrier_health_eligible;
                 self.release_unacked_locked(&mut state);
+                state.carrier_health_downlink |= carrier_health_eligible;
+                if carrier_health_eligible {
+                    state.carrier_health_activity_at = Some(Instant::now());
+                }
             } else if cursor != state.down_cursor {
                 drop(state);
                 self.close();
                 return Err(ManagerError::Protocol);
             }
-            state.down_epoch = state.down_epoch.wrapping_add(1).max(1);
-            state.down_epoch
+            let Some(epoch) = state.down_epoch.checked_add(1) else {
+                drop(state);
+                self.close();
+                return Err(ManagerError::Protocol);
+            };
+            state.down_epoch = epoch;
+            let healthy = self.carrier_health_ready_locked(&mut state, Instant::now());
+            (state.down_epoch, healthy)
         };
+        if healthy {
+            self.finish_carrier_health();
+        }
         self.down_notify.notify_waiters();
 
         let deadline = Duration::from_secs(self.timeouts.long_poll_secs);
@@ -60,6 +76,9 @@ impl WebSession {
                     if !state.pending_frames.is_empty() {
                         let batch = match self.take_down_batch_locked(&mut state, cursor) {
                             Ok(batch) => batch,
+                            Err(ManagerError::Backpressure) => {
+                                return Err(ManagerError::Backpressure);
+                            }
                             Err(error) => {
                                 drop(state);
                                 self.close();
@@ -121,6 +140,15 @@ impl WebSession {
             .limits
             .pending_items_per_session
             .saturating_sub(item_reserve);
+        let resident = self.resident.snapshot();
+        let pending_bytes = state.pending_bytes.saturating_add(resident.bytes());
+        let pending_items = state.pending_items.saturating_add(resident.items());
+        let pending_control_bytes = state
+            .pending_control_bytes
+            .saturating_add(resident.control_bytes);
+        let pending_control_items = state
+            .pending_control_items
+            .saturating_add(resident.control_items);
         if state.closed {
             return false;
         }
@@ -128,20 +156,14 @@ impl WebSession {
         let fits = if control {
             bytes <= self.limits.control_bytes_per_session
                 && items <= item_reserve
-                && state.pending_bytes
-                    <= self.limits.pending_bytes_per_session.saturating_sub(bytes)
-                && state.pending_items
-                    <= self.limits.pending_items_per_session.saturating_sub(items)
-                && state.pending_control_bytes
+                && pending_bytes <= self.limits.pending_bytes_per_session.saturating_sub(bytes)
+                && pending_items <= self.limits.pending_items_per_session.saturating_sub(items)
+                && pending_control_bytes
                     <= self.limits.control_bytes_per_session.saturating_sub(bytes)
-                && state.pending_control_items <= item_reserve.saturating_sub(items)
+                && pending_control_items <= item_reserve.saturating_sub(items)
         } else {
-            let data_bytes = state
-                .pending_bytes
-                .saturating_sub(state.pending_control_bytes);
-            let data_items = state
-                .pending_items
-                .saturating_sub(state.pending_control_items);
+            let data_bytes = pending_bytes.saturating_sub(pending_control_bytes);
+            let data_items = pending_items.saturating_sub(pending_control_items);
             let (byte_limit, item_limit) = if class == PendingClass::Downlink {
                 let uplink_bytes = self.limits.max_body_bytes.saturating_add(
                     self.limits
@@ -200,6 +222,21 @@ impl WebSession {
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.release_pending(self.profile_key, bytes, items, control);
+        }
+    }
+
+    pub(super) fn release_local_locked(
+        &self,
+        state: &mut SessionState,
+        bytes: usize,
+        items: usize,
+        control: bool,
+    ) {
+        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+        state.pending_items = state.pending_items.saturating_sub(items);
+        if control {
+            state.pending_control_bytes = state.pending_control_bytes.saturating_sub(bytes);
+            state.pending_control_items = state.pending_control_items.saturating_sub(items);
         }
     }
 
@@ -351,6 +388,12 @@ impl WebSession {
             body_len += queued.encoded.len();
             count += 1;
         }
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(ManagerError::Closed);
+        };
+        let Some(_staging) = manager.try_downlink_staging_budget(body_len) else {
+            return Err(ManagerError::Backpressure);
+        };
         let mut body = BytesMut::with_capacity(body_len);
         let mut data_bytes = 0usize;
         let mut data_items = 0usize;
@@ -383,14 +426,25 @@ impl WebSession {
             *index = index.saturating_sub(count);
         }
         state.down_cursor = next_cursor;
+        let counts = PendingCounts {
+            data_bytes,
+            data_items,
+            control_bytes,
+            control_items,
+        };
+        let lease = PendingResponseLease::new(self, counts, None);
+        let body = Bytes::from_owner(OwnedBatchBody::new(body.freeze(), Arc::clone(&lease)));
         Ok(DownBatch {
-            body: body.freeze(),
+            body,
+            lease,
             base_cursor: cursor,
             next_cursor,
             data_bytes,
             data_items,
             control_bytes,
             control_items,
+            carrier_health_eligible: state.negotiation_phase
+                == super::SessionNegotiationPhase::Committed,
         })
     }
 
@@ -398,8 +452,9 @@ impl WebSession {
         let Some(batch) = state.unacked.take() else {
             return;
         };
-        self.release_locked(state, batch.data_bytes, batch.data_items, false);
-        self.release_locked(state, batch.control_bytes, batch.control_items, true);
+        batch.lease.detach();
+        self.release_local_locked(state, batch.data_bytes, batch.data_items, false);
+        self.release_local_locked(state, batch.control_bytes, batch.control_items, true);
         for stream in state.streams.values_mut() {
             if let Some(waker) = stream.write_waker.take() {
                 waker.wake();
@@ -409,106 +464,5 @@ impl WebSession {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-
-    use crate::config::{
-        WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
-    };
-    use crate::web::manager::WebProcessRuntime;
-
-    fn session() -> Arc<WebSession> {
-        let profile = Arc::new(WebRuntimeProfile {
-            host: "proxy.example.com".to_string(),
-            public_addr: SocketAddr::from(([203, 0, 113, 10], 443)),
-            user: "alice".to_string(),
-            secret_mode: WebSecretMode::Plain,
-            carrier: WebCarrier::Https,
-            capability: [0; 32],
-            key_fingerprint: "0000000000000000".to_string(),
-            max_sessions: 1,
-            max_streams: 1,
-            max_streams_per_session: 1,
-        });
-        WebSession::new(
-            std::sync::Weak::<WebProcessRuntime>::new(),
-            [1; 32],
-            "192.0.2.10".parse().unwrap(),
-            1,
-            profile,
-            [2; 32],
-            WebLimitsConfig::default(),
-            WebTimeoutsConfig::default(),
-        )
-    }
-
-    fn queue_close(session: &WebSession) {
-        let encoded = frame::encode(FrameType::Close, 1, &[]);
-        session.state.lock().pending_frames.push_back(QueuedFrame {
-            encoded: BytesMut::from(encoded.as_ref()),
-            frame_type: FrameType::Close,
-            stream_id: 1,
-            control: true,
-            cost: frame::HEADER_BYTES + QUEUE_ITEM_COST,
-        });
-    }
-
-    #[tokio::test]
-    async fn downlink_replays_unacknowledged_batch_byte_for_byte() {
-        let session = session();
-        queue_close(&session);
-        let first = session.poll_down(0).await.unwrap();
-        let replay = session.poll_down(0).await.unwrap();
-        assert_eq!(first.next_cursor, 1);
-        assert_eq!(replay.next_cursor, 1);
-        assert_eq!(first.body, replay.body);
-    }
-
-    #[tokio::test]
-    async fn invalid_or_overflowing_cursor_closes_session() {
-        let invalid = session();
-        assert!(matches!(
-            invalid.poll_down(1).await,
-            Err(ManagerError::Protocol)
-        ));
-        assert!(invalid.state.lock().closed);
-
-        let overflow = session();
-        {
-            let mut state = overflow.state.lock();
-            state.down_cursor = u64::MAX;
-        }
-        queue_close(&overflow);
-        assert!(matches!(
-            overflow.poll_down(u64::MAX).await,
-            Err(ManagerError::Protocol)
-        ));
-        assert!(overflow.state.lock().closed);
-    }
-
-    #[tokio::test]
-    async fn newer_poll_supersedes_older_poll_without_closing_session() {
-        let session = session();
-        let first_session = Arc::clone(&session);
-        let first = tokio::spawn(async move { first_session.poll_down(0).await });
-        while session.state.lock().down_epoch < 1 {
-            tokio::task::yield_now().await;
-        }
-        let second_session = Arc::clone(&session);
-        let second = tokio::spawn(async move { second_session.poll_down(0).await });
-        while session.state.lock().down_epoch < 2 {
-            tokio::task::yield_now().await;
-        }
-        let superseded = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(superseded.body.is_empty());
-        assert_eq!(superseded.next_cursor, 0);
-        assert!(!session.state.lock().closed);
-        second.abort();
-    }
-}
+#[path = "downlink_tests.rs"]
+mod tests;
