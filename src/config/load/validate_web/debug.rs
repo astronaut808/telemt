@@ -18,7 +18,9 @@ pub(super) fn validate(policy: &WebDebugConfig, limits: &WebLimitsConfig) -> Res
         );
     }
     if policy.body_prefix_bytes > limits.max_body_bytes {
-        return config_error("web.debug.body_prefix_bytes must not exceed web.limits.max_body_bytes");
+        return config_error(
+            "web.debug.body_prefix_bytes must not exceed web.limits.max_body_bytes",
+        );
     }
     if policy.body_prefix_bytes > limits.debug_bytes_global
         || policy.decoy_body_prefix_bytes > limits.debug_bytes_global

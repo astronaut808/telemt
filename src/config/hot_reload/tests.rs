@@ -114,7 +114,10 @@ fn web_debug_prefix_requiring_deferred_capacity_is_not_hot_applied() {
     new.web.debug.body_prefix_bytes = 3 * 1024 * 1024;
 
     let applied = overlay_hot_fields(&old, &new);
-    assert_eq!(applied.web.limits.max_body_bytes, old.web.limits.max_body_bytes);
+    assert_eq!(
+        applied.web.limits.max_body_bytes,
+        old.web.limits.max_body_bytes
+    );
     assert_eq!(
         applied.web.debug.body_prefix_bytes,
         old.web.debug.body_prefix_bytes

@@ -9,9 +9,7 @@ use hyper::Request;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 
 use crate::web::manager::WebProcessRuntime;
-use crate::web::trace::{
-    HttpTraceExchange, TraceBodyState, TraceDirection,
-};
+use crate::web::trace::{HttpTraceExchange, TraceBodyState, TraceDirection};
 
 /// Incoming request body wrapper that observes frames without changing streaming semantics.
 pub(super) struct RequestBody {
@@ -28,6 +26,15 @@ impl RequestBody {
             trace,
             terminal: false,
         }
+    }
+
+    /// Completes observation for a request whose Hyper body is already empty.
+    pub(super) fn finish_empty(&mut self) -> bool {
+        if !self.inner.is_end_stream() {
+            return false;
+        }
+        self.finish(TraceBodyState::Complete);
+        true
     }
 
     fn finish(&mut self, state: TraceBodyState) {

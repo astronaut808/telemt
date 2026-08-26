@@ -232,7 +232,10 @@ async fn rejected_bridge_bootstrap_falls_back_to_uncacheable_static_index() {
     let fallback_response = request(&listener, &runtime, bridge_request()).await;
     let (fallback_headers, fallback_body) = split_response(&fallback_response);
     assert!(fallback_headers.starts_with(b"HTTP/1.1 200"));
-    assert_eq!(response_header(fallback_headers, "cache-control"), "no-store");
+    assert_eq!(
+        response_header(fallback_headers, "cache-control"),
+        "no-store"
+    );
     assert_eq!(fallback_body, b"<!doctype html><title>decoy</title>");
 
     runtime.shutdown().await;

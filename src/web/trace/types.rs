@@ -15,6 +15,8 @@ pub(crate) enum TraceRoute {
     Uplink,
     /// Carrier downlink exchange.
     Downlink,
+    /// WebSocket upgrade handshake.
+    Websocket,
 }
 
 impl TraceRoute {
@@ -27,6 +29,7 @@ impl TraceRoute {
             Self::Session => "session",
             Self::Uplink => "uplink",
             Self::Downlink => "downlink",
+            Self::Websocket => "websocket",
         }
     }
 }
@@ -180,6 +183,44 @@ pub(crate) struct TraceHttpRecord {
     pub(crate) timings: Option<TraceTimings>,
 }
 
+/// Stable non-secret metadata retained across one WebSocket connection.
+#[derive(Clone, Debug)]
+pub(crate) struct TraceWebSocketContext {
+    /// Process-unique connection identifier.
+    pub(crate) connection_id: u64,
+    /// Direct listener peer address.
+    pub(crate) peer_ip: IpAddr,
+    /// Trusted effective client address.
+    pub(crate) effective_ip: IpAddr,
+    /// Bounded user-agent copied only while debugging is enabled.
+    pub(crate) user_agent: Option<String>,
+    /// Session and profile identity without credentials.
+    pub(crate) identity: TraceIdentity,
+    /// Logical lane identifier for websocket-lanes.
+    pub(crate) lane_id: Option<u32>,
+}
+
+/// One bounded ordered WebSocket message observation.
+#[derive(Debug)]
+pub(crate) struct TraceWebSocketRecord {
+    /// Wire direction of this message.
+    pub(crate) direction: TraceDirection,
+    /// Closed RFC 6455 message category.
+    pub(crate) message_type: &'static str,
+    /// Total payload bytes observed.
+    pub(crate) payload_bytes: usize,
+    /// Policy-bounded message body observation.
+    pub(crate) body: Option<TraceBodySnapshot>,
+    /// Parsed carrier frames for binary messages.
+    pub(crate) frames: Vec<TraceFrame>,
+    /// Message processing or write duration when timing capture is enabled.
+    pub(crate) duration_us: Option<u64>,
+    /// Process-unique owning WebSocket connection.
+    pub(crate) connection_id: u64,
+    /// Logical lane identifier for websocket-lanes.
+    pub(crate) lane_id: Option<u32>,
+}
+
 /// Closed WEB lifecycle event category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TraceLifecycleEvent {
@@ -257,6 +298,8 @@ pub(crate) struct TraceLifecycleRecord {
 pub(crate) enum TraceRecordKind {
     /// HTTP request-to-response exchange.
     Http(TraceHttpRecord),
+    /// One ordered WebSocket message.
+    Websocket(TraceWebSocketRecord),
     /// Session or stream lifecycle event.
     Lifecycle(TraceLifecycleRecord),
 }

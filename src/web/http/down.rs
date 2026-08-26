@@ -32,6 +32,9 @@ pub(super) async fn handle_down(
     let Ok(session) = runtime.get_session(token_hash, &vhost.host) else {
         return serve_decoy(request, vhost, true, &runtime).await;
     };
+    if session.carrier().uses_websocket() {
+        return serve_decoy(request, vhost, true, &runtime).await;
+    }
     if let Some(trace) = request_trace(&request) {
         trace.set_route(TraceRoute::Downlink);
         trace.bind_identity(session.trace_identity());

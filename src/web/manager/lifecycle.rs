@@ -69,6 +69,8 @@ impl WebProcessRuntime {
     /// Stops issuance, closes all sessions, and joins bounded child work.
     pub(crate) async fn shutdown(&self) {
         self.shutdown.cancel();
+        self.close_websockets();
+        self.data_budget.close();
         let sessions = {
             let mut state = self.state.lock();
             state.closed = true;
@@ -94,15 +96,11 @@ impl WebProcessRuntime {
         let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), waits).await;
         self.tasks.close();
         let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), self.tasks.wait()).await;
-        let (sessions_live, streams_live, pending_bytes, pending_items) = {
+        let (sessions_live, streams_live) = {
             let state = self.state.lock();
-            (
-                state.sessions.len(),
-                state.streams_live,
-                state.pending_bytes,
-                state.pending_items,
-            )
+            (state.sessions.len(), state.streams_live)
         };
+        let budget = self.data_budget.snapshot();
         info!(
             target: "telemt::web",
             sessions_created = self.sessions_created.load(Ordering::Relaxed),
@@ -111,8 +109,10 @@ impl WebProcessRuntime {
             streams_opened = self.streams_opened.load(Ordering::Relaxed),
             streams_rejected = self.streams_rejected.load(Ordering::Relaxed),
             streams_live,
-            pending_bytes,
-            pending_items,
+            pending_bytes = budget.queue_bytes,
+            pending_items = budget.queue_items,
+            websocket_bytes = budget.websocket_bytes,
+            data_high_water_bytes = budget.high_water_bytes,
             bytes_up = self.bytes_up.load(Ordering::Relaxed),
             bytes_down = self.bytes_down.load(Ordering::Relaxed),
             limit_hits = self.limit_hits.load(Ordering::Relaxed),
@@ -122,6 +122,7 @@ impl WebProcessRuntime {
 
     /// Expires credentials and closes idle sessions without holding locks across callbacks.
     pub(super) fn cleanup(&self) {
+        self.cleanup_websockets();
         let now = Instant::now();
         let sessions = {
             let mut state = self.state.lock();

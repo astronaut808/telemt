@@ -9,16 +9,14 @@ use crate::config::WebCarrier;
 use crate::web::frame;
 
 /// Validates and resolves the optional carrier lane header.
-pub(super) fn carrier_lane<B>(
-    request: &Request<B>,
-    carrier: WebCarrier,
-) -> Option<Option<u32>> {
+pub(super) fn carrier_lane<B>(request: &Request<B>, carrier: WebCarrier) -> Option<Option<u32>> {
     match carrier {
         WebCarrier::Https => (!request.headers().contains_key("x-lane-id")).then_some(None),
         WebCarrier::HttpsLanes => canonical_u64_header(request, "x-lane-id")
             .and_then(|value| u32::try_from(value).ok())
             .filter(|value| *value <= frame::MAX_STREAM_ID)
             .map(Some),
+        WebCarrier::Websocket | WebCarrier::WebsocketLanes => None,
     }
 }
 

@@ -18,9 +18,7 @@ async fn make_pool() -> (Arc<MePool>, Arc<SecureRandom>) {
     make_pool_with_decision(NetworkDecision::default()).await
 }
 
-async fn make_pool_with_decision(
-    decision: NetworkDecision,
-) -> (Arc<MePool>, Arc<SecureRandom>) {
+async fn make_pool_with_decision(decision: NetworkDecision) -> (Arc<MePool>, Arc<SecureRandom>) {
     let general = GeneralConfig {
         me_route_no_writer_mode: MeRouteNoWriterMode::AsyncRecoveryFailfast,
         me_route_no_writer_wait_ms: 50,

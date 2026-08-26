@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::BodyExt;
+use http_body_util::combinators::UnsyncBoxBody;
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -34,13 +34,16 @@ mod down;
 mod request;
 // Carrier response construction and lane-header helpers are shared by handlers.
 mod response;
+// RFC 6455 upgrade validation and carrier drivers remain isolated from HTTP routing.
 #[cfg(test)]
 mod tests;
+mod websocket;
 // Enabled-debug integration coverage remains separate from carrier behavior tests.
 #[cfg(test)]
 #[path = "http/trace_tests.rs"]
 mod trace_tests;
 
+use crate::web::trace::{HttpTraceExchange, TraceDirection, TraceLifecycleEvent, TraceRoute};
 use activity::{ActivityBody, RequestActivity};
 use body::{CollectBodyError, CollectedBody, RequestBody, collect_body};
 use decoy::serve_decoy;
@@ -53,9 +56,6 @@ use response::{
     bad_gateway, carrier_empty, carrier_headers, carrier_lane, full_response, generic_not_found,
     insert_header, service_unavailable,
 };
-use crate::web::trace::{
-    HttpTraceExchange, TraceDirection, TraceLifecycleEvent, TraceRoute,
-};
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type HttpBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -63,6 +63,7 @@ type HttpResponse = Response<HttpBody>;
 
 const CREATE_BODY_LIMIT: usize = 64;
 const TRANSPORT_PATHS: [&str; 3] = ["/api/v1/session", "/api/v1/up", "/api/v1/down"];
+const WEBSOCKET_PATH: &str = "/api/v1/ws";
 
 /// Serves one bounded HTTP/1.1 connection accepted from an external TLS terminator.
 pub(crate) async fn serve_connection(
@@ -107,8 +108,8 @@ pub(crate) async fn serve_connection(
             if let Some(trace) = &trace {
                 trace.response_ready(&response);
             }
-            let response = response
-                .map(|body| ActivityBody::new(body, activity, trace).boxed_unsync());
+            let response =
+                response.map(|body| ActivityBody::new(body, activity, trace).boxed_unsync());
             Ok::<_, Infallible>(response)
         }
     });
@@ -117,7 +118,11 @@ pub(crate) async fn serve_connection(
         .header_read_timeout(header_timeout)
         .max_buf_size(max_header_bytes)
         .keep_alive(true)
-        .serve_connection(TokioIo::new(stream), service);
+        .serve_connection(
+            TokioIo::new(websocket::ConnectionIo::new(stream, connection_permit)),
+            service,
+        )
+        .with_upgrades();
     tokio::pin!(connection);
     let mut idle_check = tokio::time::interval((idle_timeout / 2).max(Duration::from_secs(1)));
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -135,7 +140,6 @@ pub(crate) async fn serve_connection(
             }
         }
     }
-    drop(connection_permit);
 }
 
 async fn handle_request(
@@ -163,6 +167,17 @@ async fn handle_request(
         return generic_not_found();
     };
     let path = request.uri().path();
+    if path == WEBSOCKET_PATH {
+        return websocket::handle(
+            request,
+            peer,
+            client_ip_source,
+            trusted_proxy_cidrs,
+            runtime,
+            vhost,
+        )
+        .await;
+    }
     if TRANSPORT_PATHS.contains(&path) {
         return handle_api(
             request,
@@ -394,7 +409,9 @@ async fn handle_session(
             );
             response
         }
-        Err(error @ (ManagerError::Limit | ManagerError::Backpressure | ManagerError::Concurrent)) => {
+        Err(
+            error @ (ManagerError::Limit | ManagerError::Backpressure | ManagerError::Concurrent),
+        ) => {
             runtime.trace().record_profile_lifecycle(
                 client_ip,
                 Some(trace_session_id),
@@ -435,6 +452,9 @@ async fn handle_up(
     let Ok(session) = runtime.get_session(token_hash, &vhost.host) else {
         return serve_decoy(request, vhost, true, &runtime).await;
     };
+    if session.carrier().uses_websocket() {
+        return serve_decoy(request, vhost, true, &runtime).await;
+    }
     if let Some(trace) = request_trace(&request) {
         trace.set_route(TraceRoute::Uplink);
         trace.bind_identity(session.trace_identity());

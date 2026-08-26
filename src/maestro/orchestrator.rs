@@ -318,11 +318,8 @@ pub(super) async fn run_telemt_core(
     active_runtime_tx.send_replace(Some(active_runtime.clone()));
     runtime_tasks::mark_runtime_ready(&startup_tracker).await;
 
-    let listener_manager = listeners::ListenerManager::start(
-        bound,
-        active_runtime.clone(),
-        web_trace.clone(),
-    );
+    let listener_manager =
+        listeners::ListenerManager::start(bound, active_runtime.clone(), web_trace.clone());
     let reload_supervisor = reload_supervisor::ReloadSupervisor::spawn(
         active_runtime.clone(),
         reload_control,

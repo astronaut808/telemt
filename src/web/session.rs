@@ -22,6 +22,9 @@ mod backend;
 mod downlink;
 // Lane carrier state isolates request sequencing and downlink replay per logical stream.
 mod lanes;
+// WebSocket carrier state owns pre-OPEN lane reservations and failure isolation.
+mod websocket;
+pub(crate) use websocket::WebSocketLaneReservation;
 // Uplink batches own exactly-once sequencing and client-frame validation.
 mod uplink;
 
@@ -107,6 +110,7 @@ struct SessionState {
     last_up_sequence: u64,
     last_up_digest: TokenHash,
     carrier_lanes: HashMap<u32, CarrierLane>,
+    websocket_lane_reservations: HashMap<u32, u16>,
     pending_bytes: usize,
     pending_items: usize,
     pending_control_bytes: usize,
@@ -183,6 +187,7 @@ impl WebSession {
                 last_up_sequence: 0,
                 last_up_digest: [0; 32],
                 carrier_lanes,
+                websocket_lane_reservations: HashMap::new(),
                 pending_bytes: 0,
                 pending_items: 0,
                 pending_control_bytes: 0,
@@ -212,6 +217,16 @@ impl WebSession {
     /// Returns the immutable carrier selected when this session was created.
     pub(crate) fn carrier(&self) -> WebCarrier {
         self.profile.carrier
+    }
+
+    /// Returns the stable quota owner without exposing profile credentials.
+    pub(crate) fn profile_key(&self) -> ProfileKey {
+        self.profile_key
+    }
+
+    /// Returns the process-unique non-secret trace identifier.
+    pub(crate) fn trace_session_id(&self) -> u64 {
+        self.trace_session_id
     }
 
     /// Returns a cloned non-secret identity only for enabled debug capture.
@@ -273,12 +288,12 @@ impl WebSession {
             (data_bytes, data_items, control_bytes, control_items)
         };
         self.cancel.cancel();
-        if self.carrier() == WebCarrier::Https {
+        if self.carrier().is_multiplexed() {
             self.down_notify.notify_waiters();
         }
         if let Some(manager) = self.manager.upgrade() {
-            manager.release_pending(data_bytes, data_items, false);
-            manager.release_pending(control_bytes, control_items, true);
+            manager.release_pending(self.profile_key, data_bytes, data_items, false);
+            manager.release_pending(self.profile_key, control_bytes, control_items, true);
             if !self.finished.swap(true, Ordering::AcqRel) {
                 self.trace_lifecycle(
                     crate::web::trace::TraceLifecycleEvent::SessionClosed,
@@ -394,7 +409,7 @@ impl WebSession {
         stream.send_credit -= count as u64;
         state.last_activity = Instant::now();
         drop(state);
-        if self.carrier() == WebCarrier::Https {
+        if self.carrier().is_multiplexed() {
             self.down_notify.notify_waiters();
         }
         Poll::Ready(Ok(count))

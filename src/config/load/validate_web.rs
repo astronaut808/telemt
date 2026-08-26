@@ -6,6 +6,8 @@ use super::*;
 mod debug;
 // Memory-envelope arithmetic remains isolated from protocol validation.
 mod memory;
+// WebSocket transport policy is validated independently from HTTP body policy.
+mod websocket;
 
 const WEB_FRAME_HEADER_BYTES: usize = 8;
 const WEB_QUEUE_ITEM_COST: usize = 256;
@@ -69,6 +71,7 @@ pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
         return config_error("web.carrier=https-lanes requires web.limits.max_http_handlers >= 2");
     }
     validate_timeouts(&config.web.timeouts)?;
+    websocket::validate(config.web.carrier, &config.web.limits, &config.web.timeouts)?;
     validate_vhosts(config)?;
     Ok(())
 }
@@ -327,6 +330,12 @@ fn validate_timeouts(timeouts: &WebTimeoutsConfig) -> Result<()> {
         ("body_secs", timeouts.body_secs),
         ("stream_handshake_secs", timeouts.stream_handshake_secs),
         ("long_poll_secs", timeouts.long_poll_secs),
+        ("websocket_write_secs", timeouts.websocket_write_secs),
+        (
+            "websocket_backpressure_secs",
+            timeouts.websocket_backpressure_secs,
+        ),
+        ("websocket_eviction_secs", timeouts.websocket_eviction_secs),
         ("bootstrap_lifetime_secs", timeouts.bootstrap_lifetime_secs),
         ("reconnect_grace_secs", timeouts.reconnect_grace_secs),
         ("http_idle_secs", timeouts.http_idle_secs),

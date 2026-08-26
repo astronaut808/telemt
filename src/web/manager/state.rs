@@ -8,9 +8,11 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::{ProfileKey, TOKEN_BYTES, TokenHash};
-use crate::config::{WebLimitsConfig, WebRuntimeConfig, WebRuntimeProfile};
+use crate::config::{WebRuntimeConfig, WebRuntimeProfile};
 use crate::maestro::generation::RuntimeGeneration;
 use crate::web::session::WebSession;
+
+const WEB_PROFILE_OWNER_CONTEXT: &[u8] = b"telemt-web-profile-owner-v1\0";
 
 /// One issued bootstrap and optional idempotent session-creation replay state.
 pub(super) struct Bootstrap {
@@ -74,14 +76,6 @@ pub(super) struct ManagerState {
     /// Process-wide live relay-task count.
     pub(super) streams_live: usize,
     stream_ports: HashMap<(IpAddr, SocketAddr), StreamPortState>,
-    /// Total process-wide queued byte reservation.
-    pub(super) pending_bytes: usize,
-    /// Total process-wide queued item reservation.
-    pub(super) pending_items: usize,
-    /// Portion of queued bytes charged to the control reserve.
-    pub(super) pending_control_bytes: usize,
-    /// Portion of queued items charged to the control reserve.
-    pub(super) pending_control_items: usize,
     /// Bootstrap issuance rate limiter.
     pub(super) bootstrap_rate: RateState,
     /// Session creation rate limiter.
@@ -112,9 +106,19 @@ pub(super) fn new_unique_token(
     None
 }
 
-/// Returns the precomputed capability as the stable process profile key.
+/// Derives a secret-independent quota owner stable across capability rotation.
 pub(super) fn profile_key(profile: &WebRuntimeProfile) -> ProfileKey {
-    profile.capability
+    let mut digest = Sha256::new();
+    digest.update(WEB_PROFILE_OWNER_CONTEXT);
+    digest.update((profile.host.len() as u64).to_be_bytes());
+    digest.update(profile.host.as_bytes());
+    digest.update((profile.user.len() as u64).to_be_bytes());
+    digest.update(profile.user.as_bytes());
+    digest.update([match profile.secret_mode {
+        crate::config::WebSecretMode::Plain => 0,
+        crate::config::WebSecretMode::Dd => 1,
+    }]);
+    digest.finalize().into()
 }
 
 /// Re-resolves an issued profile against the active generation without weakening identity.
@@ -209,13 +213,6 @@ where
     if remove {
         values.remove(key);
     }
-}
-
-/// Computes the process-wide item reserve required for session control progress.
-pub(super) fn control_item_reserve(limits: &WebLimitsConfig) -> usize {
-    limits
-        .max_sessions_global
-        .saturating_mul(16usize.saturating_add(limits.max_streams_per_session.saturating_mul(3)))
 }
 
 /// Allocates a non-zero source port unique among live streams for one KDF route.

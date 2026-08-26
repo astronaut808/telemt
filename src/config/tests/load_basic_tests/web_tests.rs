@@ -64,10 +64,13 @@ fn web_debug_table_uses_debug_name_and_bounded_defaults() {
     assert_eq!(config.web.debug.default_window_secs, 180);
     assert_eq!(config.web.debug.max_window_secs, 900);
 
-    let old_name = format!("[general]\nconfig_strict = true\n{}", WEB_CONFIG.replace(
-        "[[web.vhosts]]",
-        "[web.trace]\nenabled = true\n\n[[web.vhosts]]",
-    ));
+    let old_name = format!(
+        "[general]\nconfig_strict = true\n{}",
+        WEB_CONFIG.replace(
+            "[[web.vhosts]]",
+            "[web.trace]\nenabled = true\n\n[[web.vhosts]]",
+        )
+    );
     let error = load_config_error_from_temp_toml(&old_name);
     assert!(error.contains("web.trace"));
 }
@@ -149,4 +152,53 @@ fn web_ipv6_decoy_uses_a_valid_http_authority() {
         panic!("expected HTTP decoy");
     };
     assert_eq!(authority, "[::1]:18081");
+}
+
+#[test]
+fn websocket_carriers_build_runtime_profiles_with_bounded_defaults() {
+    for (name, carrier) in [
+        ("websocket", WebCarrier::Websocket),
+        ("websocket-lanes", WebCarrier::WebsocketLanes),
+    ] {
+        let configured = WEB_CONFIG.replace("https-lanes", name);
+        let config = load_config_from_temp_toml(&configured);
+        let profile = &config.web.runtime.unwrap().profiles[0];
+        assert_eq!(profile.carrier, carrier);
+        assert_eq!(config.web.limits.websocket_bytes_global, 256 * 1024 * 1024);
+        assert_eq!(config.web.limits.websocket_admission_watermark_pct, 75);
+        assert_eq!(config.web.limits.websocket_eviction_watermark_pct, 90);
+        assert_eq!(config.web.limits.websocket_http_connection_reserve, 64);
+        assert_eq!(config.web.timeouts.websocket_write_secs, 30);
+        assert_eq!(config.web.timeouts.websocket_backpressure_secs, 30);
+        assert_eq!(config.web.timeouts.websocket_eviction_secs, 1);
+    }
+}
+
+#[test]
+fn websocket_limits_reject_ambiguous_or_nonprogressing_policy() {
+    let reversed_watermarks = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"websocket\"\n\n[web.limits]\nwebsocket_admission_watermark_pct = 90\nwebsocket_eviction_watermark_pct = 75",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&reversed_watermarks).contains("WebSocket watermarks")
+    );
+
+    let no_http_reserve = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"websocket\"\n\n[web.limits]\nwebsocket_http_connection_reserve = 0",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&no_http_reserve)
+            .contains("websocket_http_connection_reserve")
+    );
+
+    let oversized_batch = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"websocket\"\n\n[web.limits]\nmax_body_bytes = 4194304\ncarrier_batch_bytes = 4194304\nmax_body_readers = 16",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&oversized_batch)
+            .contains("carrier_batch_bytes <= 2097152")
+    );
 }

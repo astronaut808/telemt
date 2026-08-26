@@ -101,8 +101,9 @@ pub(super) fn parse_query(
                 query.key = Some(value.to_string());
             }
             "group_by" => {
-                let group = GroupBy::parse(value)
-                    .ok_or_else(|| "group_by must be ip, session, user_agent, or key".to_string())?;
+                let group = GroupBy::parse(value).ok_or_else(|| {
+                    "group_by must be ip, session, user_agent, or key".to_string()
+                })?;
                 if query.group_by.contains(&group) {
                     return Err("group_by values must not repeat".to_string());
                 }
@@ -140,11 +141,7 @@ fn parse_positive_u64(value: &str, field: &str) -> Result<u64, String> {
 }
 
 /// Applies the complete filter predicate to one immutable record.
-pub(super) fn record_matches(
-    record: &TraceRecord,
-    query: &StatusQuery,
-    since_millis: u64,
-) -> bool {
+pub(super) fn record_matches(record: &TraceRecord, query: &StatusQuery, since_millis: u64) -> bool {
     !(record.epoch_millis < since_millis
         || query.before_seq.is_some_and(|before| record.seq >= before)
         || query.record.is_some_and(|seq| record.seq != seq)

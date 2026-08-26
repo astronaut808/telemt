@@ -13,9 +13,7 @@ use crate::config::{
     WebSecretMode,
 };
 use crate::crypto::{AesCtr, sha256};
-use crate::maestro::generation::{
-    RuntimeGeneration, test_runtime_generation_with_admission,
-};
+use crate::maestro::generation::{RuntimeGeneration, test_runtime_generation_with_admission};
 use crate::protocol::constants::{
     DC_IDX_POS, HANDSHAKE_LEN, IV_LEN, PREKEY_LEN, PROTO_TAG_POS, ProtoTag, SKIP_LEN,
 };
@@ -39,10 +37,11 @@ impl TestRuntime {
     ) -> Result<u64, ManagerError> {
         let encoded = frame::encode(frame_type, stream_id, payload);
         match self.session.carrier() {
-            WebCarrier::Https => self.session.process_up(sequence, &encoded),
-            WebCarrier::HttpsLanes => {
-                self.session
-                    .process_up_lane(stream_id, sequence, &encoded)
+            WebCarrier::Https | WebCarrier::Websocket => {
+                self.session.process_up(sequence, &encoded)
+            }
+            WebCarrier::HttpsLanes | WebCarrier::WebsocketLanes => {
+                self.session.process_up_lane(stream_id, sequence, &encoded)
             }
         }
     }
@@ -152,8 +151,7 @@ fn valid_plain_handshake() -> [u8; HANDSHAKE_LEN] {
     let mut cipher = AesCtr::new(&dec_key, u128::from_be_bytes(dec_iv));
     let keystream = cipher.encrypt(&[0u8; HANDSHAKE_LEN]);
     let mut plaintext = [0u8; HANDSHAKE_LEN];
-    plaintext[PROTO_TAG_POS..PROTO_TAG_POS + 4]
-        .copy_from_slice(&ProtoTag::Intermediate.to_bytes());
+    plaintext[PROTO_TAG_POS..PROTO_TAG_POS + 4].copy_from_slice(&ProtoTag::Intermediate.to_bytes());
     plaintext[DC_IDX_POS..DC_IDX_POS + 2].copy_from_slice(&2i16.to_le_bytes());
     for index in PROTO_TAG_POS..HANDSHAKE_LEN {
         handshake[index] = plaintext[index] ^ keystream[index];

@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::header::{self, HeaderValue};
@@ -9,16 +8,17 @@ use hyper::{Response, StatusCode};
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::config::WebDebugConfig;
-use crate::web::trace::{
-    StoredTraceRecord, TraceRecord, TraceRecordKind, WebTraceStore,
-};
+use crate::web::trace::{StoredTraceRecord, TraceRecord, TraceRecordKind, WebTraceStore};
 
 const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GROUPS: usize = 1024;
 
+// Record-detail rendering remains isolated from filtering and page layout.
+mod details;
 // Query parsing and matching remain independent from bounded HTML rendering.
 mod query;
 
+use details::{push_body, push_frames, push_headers};
 use query::{GroupBy, StatusQuery, client_ip, parse_query, record_matches};
 
 struct GroupSummary {
@@ -119,11 +119,18 @@ fn push_page_start(html: &mut String) {
 fn push_filter_form(html: &mut String, query: &StatusQuery) {
     html.push_str("<section><h2>Filters</h2><form method=\"get\" action=\"/web-status\">");
     input(html, "window_secs", &query.window_secs.to_string());
-    input(html, "ip", &query.ip.map(|value| value.to_string()).unwrap_or_default());
+    input(
+        html,
+        "ip",
+        &query.ip.map(|value| value.to_string()).unwrap_or_default(),
+    );
     input(
         html,
         "session",
-        &query.session.map(|value| value.to_string()).unwrap_or_default(),
+        &query
+            .session
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
     );
     input(
         html,
@@ -133,7 +140,12 @@ fn push_filter_form(html: &mut String, query: &StatusQuery) {
     input(html, "key", query.key.as_deref().unwrap_or_default());
     input(html, "limit", &query.limit.to_string());
     html.push_str("<label>group_by<select name=\"group_by\" multiple size=\"4\">");
-    for group in [GroupBy::Ip, GroupBy::Session, GroupBy::UserAgent, GroupBy::Key] {
+    for group in [
+        GroupBy::Ip,
+        GroupBy::Session,
+        GroupBy::UserAgent,
+        GroupBy::Key,
+    ] {
         html.push_str("<option value=\"");
         html.push_str(group.as_str());
         if query.group_by.contains(&group) {
@@ -165,11 +177,7 @@ fn summary_row(html: &mut String, name: &str, value: &str) {
     html.push_str("</td></tr>");
 }
 
-fn push_groups(
-    html: &mut String,
-    records: &[Arc<StoredTraceRecord>],
-    groups: &[GroupBy],
-) {
+fn push_groups(html: &mut String, records: &[Arc<StoredTraceRecord>], groups: &[GroupBy]) {
     let mut summaries = BTreeMap::<Vec<String>, GroupSummary>::new();
     let mut overflow = 0usize;
     for stored in records {
@@ -275,7 +283,15 @@ fn push_record(html: &mut String, record: &TraceRecord) {
             "http",
             http.route.as_str(),
             http.method.as_str(),
-            http.status.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string()),
+            http.status
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+        TraceRecordKind::Websocket(message) => (
+            "websocket",
+            message.direction.as_str(),
+            message.message_type,
+            message.payload_bytes.to_string(),
         ),
         TraceRecordKind::Lifecycle(event) => (
             "lifecycle",
@@ -327,83 +343,46 @@ fn push_record(html: &mut String, record: &TraceRecord) {
                 html.push_str(&option_u64(timings.response_body_us));
                 html.push_str(" us\n(kernel flush and TCP ACK are not observed)</pre>");
             }
-            if !http.frames.is_empty() {
-                html.push_str("<h3>frames</h3><table><tr><th>dir</th><th>type</th><th>stream/lane</th><th>payload</th><th>WINDOW</th><th>error</th></tr>");
-                for frame in &http.frames {
-                    html.push_str("<tr>");
-                    for value in [
-                        frame.direction.as_str().to_string(),
-                        frame.frame_type.unwrap_or("-").to_string(),
-                        frame.stream_id.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        frame.payload_len.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        frame.window_delta.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()),
-                        frame.parse_error.unwrap_or("-").to_string(),
-                    ] {
-                        html.push_str("<td>");
-                        escape(html, &value);
-                        html.push_str("</td>");
-                    }
-                    html.push_str("</tr>");
-                }
-                html.push_str("</table>");
-            }
+            push_frames(html, &http.frames);
+        }
+        TraceRecordKind::Websocket(message) => {
+            html.push_str("<pre>connection: ");
+            html.push_str(&message.connection_id.to_string());
+            html.push_str("\nlane: ");
+            html.push_str(
+                &message
+                    .lane_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            html.push_str("\ndirection: ");
+            html.push_str(message.direction.as_str());
+            html.push_str("\nmessage: ");
+            html.push_str(message.message_type);
+            html.push_str("\npayload bytes: ");
+            html.push_str(&message.payload_bytes.to_string());
+            html.push_str("\nduration: ");
+            html.push_str(&option_u64(message.duration_us));
+            html.push_str(" us</pre>");
+            push_body(html, "message body", message.body.as_ref());
+            push_frames(html, &message.frames);
         }
         TraceRecordKind::Lifecycle(event) => {
             html.push_str("<pre>event: ");
             html.push_str(event.event.as_str());
             html.push_str("\nstream: ");
-            html.push_str(&event.stream_id.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string()));
+            html.push_str(
+                &event
+                    .stream_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
             html.push_str("\nreason: ");
             html.push_str(event.reason.unwrap_or("-"));
             html.push_str("</pre>");
         }
     }
     html.push_str("</details></td></tr>");
-}
-
-fn push_headers(html: &mut String, title: &str, headers: &[crate::web::trace::TraceHeader]) {
-    html.push_str("<h3>");
-    escape(html, title);
-    html.push_str("</h3><pre>");
-    for header in headers {
-        escape(html, &header.name);
-        html.push_str(": ");
-        escape(html, header.value.as_deref().unwrap_or("[value omitted]"));
-        html.push('\n');
-    }
-    html.push_str("</pre>");
-}
-
-fn push_body(
-    html: &mut String,
-    title: &str,
-    body: Option<&crate::web::trace::TraceBodySnapshot>,
-) {
-    html.push_str("<h3>");
-    escape(html, title);
-    html.push_str("</h3>");
-    let Some(body) = body else {
-        html.push_str("<p class=\"muted\">capture off</p>");
-        return;
-    };
-    html.push_str("<p>observed=");
-    html.push_str(&body.observed_bytes.to_string());
-    html.push_str(" captured=");
-    html.push_str(&body.captured.len().to_string());
-    html.push_str(" state=");
-    html.push_str(body.state.as_str());
-    html.push_str(" truncated=");
-    html.push_str(yes_no(body.truncated));
-    html.push_str("</p><pre>");
-    let available = MAX_PAGE_BYTES.saturating_sub(html.len()).saturating_sub(4096);
-    let raw_limit = available.saturating_mul(3) / 4;
-    let shown = body.captured.len().min(raw_limit);
-    base64::engine::general_purpose::STANDARD
-        .encode_string(&body.captured[..shown], html);
-    if shown < body.captured.len() {
-        html.push_str("\n[page output truncated]");
-    }
-    html.push_str("</pre>");
 }
 
 fn pagination_url(query: &StatusQuery, before_seq: u64) -> String {
@@ -436,7 +415,9 @@ fn format_time(epoch_millis: u64) -> String {
 }
 
 fn option_u64(value: Option<u64>) -> String {
-    value.map(|value| value.to_string()).unwrap_or_else(|| "-".to_string())
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn body_mode(policy: &WebDebugConfig) -> &'static str {

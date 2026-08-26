@@ -1,6 +1,7 @@
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -21,7 +22,14 @@ mod credentials;
 mod admission;
 // Shutdown and expiry work remain outside request-path coordination.
 mod lifecycle;
-use state::{ManagerState, control_item_reserve};
+// Queue and WebSocket allocations share one process-owned data-plane budget.
+mod budget;
+// WebSocket admission, replacement, and liveness are process-scoped.
+mod websocket;
+pub(crate) use budget::WebSocketBudgetLease;
+use budget::{WebDataBudget, WebSocketBudgetClass};
+use state::ManagerState;
+pub(crate) use websocket::{WebSocketConnection, WebSocketKind};
 
 const TOKEN_BYTES: usize = 32;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
@@ -76,8 +84,12 @@ pub(crate) struct WebProcessRuntime {
     body_readers: Arc<Semaphore>,
     body_bytes: Arc<Semaphore>,
     stream_handshakes: Arc<Semaphore>,
-    budget_notify: Arc<Notify>,
-    budget_saturated: AtomicBool,
+    websocket_connections: Arc<Semaphore>,
+    websockets: Mutex<websocket::WebSocketRegistry>,
+    websocket_next_id: AtomicU64,
+    websocket_clock: std::time::Instant,
+    websocket_notify: Arc<Notify>,
+    data_budget: Arc<WebDataBudget>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
     sessions_created: AtomicU64,
@@ -104,6 +116,9 @@ impl WebProcessRuntime {
         trace: Arc<WebTraceStore>,
     ) -> Arc<Self> {
         let limits = active_runtime.load().config().web.limits.clone();
+        let websocket_connections = limits
+            .max_http_connections
+            .saturating_sub(limits.websocket_http_connection_reserve);
         let runtime = Arc::new(Self {
             active_runtime,
             trace,
@@ -113,10 +128,14 @@ impl WebProcessRuntime {
             body_readers: Arc::new(Semaphore::new(limits.max_body_readers)),
             body_bytes: Arc::new(Semaphore::new(limits.max_body_bytes_global)),
             stream_handshakes: Arc::new(Semaphore::new(limits.max_stream_handshakes)),
+            websocket_connections: Arc::new(Semaphore::new(websocket_connections)),
+            websockets: Mutex::new(websocket::WebSocketRegistry::default()),
+            websocket_next_id: AtomicU64::new(1),
+            websocket_clock: std::time::Instant::now(),
+            websocket_notify: Arc::new(Notify::new()),
+            data_budget: WebDataBudget::new(limits.clone()),
             limits,
             state: Mutex::new(ManagerState::default()),
-            budget_notify: Arc::new(Notify::new()),
-            budget_saturated: AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
             sessions_created: AtomicU64::new(0),
@@ -235,89 +254,80 @@ impl WebProcessRuntime {
     /// Reserves bounded process-wide queue capacity for data or control traffic.
     pub(crate) fn try_reserve_pending(
         &self,
+        owner: ProfileKey,
         bytes: usize,
         items: usize,
         control: bool,
         downlink: bool,
     ) -> bool {
-        let mut state = self.state.lock();
-        let data_byte_limit = self
-            .limits
-            .pending_bytes_global
-            .saturating_sub(self.limits.control_bytes_global);
-        let control_item_reserve = control_item_reserve(&self.limits);
-        let data_item_limit = self
-            .limits
-            .pending_items_global
-            .saturating_sub(control_item_reserve);
-        if state.closed {
-            return false;
-        }
-        let fits = if control {
-            bytes <= self.limits.control_bytes_global
-                && items <= control_item_reserve
-                && state.pending_bytes <= self.limits.pending_bytes_global.saturating_sub(bytes)
-                && state.pending_items <= self.limits.pending_items_global.saturating_sub(items)
-                && state.pending_control_bytes
-                    <= self.limits.control_bytes_global.saturating_sub(bytes)
-                && state.pending_control_items <= control_item_reserve.saturating_sub(items)
-        } else {
-            let data_bytes = state
-                .pending_bytes
-                .saturating_sub(state.pending_control_bytes);
-            let data_items = state
-                .pending_items
-                .saturating_sub(state.pending_control_items);
-            let (byte_limit, item_limit) = if downlink {
-                let uplink_bytes = self.limits.max_body_bytes.saturating_add(
-                    self.limits
-                        .max_frames_per_body
-                        .saturating_mul(crate::web::session::QUEUE_ITEM_COST),
-                );
-                (
-                    data_byte_limit.saturating_sub(uplink_bytes),
-                    data_item_limit.saturating_sub(self.limits.max_frames_per_body),
-                )
-            } else {
-                (data_byte_limit, data_item_limit)
-            };
-            bytes <= byte_limit
-                && items <= item_limit
-                && data_bytes <= byte_limit - bytes
-                && data_items <= item_limit - items
-        };
-        if !fits {
-            self.budget_saturated.store(true, Ordering::Release);
+        if !self
+            .data_budget
+            .try_reserve_queue(owner, bytes, items, control, downlink)
+        {
             self.record_limit_hit();
             return false;
-        }
-        state.pending_bytes += bytes;
-        state.pending_items += items;
-        if control {
-            state.pending_control_bytes += bytes;
-            state.pending_control_items += items;
         }
         true
     }
 
     /// Releases process-wide queue capacity and wakes blocked relay writers.
-    pub(crate) fn release_pending(&self, bytes: usize, items: usize, control: bool) {
-        let mut state = self.state.lock();
-        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
-        state.pending_items = state.pending_items.saturating_sub(items);
-        if control {
-            state.pending_control_bytes = state.pending_control_bytes.saturating_sub(bytes);
-            state.pending_control_items = state.pending_control_items.saturating_sub(items);
-        }
-        drop(state);
-        if self.budget_saturated.swap(false, Ordering::AcqRel) {
-            self.budget_notify.notify_waiters();
-        }
+    pub(crate) fn release_pending(
+        &self,
+        owner: ProfileKey,
+        bytes: usize,
+        items: usize,
+        control: bool,
+    ) {
+        self.data_budget.release_queue(owner, bytes, items, control);
     }
 
     /// Returns the shared notification source for global queue capacity changes.
     pub(crate) fn budget_notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.budget_notify)
+        self.data_budget.notify()
+    }
+
+    /// Reserves fixed WebSocket driver memory below the admission watermark.
+    pub(crate) fn try_websocket_base_budget(
+        &self,
+        owner: ProfileKey,
+        bytes: usize,
+    ) -> Option<WebSocketBudgetLease> {
+        self.data_budget
+            .try_reserve_websocket(owner, bytes, WebSocketBudgetClass::Base)
+    }
+
+    /// Reserves one transient WebSocket message below the eviction watermark.
+    pub(crate) fn try_websocket_data_budget(
+        &self,
+        owner: ProfileKey,
+        bytes: usize,
+    ) -> Option<WebSocketBudgetLease> {
+        self.data_budget
+            .try_reserve_websocket(owner, bytes, WebSocketBudgetClass::Data)
+    }
+
+    /// Admits one WebSocket with owner-first bounded replacement.
+    pub(crate) async fn admit_websocket(
+        self: &Arc<Self>,
+        owner: ProfileKey,
+        session_id: u64,
+        client_ip: IpAddr,
+        kind: WebSocketKind,
+        base_bytes: usize,
+        liveness_interval: Duration,
+        eviction_timeout: Duration,
+    ) -> Result<WebSocketConnection, ManagerError> {
+        websocket::admit(
+            self,
+            owner,
+            session_id,
+            client_ip,
+            kind,
+            base_bytes,
+            liveness_interval,
+            eviction_timeout,
+        )
+        .await
     }
 
     /// Accounts one successfully committed carrier uplink body.

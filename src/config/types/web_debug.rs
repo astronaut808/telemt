@@ -90,10 +90,7 @@ fn default_max_window_secs() -> u64 {
 }
 
 /// Checks whether a hot debug policy fits restart-frozen process capacities.
-pub(crate) fn web_debug_fits_limits(
-    policy: &WebDebugConfig,
-    limits: &WebLimitsConfig,
-) -> bool {
+pub(crate) fn web_debug_fits_limits(policy: &WebDebugConfig, limits: &WebLimitsConfig) -> bool {
     policy.body_prefix_bytes <= limits.max_body_bytes
         && policy.body_prefix_bytes <= limits.debug_bytes_global
         && policy.decoy_body_prefix_bytes <= limits.debug_bytes_global

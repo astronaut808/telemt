@@ -18,7 +18,7 @@ pub enum WebSecretMode {
     Dd,
 }
 
-/// HTTP carrier selected for newly issued WEB bridge sessions.
+/// Carrier selected for newly issued WEB bridge sessions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WebCarrier {
@@ -27,6 +27,10 @@ pub enum WebCarrier {
     Https,
     /// Give every logical stream independent HTTPS sequencing and polling state.
     HttpsLanes,
+    /// Multiplex all logical streams over one ordered WebSocket.
+    Websocket,
+    /// Give every logical stream an independently owned WebSocket lane.
+    WebsocketLanes,
 }
 
 impl WebCarrier {
@@ -35,7 +39,24 @@ impl WebCarrier {
         match self {
             Self::Https => "https",
             Self::HttpsLanes => "https-lanes",
+            Self::Websocket => "websocket",
+            Self::WebsocketLanes => "websocket-lanes",
         }
+    }
+
+    /// Returns whether one carrier owns independent state per logical stream.
+    pub(crate) const fn uses_lanes(self) -> bool {
+        matches!(self, Self::HttpsLanes | Self::WebsocketLanes)
+    }
+
+    /// Returns whether carrier messages use RFC 6455 instead of HTTP bodies.
+    pub(crate) const fn uses_websocket(self) -> bool {
+        matches!(self, Self::Websocket | Self::WebsocketLanes)
+    }
+
+    /// Returns whether all logical streams share one carrier state machine.
+    pub(crate) const fn is_multiplexed(self) -> bool {
+        matches!(self, Self::Https | Self::Websocket)
     }
 }
 
@@ -114,6 +135,18 @@ pub struct WebLimitsConfig {
     /// Process-wide concurrently executing HTTP handler ceiling.
     #[serde(default = "default_web_max_http_handlers")]
     pub max_http_handlers: usize,
+    /// Process-wide transient WebSocket byte sub-budget inside pending bytes.
+    #[serde(default = "default_web_websocket_bytes_global")]
+    pub websocket_bytes_global: usize,
+    /// WebSocket usage percentage above which ordinary admission uses replacement.
+    #[serde(default = "default_web_websocket_admission_watermark_pct")]
+    pub websocket_admission_watermark_pct: u8,
+    /// WebSocket usage percentage that triggers pressure eviction.
+    #[serde(default = "default_web_websocket_eviction_watermark_pct")]
+    pub websocket_eviction_watermark_pct: u8,
+    /// Accepted HTTP connections that WebSocket upgrades must leave available.
+    #[serde(default = "default_web_websocket_http_connection_reserve")]
+    pub websocket_http_connection_reserve: usize,
     /// Process-wide concurrently collected request body ceiling.
     #[serde(default = "default_web_max_body_readers")]
     pub max_body_readers: usize,
@@ -216,6 +249,10 @@ impl Default for WebLimitsConfig {
             max_frames_per_body: default_web_max_frames_per_body(),
             max_http_connections: default_web_max_http_connections(),
             max_http_handlers: default_web_max_http_handlers(),
+            websocket_bytes_global: default_web_websocket_bytes_global(),
+            websocket_admission_watermark_pct: default_web_websocket_admission_watermark_pct(),
+            websocket_eviction_watermark_pct: default_web_websocket_eviction_watermark_pct(),
+            websocket_http_connection_reserve: default_web_websocket_http_connection_reserve(),
             max_body_readers: default_web_max_body_readers(),
             max_body_bytes_global: default_web_max_body_bytes_global(),
             max_sessions_global: default_web_max_sessions_global(),
@@ -265,6 +302,15 @@ pub struct WebTimeoutsConfig {
     /// Maximum wait for one empty downlink long poll.
     #[serde(default = "default_web_long_poll_timeout_secs")]
     pub long_poll_secs: u64,
+    /// Maximum wait for one WebSocket write to complete.
+    #[serde(default = "default_web_websocket_write_secs")]
+    pub websocket_write_secs: u64,
+    /// Maximum wait for WebSocket queue or byte-budget progress.
+    #[serde(default = "default_web_websocket_backpressure_secs")]
+    pub websocket_backpressure_secs: u64,
+    /// Maximum graceful close wait for an evicted WebSocket.
+    #[serde(default = "default_web_websocket_eviction_secs")]
+    pub websocket_eviction_secs: u64,
     /// Lifetime of an unused bootstrap credential and closed-token replay marker.
     #[serde(default = "default_web_bootstrap_lifetime_secs")]
     pub bootstrap_lifetime_secs: u64,
@@ -289,6 +335,9 @@ impl Default for WebTimeoutsConfig {
             body_secs: default_web_body_timeout_secs(),
             stream_handshake_secs: default_web_stream_handshake_timeout_secs(),
             long_poll_secs: default_web_long_poll_timeout_secs(),
+            websocket_write_secs: default_web_websocket_write_secs(),
+            websocket_backpressure_secs: default_web_websocket_backpressure_secs(),
+            websocket_eviction_secs: default_web_websocket_eviction_secs(),
             bootstrap_lifetime_secs: default_web_bootstrap_lifetime_secs(),
             reconnect_grace_secs: default_web_reconnect_grace_secs(),
             http_idle_secs: default_web_http_idle_secs(),
@@ -418,6 +467,14 @@ macro_rules! u32_default {
     };
 }
 
+macro_rules! u8_default {
+    ($name:ident, $value:expr) => {
+        fn $name() -> u8 {
+            $value
+        }
+    };
+}
+
 macro_rules! u64_default {
     ($name:ident, $value:expr) => {
         fn $name() -> u64 {
@@ -433,6 +490,10 @@ usize_default!(default_web_carrier_batch_bytes, 2 * 1024 * 1024);
 usize_default!(default_web_max_frames_per_body, 4096);
 usize_default!(default_web_max_http_connections, 1024);
 usize_default!(default_web_max_http_handlers, 512);
+usize_default!(default_web_websocket_bytes_global, 256 * 1024 * 1024);
+u8_default!(default_web_websocket_admission_watermark_pct, 75);
+u8_default!(default_web_websocket_eviction_watermark_pct, 90);
+usize_default!(default_web_websocket_http_connection_reserve, 64);
 usize_default!(default_web_max_body_readers, 32);
 usize_default!(default_web_max_body_bytes_global, 64 * 1024 * 1024);
 usize_default!(default_web_max_sessions_global, 128);
@@ -467,6 +528,9 @@ u64_default!(default_web_header_timeout_secs, 10);
 u64_default!(default_web_body_timeout_secs, 30);
 u64_default!(default_web_stream_handshake_timeout_secs, 10);
 u64_default!(default_web_long_poll_timeout_secs, 25);
+u64_default!(default_web_websocket_write_secs, 30);
+u64_default!(default_web_websocket_backpressure_secs, 30);
+u64_default!(default_web_websocket_eviction_secs, 1);
 u64_default!(default_web_bootstrap_lifetime_secs, 120);
 u64_default!(default_web_reconnect_grace_secs, 120);
 u64_default!(default_web_http_idle_secs, 75);

@@ -11,7 +11,6 @@ use super::{
     InboundChunk, PendingClass, QUEUE_ITEM_COST, SessionState, StreamState, WebSession,
     inbound_queue_cost,
 };
-use crate::config::WebCarrier;
 use crate::web::frame::{self, Frame, FrameType};
 use crate::web::manager::{ManagerError, TokenHash};
 
@@ -22,7 +21,7 @@ impl WebSession {
         sequence: u64,
         body: &[u8],
     ) -> Result<u64, ManagerError> {
-        if self.carrier() != WebCarrier::Https {
+        if !self.carrier().is_multiplexed() {
             return Err(ManagerError::Protocol);
         }
         if self
@@ -90,6 +89,7 @@ impl WebSession {
                 &mut state,
                 &frames,
                 &mut opened,
+                &mut None,
                 &mut unused_bytes,
                 &mut unused_items,
             );
@@ -113,7 +113,7 @@ impl WebSession {
             return result;
         }
         for (stream_id, peer_port) in opened {
-            self.spawn_stream(stream_id, peer_port);
+            self.spawn_stream(stream_id, peer_port, false);
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.record_up(body.len());
@@ -126,6 +126,7 @@ impl WebSession {
         state: &mut SessionState,
         frames: &[Frame<'_>],
         opened: &mut Vec<(u32, u16)>,
+        reserved_open: &mut Option<(u32, u16)>,
         unused_bytes: &mut usize,
         unused_items: &mut usize,
     ) -> bool {
@@ -136,13 +137,31 @@ impl WebSession {
             let was_closed = state.closed_streams.contains(&value.stream_id);
             match value.frame_type {
                 FrameType::Open => {
-                    let Some(peer_port) = self.reserve_stream_locked(state) else {
-                        self.remember_closed_locked(state, value.stream_id);
-                        if !self.queue_control_locked(state, FrameType::Close, value.stream_id, &[])
+                    let peer_port = match reserved_open.take() {
+                        Some((reserved_stream_id, peer_port))
+                            if reserved_stream_id == value.stream_id =>
                         {
+                            peer_port
+                        }
+                        Some(reserved) => {
+                            *reserved_open = Some(reserved);
                             return false;
                         }
-                        continue;
+                        None => {
+                            let Some(peer_port) = self.reserve_stream_locked(state) else {
+                                self.remember_closed_locked(state, value.stream_id);
+                                if !self.queue_control_locked(
+                                    state,
+                                    FrameType::Close,
+                                    value.stream_id,
+                                    &[],
+                                ) {
+                                    return false;
+                                }
+                                continue;
+                            };
+                            peer_port
+                        }
                     };
                     state.streams.insert(
                         value.stream_id,
@@ -331,7 +350,9 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    use crate::config::{WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig};
+    use crate::config::{
+        WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
+    };
     use crate::web::manager::WebProcessRuntime;
 
     fn session() -> Arc<WebSession> {

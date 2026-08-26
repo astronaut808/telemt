@@ -499,12 +499,9 @@ async fn handle(
 
     let result: Result<Response<Full<Bytes>>, ApiFailure> = async {
         match (method.as_str(), normalized_path) {
-            ("GET", "/web-status") => Ok(web_status::render(
-                query.as_deref(),
-                &shared.web_trace,
-                &cfg.web.debug,
-            )
-            .await),
+            ("GET", "/web-status") => {
+                Ok(web_status::render(query.as_deref(), &shared.web_trace, &cfg.web.debug).await)
+            }
             ("GET", "/v1/health") => {
                 let revision = current_revision(&shared.config_path).await?;
                 let data = HealthData {

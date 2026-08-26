@@ -113,6 +113,7 @@ impl WebSession {
                 &mut state,
                 &frames,
                 &mut opened,
+                &mut None,
                 &mut unused_bytes,
                 &mut unused_items,
             );
@@ -137,7 +138,7 @@ impl WebSession {
             return result;
         }
         for (stream_id, peer_port) in opened {
-            self.spawn_stream(stream_id, peer_port);
+            self.spawn_stream(stream_id, peer_port, false);
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.record_up(body.len());
@@ -151,7 +152,7 @@ impl WebSession {
         lane_id: u32,
         cursor: u64,
     ) -> Result<PollResult, ManagerError> {
-        if self.carrier() != WebCarrier::HttpsLanes || lane_id > frame::MAX_STREAM_ID {
+        if !self.carrier().uses_lanes() || lane_id > frame::MAX_STREAM_ID {
             return Err(ManagerError::Protocol);
         }
         let (epoch, notify) = {
@@ -404,7 +405,7 @@ impl WebSession {
 
     pub(super) fn remember_closed_locked(&self, state: &mut SessionState, stream_id: u32) {
         let evicted = remember_closed(state, stream_id, self.limits.max_tombstones_per_session);
-        if self.carrier() != WebCarrier::HttpsLanes {
+        if !self.carrier().uses_lanes() {
             return;
         }
         if let Some(evicted) = evicted {
@@ -415,7 +416,7 @@ impl WebSession {
         }
     }
 
-    fn release_lane_locked(&self, state: &mut SessionState, lane_id: u32) {
+    pub(super) fn release_lane_locked(&self, state: &mut SessionState, lane_id: u32) {
         let Some(mut lane) = state.carrier_lanes.remove(&lane_id) else {
             return;
         };

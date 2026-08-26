@@ -13,6 +13,9 @@ use super::types::{
 };
 use crate::config::{WebDebugConfig, WebLimitsConfig};
 
+// WebSocket message capture is isolated from HTTP exchange storage.
+mod websocket;
+
 const BASE_RECORD_RESERVATION: usize = 1024;
 
 struct RingState {
@@ -66,6 +69,7 @@ pub(crate) struct WebTraceStore {
     records_capacity: usize,
     bytes_capacity: usize,
     max_carrier_body_bytes: usize,
+    frame_limits: WebLimitsConfig,
     used_bytes: Arc<AtomicUsize>,
     ring: Mutex<RingState>,
     next_record_seq: AtomicU64,
@@ -86,7 +90,8 @@ impl WebTraceStore {
             epoch: AtomicU64::new(1),
             records_capacity: limits.debug_records_capacity,
             bytes_capacity: limits.debug_bytes_global,
-            max_carrier_body_bytes: limits.max_body_bytes,
+            max_carrier_body_bytes: limits.max_body_bytes.max(limits.carrier_batch_bytes),
+            frame_limits: limits.clone(),
             used_bytes: Arc::new(AtomicUsize::new(0)),
             ring: Mutex::new(RingState {
                 records: VecDeque::with_capacity(limits.debug_records_capacity),
@@ -171,22 +176,14 @@ impl WebTraceStore {
             .user
             .as_ref()
             .map_or(0, String::len)
-            .checked_add(
-                identity
-                    .key_fingerprint
-                    .as_ref()
-                    .map_or(0, String::len),
-            );
-        let Some(reservation) = identity_bytes
-            .and_then(|bytes| BASE_RECORD_RESERVATION.checked_add(bytes))
+            .checked_add(identity.key_fingerprint.as_ref().map_or(0, String::len));
+        let Some(reservation) =
+            identity_bytes.and_then(|bytes| BASE_RECORD_RESERVATION.checked_add(bytes))
         else {
             self.record_truncation();
             return;
         };
-        if !policy.enabled
-            || !policy.capture_lifecycle
-            || !self.try_reserve_record(reservation)
-        {
+        if !policy.enabled || !policy.capture_lifecycle || !self.try_reserve_record(reservation) {
             return;
         }
         let record = TraceRecord {

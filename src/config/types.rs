@@ -54,12 +54,12 @@ pub use web::{
     WebCarrier, WebConfig, WebDecoyConfig, WebLimitsConfig, WebProfileConfig, WebSecretMode,
     WebTimeoutsConfig, WebVhostConfig,
 };
-pub use web_debug::{WebDebugBodyCapture, WebDebugConfig};
-pub(crate) use web_debug::web_debug_fits_limits;
 pub(crate) use web::{
     WebRuntimeConfig, WebRuntimeDecoy, WebRuntimeProfile, WebRuntimeVhost, WebStaticAsset,
     WebStaticSite,
 };
+pub(crate) use web_debug::web_debug_fits_limits;
+pub use web_debug::{WebDebugBodyCapture, WebDebugConfig};
 
 fn default_quota_state_path() -> PathBuf {
     PathBuf::from("telemt.limit.json")

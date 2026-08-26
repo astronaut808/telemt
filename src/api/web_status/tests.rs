@@ -47,7 +47,11 @@ async fn renderer_filters_groups_and_sets_control_plane_security_headers() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-    assert!(response.headers().contains_key(header::CONTENT_SECURITY_POLICY));
+    assert!(
+        response
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY)
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     assert!(body.contains("session_created"));

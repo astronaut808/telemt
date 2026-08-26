@@ -46,9 +46,7 @@ pub(super) fn validate(limits: &WebLimitsConfig) -> Result<()> {
                 .checked_mul(WEB_DEBUG_GROUP_SCRATCH_BYTES)
                 .and_then(|scratch| value.checked_add(scratch))
         })
-        .ok_or_else(|| {
-            ProxyError::Config("web.debug reservations overflowed usize".to_string())
-        })?;
+        .ok_or_else(|| ProxyError::Config("web.debug reservations overflowed usize".to_string()))?;
     let reserved = limits
         .pending_bytes_global
         .checked_add(limits.max_body_bytes_global)

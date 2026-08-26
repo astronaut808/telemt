@@ -139,7 +139,10 @@ impl HttpTraceExchange {
 
     /// Binds non-secret profile and process session identity.
     pub(crate) fn bind_profile(&self, profile: &WebRuntimeProfile, session_id: u64) {
-        let dynamic = profile.user.len().saturating_add(profile.key_fingerprint.len());
+        let dynamic = profile
+            .user
+            .len()
+            .saturating_add(profile.key_fingerprint.len());
         let mut state = self.state.lock();
         state.identity.session_id = Some(session_id);
         if self.reserve(dynamic) {
@@ -150,12 +153,11 @@ impl HttpTraceExchange {
 
     /// Binds an already resolved non-secret session identity.
     pub(crate) fn bind_identity(&self, identity: TraceIdentity) {
-        let dynamic = identity.user.as_ref().map_or(0, String::len).saturating_add(
-            identity
-                .key_fingerprint
-                .as_ref()
-                .map_or(0, String::len),
-        );
+        let dynamic = identity
+            .user
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(identity.key_fingerprint.as_ref().map_or(0, String::len));
         let mut state = self.state.lock();
         state.identity.session_id = identity.session_id;
         if self.reserve(dynamic) {
@@ -223,11 +225,8 @@ impl HttpTraceExchange {
             body.truncated |= !data.is_empty();
             return;
         }
-        let Some(limit) = capture_limit(
-            &self.policy,
-            route,
-            self.store.max_carrier_body_bytes(),
-        ) else {
+        let Some(limit) = capture_limit(&self.policy, route, self.store.max_carrier_body_bytes())
+        else {
             return;
         };
         if body.captured.len() >= limit {
@@ -267,7 +266,9 @@ impl HttpTraceExchange {
         if self.policy.capture_timings {
             match direction {
                 TraceDirection::Request => state.timings.request_body_us = Some(self.elapsed_us()),
-                TraceDirection::Response => state.timings.response_body_us = Some(self.elapsed_us()),
+                TraceDirection::Response => {
+                    state.timings.response_body_us = Some(self.elapsed_us())
+                }
             }
         }
         drop(state);
@@ -386,10 +387,7 @@ impl HttpTraceExchange {
     }
 
     fn elapsed_us(&self) -> u64 {
-        self.started
-            .elapsed()
-            .as_micros()
-            .min(u128::from(u64::MAX)) as u64
+        self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
     }
 }
 
@@ -402,10 +400,7 @@ impl Drop for HttpTraceExchange {
     }
 }
 
-fn body_snapshot(
-    policy: &WebDebugConfig,
-    body: &mut BodyCapture,
-) -> Option<TraceBodySnapshot> {
+fn body_snapshot(policy: &WebDebugConfig, body: &mut BodyCapture) -> Option<TraceBodySnapshot> {
     (policy.body_capture != WebDebugBodyCapture::Off).then(|| TraceBodySnapshot {
         observed_bytes: body.observed_bytes,
         captured: std::mem::take(&mut body.captured),
@@ -475,7 +470,12 @@ mod tests {
         let request_body = http.request_body.as_ref().unwrap();
         let response_body = http.response_body.as_ref().unwrap();
         for secret in [request_token.as_bytes(), capability.as_bytes()] {
-            assert!(!request_body.captured.windows(secret.len()).any(|value| value == secret));
+            assert!(
+                !request_body
+                    .captured
+                    .windows(secret.len())
+                    .any(|value| value == secret)
+            );
         }
         assert!(
             !response_body

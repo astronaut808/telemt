@@ -59,18 +59,20 @@ const batchLimit=__BATCH_LIMIT__,queueLimit=__QUEUE_LIMIT__,queueItemLimit=__QUE
 const laneQueueLimit=Math.min(queueLimit,8388608),laneItemLimit=Math.min(queueItemLimit,1024),closedLaneLimit=4096;
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
-let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
+let initialized=false,closed=false,port=null,sessionToken='',createStarted=false,socket=null,socketReady=false;
 let queuedBytes=0,queuedItems=0,upSequence=1,downCursor='0',upRunning=false,pollController=null;
 const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
+const socketURL=()=>relayOrigin.replace(/^https:/,'wss:')+'/api/v1/ws';
 const options=(method,token,body,headers,signal,keepalive)=>({
  method,body,signal,keepalive:!!keepalive,mode:'same-origin',credentials:'omit',cache:'no-store',redirect:'error',referrerPolicy:'no-referrer',
  headers:Object.assign(token?{Authorization:'Bearer '+token}:{},body?{'Content-Type':'application/octet-stream'}:{},headers||{})
 });
 function reserve(data,lane){
- if(!data.byteLength||data.byteLength>queueLimit-queuedBytes||queuedItems>=queueItemLimit)return false;
- if(lane&&(data.byteLength>laneQueueLimit-lane.bytes||lane.items>=laneItemLimit))return false;
+ let buffered=socket?socket.bufferedAmount:0;for(const value of lanes.values())if(value.socket)buffered+=value.socket.bufferedAmount;
+ if(!data.byteLength||data.byteLength>queueLimit-queuedBytes-buffered||queuedItems>=queueItemLimit)return false;
+ if(lane&&(data.byteLength>laneQueueLimit-lane.bytes-(lane.socket?lane.socket.bufferedAmount:0)||lane.items>=laneItemLimit))return false;
  queuedBytes+=data.byteLength;queuedItems++;if(lane){lane.bytes+=data.byteLength;lane.items++}return true;
 }
 function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane){lane.bytes-=bytes;lane.items-=items}}
@@ -154,12 +156,17 @@ async function createSession(first){
   const welcome=await response.arrayBuffer();
   port.postMessage(welcome,[welcome]);status('connected');
   if(carrier==='https-lanes')ensureLane(0);
+  if(carrier==='websocket')openSocket();
   for(const data of pending.splice(0)){release(data.byteLength,1,null);queueCarrier(data)}
-  if(carrier==='https')poll();else pollLane(lanes.get(0));
+  if(carrier==='https')poll();else if(carrier==='https-lanes')pollLane(lanes.get(0));
  }catch(error){fail()}
 }
 function queueCarrier(data){
- try{if(carrier==='https')queueUp(data);else for(const value of splitFrames(data))queueLane(value)}catch(error){fail()}
+ try{
+  if(carrier==='https')queueUp(data);
+  else if(carrier==='websocket')queueSocket(data);
+  else for(const value of splitFrames(data))queueLane(value);
+ }catch(error){fail()}
 }
 function queueUp(data){if(!reserve(data,null)){fail();return}upPending.push(data);runUp()}
 async function runUp(){
@@ -173,6 +180,31 @@ async function runUp(){
   }
  }catch(error){fail()}
  finally{upRunning=false;if(!closed&&sessionToken&&upPending.length)runUp()}
+}
+function openSocket(){
+ if(socket||closed)return;socket=new WebSocket(socketURL(),'tproxy-v1.'+sessionToken);socket.binaryType='arraybuffer';
+ socket.onopen=()=>{if(closed)return;socketReady=true;status('connected');runSocketUp()};
+ socket.onmessage=event=>{
+  if(closed||!(event.data instanceof ArrayBuffer)){fail();return}
+  try{const bound=frameBound(event.data,4096,batchLimit);if(bound.bytes!==event.data.byteLength)throw new Error('invalid frame batch')}catch(error){fail();return}
+  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+ };
+ socket.onerror=()=>{};socket.onclose=()=>{socketReady=false;if(!closed)fail()};
+}
+function queueSocket(data){if(!reserve(data,null)){fail();return}upPending.push(data);runSocketUp()}
+async function waitSocket(next,size,limit){
+ while(!closed&&next.readyState===WebSocket.OPEN&&next.bufferedAmount>limit-size)await pause(10);
+ if(closed||next.readyState!==WebSocket.OPEN)throw new Error('websocket closed');
+}
+async function runSocketUp(){
+ if(upRunning||!socketReady)return;upRunning=true;
+ try{
+  while(!closed&&socketReady&&upPending.length){
+   const batch=joinPending(upPending,null);await waitSocket(socket,batch.total,queueLimit);socket.send(batch.body);
+   release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:batch.total,down:0});
+  }
+ }catch(error){if(!closed)fail()}
+ finally{upRunning=false;if(!closed&&socketReady&&upPending.length)runSocketUp()}
 }
 async function poll(){
  while(!closed&&sessionToken){
@@ -190,7 +222,7 @@ async function poll(){
 }
 function ensureLane(id){
  let lane=lanes.get(id);
- if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,controller:null};lanes.set(id,lane)}
+ if(!lane){lane={id,sequence:1,cursor:'0',pending:[],bytes:0,items:0,running:false,polling:false,controller:null,socket:null,ready:false,remoteClosed:false};lanes.set(id,lane)}
  return lane;
 }
 function rememberLaneClosed(id){
@@ -198,10 +230,13 @@ function rememberLaneClosed(id){
  if(closedLaneOrder.length===closedLaneLimit)closedLanes.delete(closedLaneOrder.shift());
  closedLanes.add(id);closedLaneOrder.push(id);
 }
-function finishLane(lane){
+function closeFrame(id){const value=new Uint8Array(8);value[0]=3;value[1]=(id>>>16)&255;value[2]=(id>>>8)&255;value[3]=id&255;return value.buffer}
+function finishLane(lane,notifyClient){
  if(lanes.get(lane.id)!==lane)return;
+ if(lane.socket&&lane.socket.readyState<WebSocket.CLOSING)lane.socket.close();
  if(lane.bytes||lane.items)release(lane.bytes,lane.items,lane);
  lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
+ if(notifyClient&&!lane.remoteClosed&&port){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
 function queueLane(value){
  let lane=lanes.get(value.id);
@@ -210,7 +245,29 @@ function queueLane(value){
  if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
  lane=lane||ensureLane(value.id);
  if(!reserve(value.data,lane)){fail();return}
- lane.pending.push(value.data);runLaneUp(lane);
+ lane.pending.push(value.data);
+ if(carrier==='websocket-lanes'){openLaneSocket(lane);runLaneSocketUp(lane)}else runLaneUp(lane);
+}
+function openLaneSocket(lane){
+ if(lane.socket||closed)return;lane.socket=new WebSocket(socketURL(),'tproxy-lane-v1.'+sessionToken+'.'+String(lane.id));lane.socket.binaryType='arraybuffer';
+ lane.socket.onopen=()=>{if(closed||lanes.get(lane.id)!==lane)return;lane.ready=true;status('connected');runLaneSocketUp(lane)};
+ lane.socket.onmessage=event=>{
+  if(closed||lanes.get(lane.id)!==lane||!(event.data instanceof ArrayBuffer)){finishLane(lane,true);return}
+  let values;try{values=splitFrames(event.data);for(const value of values)if(value.id!==lane.id)throw new Error('cross-lane frame')}catch(error){finishLane(lane,true);return}
+  if(values.some(value=>value.type===3))lane.remoteClosed=true;
+  port.postMessage({t:'traffic',up:0,down:event.data.byteLength});port.postMessage(event.data,[event.data]);status('connected');
+ };
+ lane.socket.onerror=()=>{};lane.socket.onclose=()=>{lane.ready=false;lane.socket=null;if(!closed)finishLane(lane,true)};
+}
+async function runLaneSocketUp(lane){
+ if(lane.running||!lane.ready)return;lane.running=true;
+ try{
+  while(!closed&&lane.ready&&lanes.get(lane.id)===lane&&lane.pending.length){
+   const batch=joinPending(lane.pending,lane);await waitSocket(lane.socket,batch.total,laneQueueLimit);lane.socket.send(batch.body);
+   release(batch.total,batch.count,lane);port.postMessage({t:'traffic',up:batch.total,down:0});
+  }
+ }catch(error){if(!closed)finishLane(lane,true)}
+ finally{lane.running=false;if(!closed&&lane.ready&&lane.pending.length)runLaneSocketUp(lane)}
 }
 async function runLaneUp(lane){
  if(lane.running)return;lane.running=true;
@@ -232,7 +289,7 @@ async function pollLane(lane){
    const controller=new AbortController(),laneID=String(lane.id);lane.controller=controller;
    const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
    if(response.status===204){
-    if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane);return}
+    if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane,false);return}
     status('connected');continue;
    }
    if(response.status!==200)throw new Error('lane downlink rejected');
@@ -250,7 +307,7 @@ function deleteSession(){
 }
 function close(notifyServer){
  if(closed)return;closed=true;if(pollController)pollController.abort();
- for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
+ if(socket)socket.close();for(const lane of lanes.values()){if(lane.controller)lane.controller.abort();if(lane.socket)lane.socket.close()}
  if(notifyServer)deleteSession();pending.length=0;upPending.length=0;
  for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
 }
@@ -356,5 +413,46 @@ mod tests {
                 .any(|shape| page.body.contains(shape)),
             "the iOS native carrier cannot parse a comma-declared single-quoted bootstrap"
         );
+    }
+
+    #[test]
+    fn rendered_page_advertises_exact_websocket_carriers() {
+        let websocket = render(
+            "proxy.example.com",
+            "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+            2 * 1024 * 1024,
+            32 * 1024 * 1024,
+            16 * 1024,
+            WebCarrier::Websocket,
+            &SecureRandom::new(),
+        );
+        assert!(websocket.body.contains("carrier='websocket'"));
+        assert!(
+            websocket
+                .body
+                .contains("new WebSocket(socketURL(),'tproxy-v1.'+sessionToken)")
+        );
+        assert!(
+            websocket
+                .content_security_policy
+                .contains("connect-src 'self' wss://proxy.example.com")
+        );
+
+        let lanes = render(
+            "proxy.example.com",
+            "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+            2 * 1024 * 1024,
+            32 * 1024 * 1024,
+            16 * 1024,
+            WebCarrier::WebsocketLanes,
+            &SecureRandom::new(),
+        );
+        assert!(lanes.body.contains("carrier='websocket-lanes'"));
+        assert!(
+            lanes
+                .body
+                .contains("'tproxy-lane-v1.'+sessionToken+'.'+String(lane.id)")
+        );
+        assert!(!lanes.body.contains("__"));
     }
 }

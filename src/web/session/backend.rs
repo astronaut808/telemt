@@ -1,6 +1,6 @@
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::proxy::shared_state::ConntrackClosePolicy;
@@ -15,10 +15,15 @@ mod tests;
 
 impl WebSession {
     /// Starts one owned inner handshake and relay task for an admitted stream.
-    pub(super) fn spawn_stream(self: &Arc<Self>, stream_id: u32, peer_port: u16) {
+    pub(super) fn spawn_stream(
+        self: &Arc<Self>,
+        stream_id: u32,
+        peer_port: u16,
+        retain_reservation_on_reject: bool,
+    ) -> bool {
         let Some(manager) = self.manager.upgrade() else {
-            self.stream_finished(stream_id, peer_port);
-            return;
+            self.stream_rejected_before_spawn(stream_id, peer_port, retain_reservation_on_reject);
+            return false;
         };
         let generation = manager.active_generation();
         if !*generation.admission_rx.borrow() {
@@ -27,8 +32,8 @@ impl WebSession {
                 Some(stream_id),
                 Some("admission_closed"),
             );
-            self.stream_finished(stream_id, peer_port);
-            return;
+            self.stream_rejected_before_spawn(stream_id, peer_port, retain_reservation_on_reject);
+            return false;
         }
         let Ok(connection_permit) = generation.max_connections.clone().try_acquire_owned() else {
             manager.record_stream_rejected();
@@ -37,21 +42,24 @@ impl WebSession {
                 Some(stream_id),
                 Some("connection_limit"),
             );
-            self.stream_finished(stream_id, peer_port);
-            return;
+            self.stream_rejected_before_spawn(stream_id, peer_port, retain_reservation_on_reject);
+            return false;
         };
         let deps = generation.client_runtime_deps();
         let replay_checker = Arc::clone(&generation.replay_checker);
         let session = Arc::clone(self);
         let cancel = self.cancel.clone();
+        let retain_rejected = Arc::new(AtomicBool::new(false));
         self.tasks_live.fetch_add(1, Ordering::AcqRel);
-        let spawned = generation.spawn_session(async move {
+        let completion = StreamCompletion {
+            session: Arc::clone(&session),
+            stream_id,
+            peer_port,
+            retain_rejected: Arc::clone(&retain_rejected),
+        };
+        let future = async move {
             let _connection_permit = connection_permit;
-            let _completion = StreamCompletion {
-                session: Arc::clone(&session),
-                stream_id,
-                peer_port,
-            };
+            let _completion = completion;
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamAdmitted,
                 Some(stream_id),
@@ -69,16 +77,41 @@ impl WebSession {
                     peer_port,
                 ) => {}
             }
-        });
-        if !spawned {
+        };
+        if let Err(future) = generation.try_spawn_session(future) {
+            retain_rejected.store(retain_reservation_on_reject, Ordering::Release);
             self.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamRejected,
                 Some(stream_id),
                 Some("generation_closed"),
             );
-            self.tasks_live.fetch_sub(1, Ordering::AcqRel);
+            drop(future);
+            return false;
+        }
+        true
+    }
+
+    fn stream_rejected_before_spawn(
+        &self,
+        stream_id: u32,
+        peer_port: u16,
+        retain_reservation: bool,
+    ) {
+        if !retain_reservation {
             self.stream_finished(stream_id, peer_port);
-            self.tasks_done.notify_waiters();
+            return;
+        }
+        let queued = {
+            let mut state = self.state.lock();
+            state.streams.remove(&stream_id).map(|stream| {
+                let (bytes, items) = inbound_queue_cost(&stream.inbound);
+                self.release_locked(&mut state, bytes, items, false);
+                self.remember_closed_locked(&mut state, stream_id);
+                self.queue_control_locked(&mut state, FrameType::Close, stream_id, &[])
+            })
+        };
+        if queued.is_some_and(|queued| !queued) {
+            self.close();
         }
     }
 
@@ -106,7 +139,7 @@ impl WebSession {
             if !queued {
                 self.close();
             }
-            if self.carrier() == crate::config::WebCarrier::Https {
+            if self.carrier().is_multiplexed() {
                 self.down_notify.notify_waiters();
             }
         }
@@ -117,6 +150,7 @@ struct StreamCompletion {
     session: Arc<WebSession>,
     stream_id: u32,
     peer_port: u16,
+    retain_rejected: Arc<AtomicBool>,
 }
 
 impl Drop for StreamCompletion {
@@ -126,7 +160,12 @@ impl Drop for StreamCompletion {
             Some(self.stream_id),
             None,
         );
-        self.session.stream_finished(self.stream_id, self.peer_port);
+        if self.retain_rejected.load(Ordering::Acquire) {
+            self.session
+                .stream_rejected_before_spawn(self.stream_id, self.peer_port, true);
+        } else {
+            self.session.stream_finished(self.stream_id, self.peer_port);
+        }
         if self.session.tasks_live.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.session.tasks_done.notify_waiters();
         }
@@ -263,6 +302,10 @@ async fn run_stream(
     session.trace_lifecycle(
         crate::web::trace::TraceLifecycleEvent::RelayEnded,
         Some(stream_id),
-        Some(if relay_result.is_ok() { "completed" } else { "error" }),
+        Some(if relay_result.is_ok() {
+            "completed"
+        } else {
+            "error"
+        }),
     );
 }

@@ -50,8 +50,7 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
                 client_secret(auth_entry.secret, profile.secret_mode);
             let capability =
                 derive_web_capability(&client_secret[..client_secret_len], vhost.host.as_bytes())?;
-            let key_fingerprint =
-                debug_key_fingerprint(&client_secret[..client_secret_len]);
+            let key_fingerprint = debug_key_fingerprint(&client_secret[..client_secret_len]);
             if !capabilities.insert(capability) {
                 return Err(ProxyError::Config(format!(
                     "WEB vhost `{}` contains profiles with the same client capability",

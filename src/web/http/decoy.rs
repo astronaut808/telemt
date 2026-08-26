@@ -236,6 +236,7 @@ fn sanitize_transport_request<B>(request: &mut Request<B>) {
         header::CONTENT_TYPE,
         header::UPGRADE,
         HeaderName::from_static("sec-websocket-key"),
+        HeaderName::from_static("sec-websocket-extensions"),
         HeaderName::from_static("sec-websocket-protocol"),
         HeaderName::from_static("sec-websocket-version"),
         HeaderName::from_static("x-down-cursor"),

@@ -249,8 +249,16 @@ impl RuntimeGeneration {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.try_spawn_session(future).is_ok()
+    }
+
+    /// Registers one session or returns its unpolled future to the caller.
+    pub(crate) fn try_spawn_session<F>(&self, future: F) -> Result<(), F>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let Some(_registration) = self.session_admission.try_register() else {
-            return false;
+            return Err(future);
         };
         let cancel = self.session_cancel.clone();
         self.sessions.spawn(async move {
@@ -259,7 +267,7 @@ impl RuntimeGeneration {
                 _ = future => {}
             }
         });
-        true
+        Ok(())
     }
 
     /// Closes admission while preserving already registered sessions.

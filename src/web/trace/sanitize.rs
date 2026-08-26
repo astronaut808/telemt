@@ -24,7 +24,9 @@ pub(super) fn request_dynamic_bytes<B>(
             request
                 .headers()
                 .get(header::USER_AGENT)
-                .map_or(0, |value| lossy_text_reservation(value.as_bytes(), USER_AGENT_MAX_BYTES)),
+                .map_or(0, |value| {
+                    lossy_text_reservation(value.as_bytes(), USER_AGENT_MAX_BYTES)
+                }),
         )
         .saturating_add(
             policy
@@ -56,8 +58,7 @@ pub(super) fn sanitized_headers(headers: &hyper::HeaderMap) -> Vec<TraceHeader> 
         .iter()
         .map(|(name, value)| TraceHeader {
             name: name.as_str().to_string(),
-            value: header_value_allowed(name)
-                .then(|| bounded_text(value.as_bytes(), 4096)),
+            value: header_value_allowed(name).then(|| bounded_text(value.as_bytes(), 4096)),
         })
         .collect()
 }
