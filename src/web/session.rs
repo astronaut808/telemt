@@ -486,3 +486,12 @@ fn remember_closed(state: &mut SessionState, stream_id: u32, limit: usize) -> Op
     }
     evicted
 }
+
+fn insert_carrier_lane(state: &mut SessionState, lane_id: u32) -> Option<u64> {
+    let instance = state.next_lane_instance;
+    state.next_lane_instance = instance.checked_add(1)?;
+    state
+        .carrier_lanes
+        .insert(lane_id, CarrierLane::new(instance));
+    Some(instance)
+}

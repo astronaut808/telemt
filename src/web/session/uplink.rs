@@ -7,9 +7,10 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use super::backend::StreamCompletion;
 use super::{
-    InboundChunk, PendingClass, QUEUE_ITEM_COST, SessionState, StreamState, WebSession,
-    inbound_queue_cost,
+    InboundChunk, PendingClass, QUEUE_ITEM_COST, SessionState, StreamIdentity, StreamState,
+    WebSession, inbound_queue_cost,
 };
 use crate::web::frame::{self, Frame, FrameType};
 use crate::web::manager::{ManagerError, TokenHash};
@@ -113,16 +114,14 @@ impl WebSession {
         }
         if result.is_err() {
             self.close();
-            for (_, peer_port) in opened {
-                self.release_stream_reservation(peer_port);
-            }
+            drop(opened);
             return result;
         }
         if committed {
             self.finish_carrier_commit();
         }
-        for (stream_id, peer_port) in opened {
-            self.spawn_stream(stream_id, peer_port, false);
+        for completion in opened {
+            self.spawn_stream(completion, false);
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.record_up(body.len());
@@ -131,10 +130,10 @@ impl WebSession {
     }
 
     pub(super) fn apply_batch_locked(
-        &self,
+        self: &Arc<Self>,
         state: &mut SessionState,
         frames: &[Frame<'_>],
-        opened: &mut Vec<(u32, u16)>,
+        opened: &mut Vec<StreamCompletion>,
         reserved_open: &mut Option<(u32, u16)>,
         unused_bytes: &mut usize,
         unused_items: &mut usize,
@@ -143,7 +142,8 @@ impl WebSession {
             if value.stream_id == 0 {
                 continue;
             }
-            let was_closed = state.closed_streams.contains(&value.stream_id);
+            let was_closed = state.closed_streams.contains(&value.stream_id)
+                || state.closing_streams.contains_key(&value.stream_id);
             match value.frame_type {
                 FrameType::Open => {
                     let peer_port = match reserved_open.take() {
@@ -172,9 +172,13 @@ impl WebSession {
                             peer_port
                         }
                     };
+                    let Some(stream) = next_stream_identity(state, value.stream_id) else {
+                        return false;
+                    };
                     state.streams.insert(
                         value.stream_id,
                         StreamState {
+                            instance: stream.instance,
                             inbound: VecDeque::new(),
                             receive_window: frame::INITIAL_STREAM_WINDOW,
                             send_credit: u64::from(frame::INITIAL_STREAM_WINDOW),
@@ -182,7 +186,7 @@ impl WebSession {
                             write_waker: None,
                         },
                     );
-                    opened.push((value.stream_id, peer_port));
+                    opened.push(self.own_stream_task(stream, peer_port));
                 }
                 FrameType::Data if !was_closed => {
                     let Some(stream) = state.streams.get_mut(&value.stream_id) else {
@@ -217,6 +221,9 @@ impl WebSession {
                     let Some(stream) = state.streams.remove(&value.stream_id) else {
                         return false;
                     };
+                    state
+                        .closing_streams
+                        .insert(value.stream_id, stream.instance);
                     let (bytes, items) = inbound_queue_cost(&stream.inbound);
                     self.release_locked(state, bytes, items, false);
                     self.remember_closed_locked(state, value.stream_id);
@@ -258,6 +265,15 @@ impl WebSession {
     }
 }
 
+fn next_stream_identity(state: &mut SessionState, stream_id: u32) -> Option<StreamIdentity> {
+    let instance = state.next_stream_instance;
+    state.next_stream_instance = instance.checked_add(1)?;
+    Some(StreamIdentity {
+        id: stream_id,
+        instance,
+    })
+}
+
 struct UplinkGuard<'a>(&'a AtomicBool);
 
 impl Drop for UplinkGuard<'_> {
@@ -280,8 +296,9 @@ pub(super) fn validate_batch(state: &SessionState, frames: &[Frame<'_>]) -> bool
             }
             continue;
         }
-        let was_closed =
-            state.closed_streams.contains(&value.stream_id) || closed.contains(&value.stream_id);
+        let was_closed = state.closed_streams.contains(&value.stream_id)
+            || state.closing_streams.contains_key(&value.stream_id)
+            || closed.contains(&value.stream_id);
         match value.frame_type {
             FrameType::Open => {
                 if live.contains_key(&value.stream_id) || was_closed {

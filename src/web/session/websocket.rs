@@ -4,7 +4,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 
 use super::uplink::{inbound_reservation, validate_batch};
-use super::{CarrierLane, PendingClass, WebSession, inbound_queue_cost};
+use super::{PendingClass, WebSession, inbound_queue_cost, insert_carrier_lane};
 use crate::config::WebCarrier;
 use crate::web::frame;
 use crate::web::manager::ManagerError;
@@ -89,7 +89,17 @@ impl WebSession {
             return Err(ManagerError::Limit);
         }
         state.websocket_lane_reservations.insert(lane_id, peer_port);
-        state.carrier_lanes.insert(lane_id, CarrierLane::new());
+        if insert_carrier_lane(&mut state, lane_id).is_none() {
+            state.websocket_lane_reservations.remove(&lane_id);
+            state.active_peer_ports.remove(&peer_port);
+            manager.release_stream(
+                self.profile_key,
+                self.client_ip,
+                self.profile.public_addr,
+                peer_port,
+            );
+            return Err(ManagerError::Protocol);
+        }
         Ok(WebSocketLaneReservation {
             session: Arc::clone(self),
             lane_id,
@@ -195,11 +205,11 @@ impl WebSession {
         if committed {
             self.finish_carrier_commit();
         }
-        for (stream_id, peer_port) in opened {
-            if stream_id != lane_id || peer_port != reservation.peer_port {
+        for completion in opened {
+            if completion.stream.id != lane_id || completion.peer_port != reservation.peer_port {
                 return Err(ManagerError::Protocol);
             }
-            if !self.spawn_stream(stream_id, peer_port, true) {
+            if !self.spawn_stream(completion, true) {
                 return Err(ManagerError::Limit);
             }
             reservation.transfer_to_stream();

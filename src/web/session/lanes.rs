@@ -8,7 +8,7 @@ use subtle::ConstantTimeEq;
 use super::uplink::{inbound_reservation, validate_batch};
 use super::{
     CarrierLane, DownBatch, PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState,
-    WebSession, remember_closed,
+    WebSession, insert_carrier_lane, remember_closed,
 };
 use crate::config::{WebCarrier, WebLimitsConfig};
 use crate::web::frame::{self, Frame, FrameType};
@@ -71,7 +71,11 @@ impl WebSession {
                     self.close();
                     return Err(ManagerError::Protocol);
                 }
-                state.carrier_lanes.insert(lane_id, CarrierLane::new());
+                if insert_carrier_lane(&mut state, lane_id).is_none() {
+                    drop(state);
+                    self.close();
+                    return Err(ManagerError::Protocol);
+                }
             }
             let lane = state
                 .carrier_lanes
@@ -140,16 +144,14 @@ impl WebSession {
         }
         if result.is_err() {
             self.close();
-            for (_, peer_port) in opened {
-                self.release_stream_reservation(peer_port);
-            }
+            drop(opened);
             return result;
         }
         if committed {
             self.finish_carrier_commit();
         }
-        for (stream_id, peer_port) in opened {
-            self.spawn_stream(stream_id, peer_port, false);
+        for completion in opened {
+            self.spawn_stream(completion, false);
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.record_up(body.len());
