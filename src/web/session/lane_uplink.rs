@@ -55,7 +55,14 @@ impl WebSession {
                         .is_some_and(|value| value.frame_type != FrameType::Open)
                     && only_late_frames(&frames)
                 {
-                    return Ok(sequence);
+                    return if self.automatic_carrier
+                        && state.negotiation_phase
+                            != super::SessionNegotiationPhase::Committed
+                    {
+                        Err(ManagerError::Backpressure)
+                    } else {
+                        Ok(sequence)
+                    };
                 }
                 if lane_id == 0
                     || frames
@@ -159,6 +166,10 @@ impl WebSession {
             self.close();
             drop(opened);
             return result;
+        }
+        if self.automatic_carrier && !self.is_carrier_committed() {
+            self.lane_open_notify.notify_waiters();
+            return Err(ManagerError::Backpressure);
         }
         if committed {
             self.finish_carrier_commit();

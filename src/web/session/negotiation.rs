@@ -31,7 +31,7 @@ impl WebSession {
 
     /// Publishes the already-linearized session commit to process state.
     pub(super) fn finish_carrier_commit(&self) {
-        if let Some(manager) = self.manager.upgrade() {
+        let published = self.manager.upgrade().is_some_and(|manager| {
             manager.carrier_committed(
                 self.bootstrap_hash,
                 self.token_hash,
@@ -40,7 +40,22 @@ impl WebSession {
                 self.carrier_class,
                 self.client_ip,
                 self.trace_identity(),
-            );
+            )
+        });
+        if !published {
+            return;
+        }
+        let healthy = {
+            let mut state = self.state.lock();
+            if state.closed || state.negotiation_phase != SessionNegotiationPhase::Committed {
+                false
+            } else {
+                state.carrier_commit_published = true;
+                self.carrier_health_ready_locked(&mut state, Instant::now())
+            }
+        };
+        if healthy {
+            self.finish_carrier_health();
         }
     }
 
@@ -97,7 +112,9 @@ impl WebSession {
         now: Instant,
     ) -> bool {
         if !self.automatic_carrier
+            || state.closed
             || state.negotiation_phase != SessionNegotiationPhase::Committed
+            || !state.carrier_commit_published
             || state.carrier_health_reported
             || state.carrier_health_due_at.is_none_or(|due| now < due)
         {
@@ -233,6 +250,7 @@ mod tests {
         let now = Instant::now();
         let mut state = session.state.lock();
         state.negotiation_phase = SessionNegotiationPhase::Committed;
+        state.carrier_commit_published = true;
         state.carrier_health_due_at = Some(now - Duration::from_secs(1));
         state.carrier_health_uplink = true;
         state.carrier_health_downlink = true;
@@ -251,6 +269,7 @@ mod tests {
         let now = Instant::now();
         let mut state = session.state.lock();
         state.negotiation_phase = SessionNegotiationPhase::Committed;
+        state.carrier_commit_published = true;
         state.carrier_health_due_at = Some(now - Duration::from_secs(1));
         state.websocket_carrier_active = true;
         state.websocket_commit_ack_owner = Some(7);
@@ -259,6 +278,21 @@ mod tests {
         assert!(!session.carrier_health_ready_locked(&mut state, now));
         state.websocket_probe_claimed = true;
         assert!(session.carrier_health_ready_locked(&mut state, now));
+    }
+
+    #[test]
+    fn health_waits_for_manager_commit_publication() {
+        let session = session(WebCarrier::Https, Instant::now() + Duration::from_secs(60));
+        let now = Instant::now();
+        let mut state = session.state.lock();
+        state.negotiation_phase = SessionNegotiationPhase::Committed;
+        state.carrier_health_due_at = Some(now - Duration::from_secs(1));
+        state.carrier_health_uplink = true;
+        state.carrier_health_downlink = true;
+        state.carrier_health_activity_at = Some(now);
+
+        assert!(!session.carrier_health_ready_locked(&mut state, now));
+        assert!(!state.carrier_health_reported);
     }
 
     #[test]

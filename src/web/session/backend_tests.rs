@@ -373,3 +373,17 @@ async fn cancellation_while_waiting_for_data_releases_stream_ownership() {
     );
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn exhausted_stream_identity_does_not_acquire_synthetic_port_ownership() {
+    let runtime = test_runtime(WebCarrier::Https, 1);
+    runtime.session.state.lock().next_stream_instance = u64::MAX;
+
+    assert_eq!(
+        runtime.process_frame(1, 1, FrameType::Open, &[]),
+        Err(ManagerError::Closed)
+    );
+    assert!(runtime.session.state.lock().active_peer_ports.is_empty());
+
+    runtime.shutdown().await;
+}

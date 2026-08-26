@@ -80,7 +80,7 @@ impl WebProcessRuntime {
         class: CarrierClientClass,
         client_ip: IpAddr,
         identity: TraceIdentity,
-    ) {
+    ) -> bool {
         let mut state = self.state.lock();
         let scores = state.bootstraps.get_mut(&bootstrap_hash).and_then(|entry| {
             if entry.carrier_attempt == attempt
@@ -97,7 +97,7 @@ impl WebProcessRuntime {
             }
         });
         drop(state);
-        let Some(scores) = scores else { return };
+        let Some(scores) = scores else { return false };
         self.trace.record_carrier_lifecycle(
             client_ip,
             identity.clone(),
@@ -108,6 +108,7 @@ impl WebProcessRuntime {
             scores,
             None,
         );
+        true
     }
 
     /// Promotes one exact committed attempt after transport-specific health evidence.

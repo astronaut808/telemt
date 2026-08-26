@@ -34,8 +34,11 @@ impl WebSession {
         sequence: u64,
         body: &[u8],
     ) -> Result<u64, ManagerError> {
-        self.process_up_inner(sequence, body)
-            .map(|(acknowledged, _)| acknowledged)
+        let (acknowledged, progressed) = self.process_up_inner(sequence, body)?;
+        if self.automatic_carrier && !progressed && !self.is_carrier_committed() {
+            return Err(ManagerError::Backpressure);
+        }
+        Ok(acknowledged)
     }
 
     /// Applies one WebSocket uplink batch and reports actual carrier progress.
@@ -182,6 +185,9 @@ impl WebSession {
                 || state.closing_streams.contains_key(&value.stream_id);
             match value.frame_type {
                 FrameType::Open => {
+                    let Some(stream) = next_stream_identity(state, value.stream_id) else {
+                        return false;
+                    };
                     let peer_port = match reserved_open.take() {
                         Some((reserved_stream_id, peer_port))
                             if reserved_stream_id == value.stream_id =>
@@ -207,9 +213,6 @@ impl WebSession {
                             };
                             peer_port
                         }
-                    };
-                    let Some(stream) = next_stream_identity(state, value.stream_id) else {
-                        return false;
                     };
                     state.streams.insert(
                         value.stream_id,
@@ -420,6 +423,10 @@ mod tests {
     use crate::web::manager::WebProcessRuntime;
 
     fn session() -> Arc<WebSession> {
+        session_with_automatic(false)
+    }
+
+    fn session_with_automatic(automatic: bool) -> Arc<WebSession> {
         let profile = Arc::new(WebRuntimeProfile {
             host: "proxy.example.com".to_string(),
             public_addr: SocketAddr::from(([203, 0, 113, 10], 443)),
@@ -447,9 +454,13 @@ mod tests {
             1,
             [3; 32],
             None,
-            crate::web::manager::CarrierClientClass::Legacy,
+            if automatic {
+                crate::web::manager::CarrierClientClass::Bridge
+            } else {
+                crate::web::manager::CarrierClientClass::Legacy
+            },
             None,
-            false,
+            automatic,
             WebLimitsConfig::default(),
             WebTimeoutsConfig::default(),
         )
@@ -514,5 +525,15 @@ mod tests {
         let body = frame::encode(FrameType::Pong, 0, &[]);
         assert_eq!(session.process_up(2, &body), Err(ManagerError::Protocol));
         assert!(session.state.lock().closed);
+    }
+
+    #[test]
+    fn automatic_uplink_does_not_ack_a_batch_without_real_progress() {
+        let session = session_with_automatic(true);
+        let body = frame::encode(FrameType::Pong, 0, &[]);
+
+        assert_eq!(session.process_up(1, &body), Err(ManagerError::Backpressure));
+        assert!(!session.is_carrier_committed());
+        assert!(!session.state.lock().closed);
     }
 }

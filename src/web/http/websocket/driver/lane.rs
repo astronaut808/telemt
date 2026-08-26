@@ -2,125 +2,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use hyper_util::rt::TokioIo;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
-use super::ConnectionIo;
+use super::CarrierSocket;
+use super::io::{flush, process_lane, read_message, record_message, reserve_data, send};
 use crate::web::manager::{
     WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection,
 };
-use crate::web::session::{
-    WebSession, WebSocketLaneReservation, WebSocketProbeReservation,
-};
+use crate::web::session::{WebSession, WebSocketLaneReservation};
 use crate::web::trace::{TraceDirection, TraceWebSocketContext};
 
-const READ_BUFFER_BYTES: usize = 64 * 1024;
-const WRITE_BUFFER_BYTES: usize = 64 * 1024;
-
-// Cancellation-safe message I/O and budget retries remain separate from carrier loops.
-mod io;
-// Per-lane carrier state remains isolated from the multiplexed driver.
-mod lane;
-use io::{flush, process_multiplex, read_message, record_message, reserve_data, send};
-use lane::run_lane;
-
-pub(super) async fn run_upgraded(
-    on_upgrade: hyper::upgrade::OnUpgrade,
-    runtime: Arc<WebProcessRuntime>,
-    session: Arc<WebSession>,
-    connection: WebSocketConnection,
-    mut lane_reservation: Option<WebSocketLaneReservation>,
-    _probe_reservation: Option<WebSocketProbeReservation>,
-    trace: Option<TraceWebSocketContext>,
-    acknowledge_commit: bool,
-) {
-    let cancellation = connection.cancellation();
-    let timeouts = session.timeouts().clone();
-    let upgraded = tokio::select! {
-        _ = cancellation.cancelled() => return,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeouts.websocket_upgrade_secs),
-            on_upgrade,
-        ) => result,
-    };
-    let Ok(Ok(upgraded)) = upgraded else {
-        return;
-    };
-    let Ok(parts) = upgraded.downcast::<TokioIo<ConnectionIo>>() else {
-        return;
-    };
-    let mut io = parts.io.into_inner();
-    io.enable_websocket(parts.read_buf);
-    let limits = session.limits().clone();
-    let config = WebSocketConfig::default()
-        .read_buffer_size(READ_BUFFER_BYTES)
-        .write_buffer_size(WRITE_BUFFER_BYTES)
-        .max_write_buffer_size(
-            WRITE_BUFFER_BYTES
-                .saturating_add(limits.carrier_batch_bytes)
-                .saturating_add(1024),
-        )
-        .max_message_size(Some(limits.carrier_batch_bytes))
-        .max_frame_size(Some(limits.carrier_batch_bytes));
-    let mut socket = WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await;
-    if !connection.mark_opened() {
-        return;
-    }
-    if let Some(reservation) = lane_reservation.as_mut() {
-        let _ = run_lane(
-            &mut socket,
-            &runtime,
-            &session,
-            &connection,
-            reservation,
-            cancellation.clone(),
-            trace.as_ref(),
-            acknowledge_commit,
-        )
-        .await;
-    } else {
-        let _ = run_multiplex(
-            &mut socket,
-            &runtime,
-            &session,
-            &connection,
-            cancellation.clone(),
-            trace.as_ref(),
-            acknowledge_commit,
-        )
-        .await;
-    }
-    let eviction = Duration::from_secs(timeouts.websocket_eviction_secs);
-    tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {}
-        _ = tokio::time::timeout(eviction, socket.close(None)) => {}
-    }
-    if let Some(reservation) = lane_reservation {
-        session.close_websocket_lane(reservation.lane_id());
-        drop(reservation);
-    } else if !acknowledge_commit || session.is_carrier_committed() {
-        session.close();
-    }
-}
-
-type CarrierSocket = WebSocketStream<ConnectionIo>;
-
-async fn run_multiplex(
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_lane(
     socket: &mut CarrierSocket,
     runtime: &Arc<WebProcessRuntime>,
     session: &Arc<WebSession>,
     connection: &WebSocketConnection,
+    reservation: &mut WebSocketLaneReservation,
     cancellation: CancellationToken,
     trace: Option<&TraceWebSocketContext>,
     acknowledge_commit: bool,
 ) -> Result<(), ()> {
     let mut sequence = 1u64;
     let mut cursor = 0u64;
-    // The lease survives cancelled select branches and control frames interleaved
-    // inside one fragmented data message.
+    // Lane reads use the same cancellation-safe fragmented-message ownership.
     let mut read_budget = None;
     let liveness_interval = connection.liveness_interval();
     let mut next_ping = Instant::now() + liveness_interval;
@@ -132,7 +38,7 @@ async fn run_multiplex(
     let maximum_message = session.limits().carrier_batch_bytes;
     let mut active = false;
     loop {
-        let down = session.poll_down(cursor);
+        let down = session.poll_down_lane(reservation.lane_id(), cursor);
         tokio::pin!(down);
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Err(()),
@@ -155,9 +61,10 @@ async fn run_multiplex(
             DriverEvent::Incoming((message, _budget)) => match message {
                 Message::Binary(body) => {
                     let started = Instant::now();
-                    let result = process_multiplex(
+                    let result = process_lane(
                         runtime,
                         session,
+                        reservation,
                         sequence,
                         &body,
                         &cancellation,
@@ -178,13 +85,18 @@ async fn run_multiplex(
                             return Err(());
                         }
                         let started = Instant::now();
-                        send(
+                        if send(
                             socket,
                             Message::Binary(Bytes::new()),
                             &cancellation,
                             write_timeout,
                         )
-                        .await?;
+                        .await
+                        .is_err()
+                        {
+                            session.close();
+                            return Err(());
+                        }
                         record_message(
                             runtime,
                             trace,
@@ -271,6 +183,9 @@ async fn run_multiplex(
                 Message::Frame(_) => return Err(()),
             },
             DriverEvent::Down(result) => {
+                if result.lane_closed {
+                    return Ok(());
+                }
                 if result.body.is_empty() {
                     let started = Instant::now();
                     send(

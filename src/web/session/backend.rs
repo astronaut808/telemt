@@ -118,11 +118,11 @@ impl WebSession {
                 .then(|| state.streams.remove(&stream.id))
                 .flatten()
                 .map(|stream_state| {
-                let (bytes, items) = inbound_queue_cost(&stream_state.inbound);
-                self.release_locked(&mut state, bytes, items, false);
-                self.remember_closed_locked(&mut state, stream.id);
-                self.queue_control_locked(&mut state, FrameType::Close, stream.id, &[])
-            })
+                    let (bytes, items) = inbound_queue_cost(&stream_state.inbound);
+                    self.release_locked(&mut state, bytes, items, false);
+                    self.remember_closed_locked(&mut state, stream.id);
+                    self.queue_control_locked(&mut state, FrameType::Close, stream.id, &[])
+                })
         };
         if queued.is_some_and(|queued| !queued) {
             self.close();
@@ -137,12 +137,15 @@ impl WebSession {
                 .streams
                 .get(&stream.id)
                 .is_some_and(|state| state.instance == stream.instance);
-            let queued = current.then(|| state.streams.remove(&stream.id)).flatten().map(|stream_state| {
-                let (bytes, items) = inbound_queue_cost(&stream_state.inbound);
-                self.release_locked(&mut state, bytes, items, false);
-                self.remember_closed_locked(&mut state, stream.id);
-                self.queue_control_locked(&mut state, FrameType::Close, stream.id, &[])
-            });
+            let queued = current
+                .then(|| state.streams.remove(&stream.id))
+                .flatten()
+                .map(|stream_state| {
+                    let (bytes, items) = inbound_queue_cost(&stream_state.inbound);
+                    self.release_locked(&mut state, bytes, items, false);
+                    self.remember_closed_locked(&mut state, stream.id);
+                    self.queue_control_locked(&mut state, FrameType::Close, stream.id, &[])
+                });
             if state.closing_streams.get(&stream.id) == Some(&stream.instance) {
                 state.closing_streams.remove(&stream.id);
                 self.remember_closed_locked(&mut state, stream.id);

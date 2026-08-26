@@ -191,9 +191,7 @@ impl WebProcessRuntime {
             trace,
             http_connections: Arc::new(Semaphore::new(limits.max_http_connections)),
             http_handlers: Arc::new(Semaphore::new(limits.max_http_handlers)),
-            lane_polls: Arc::new(Semaphore::new(
-                lane_poll_limit,
-            )),
+            lane_polls: Arc::new(Semaphore::new(lane_poll_limit)),
             lane_aux_polls: Arc::new(Semaphore::new(lane_aux_poll_limit)),
             body_readers: Arc::new(Semaphore::new(limits.max_body_readers)),
             body_bytes: Arc::new(Semaphore::new(limits.max_body_bytes_global)),

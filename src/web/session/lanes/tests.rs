@@ -21,6 +21,14 @@ fn new_session(
     limits: WebLimitsConfig,
     manager: std::sync::Weak<WebProcessRuntime>,
 ) -> Arc<WebSession> {
+    new_session_with_automatic(limits, manager, false)
+}
+
+fn new_session_with_automatic(
+    limits: WebLimitsConfig,
+    manager: std::sync::Weak<WebProcessRuntime>,
+    automatic: bool,
+) -> Arc<WebSession> {
     let profile = Arc::new(WebRuntimeProfile {
         host: "proxy.example.com".to_string(),
         public_addr: SocketAddr::from(([203, 0, 113, 10], 443)),
@@ -48,9 +56,13 @@ fn new_session(
         1,
         [3; 32],
         None,
-        crate::web::manager::CarrierClientClass::Legacy,
+        if automatic {
+            crate::web::manager::CarrierClientClass::Bridge
+        } else {
+            crate::web::manager::CarrierClientClass::Legacy
+        },
         None,
-        false,
+        automatic,
         limits,
         WebTimeoutsConfig::default(),
     )
@@ -257,5 +269,22 @@ fn tombstone_eviction_releases_lane_budget_and_accepts_late_frames() {
     }
     let late = frame::encode(FrameType::Data, 7, b"late");
     assert_eq!(session.process_up_lane(7, 7, &late), Ok(7));
+    assert!(!session.state.lock().closed);
+}
+
+#[test]
+fn automatic_lane_does_not_ack_a_missing_lane_without_real_progress() {
+    let session = new_session_with_automatic(
+        WebLimitsConfig::default(),
+        std::sync::Weak::new(),
+        true,
+    );
+    let late = frame::encode(FrameType::Data, 7, b"late");
+
+    assert_eq!(
+        session.process_up_lane(7, 1, &late),
+        Err(ManagerError::Backpressure)
+    );
+    assert!(!session.is_carrier_committed());
     assert!(!session.state.lock().closed);
 }

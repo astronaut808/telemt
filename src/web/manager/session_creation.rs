@@ -276,13 +276,13 @@ impl WebProcessRuntime {
             now + Duration::from_secs(profile.carrier_negotiation_deadlines_secs[3]),
         );
         let learning_context = learning_epoch.map(|epoch| CarrierLearningContext {
-                profile_key,
-                client_ip,
-                class: carrier_request.class(),
-                user_agent_hash: carrier_request.user_agent_hash(),
-                epoch,
-                ip_learning_eligible,
-            });
+            profile_key,
+            client_ip,
+            class: carrier_request.class(),
+            user_agent_hash: carrier_request.user_agent_hash(),
+            epoch,
+            ip_learning_eligible,
+        });
         let session = WebSession::new(
             Arc::downgrade(self),
             session_hash,
@@ -540,5 +540,4 @@ impl WebProcessRuntime {
         );
         Ok(result)
     }
-
 }
