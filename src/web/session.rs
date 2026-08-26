@@ -81,6 +81,8 @@ struct DownBatch {
 
 struct CarrierLane {
     instance: u64,
+    pending_bytes: usize,
+    pending_items: usize,
     pending_frames: VecDeque<QueuedFrame>,
     pending_windows: HashMap<u32, usize>,
     unacked: Option<DownBatch>,
@@ -96,6 +98,8 @@ impl CarrierLane {
     fn new(instance: u64) -> Self {
         Self {
             instance,
+            pending_bytes: 0,
+            pending_items: 0,
             pending_frames: VecDeque::new(),
             pending_windows: HashMap::new(),
             unacked: None,
@@ -124,7 +128,6 @@ struct SessionState {
     last_up_sequence: u64,
     last_up_digest: TokenHash,
     carrier_lanes: HashMap<u32, CarrierLane>,
-    lane_open_claims: HashSet<u32>,
     lane_open_waits: usize,
     next_lane_instance: u64,
     websocket_lane_reservations: HashMap<u32, u16>,
@@ -231,7 +234,6 @@ impl WebSession {
                 last_up_sequence: 0,
                 last_up_digest: [0; 32],
                 carrier_lanes,
-                lane_open_claims: HashSet::new(),
                 lane_open_waits: 0,
                 next_lane_instance,
                 websocket_lane_reservations: HashMap::new(),
@@ -458,17 +460,6 @@ impl WebSession {
             .map(|manager| manager.budget_notify())
     }
 
-    fn release_stream_reservation(&self, peer_port: u16) {
-        let removed = self.state.lock().active_peer_ports.remove(&peer_port);
-        if removed && let Some(manager) = self.manager.upgrade() {
-            manager.release_stream(
-                self.profile_key,
-                self.client_ip,
-                self.profile.public_addr,
-                peer_port,
-            );
-        }
-    }
 }
 
 fn inbound_queue_cost(queue: &VecDeque<InboundChunk>) -> (usize, usize) {

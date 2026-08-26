@@ -15,6 +15,12 @@ use crate::web::frame::{self, Frame, FrameType};
 use crate::web::manager::{ManagerError, TokenHash};
 
 impl WebSession {
+    /// Classifies control and pre-OPEN polls for their reserved handler pool.
+    pub(crate) fn lane_poll_is_auxiliary(&self, lane_id: u32) -> bool {
+        let state = self.state.lock();
+        lane_id == 0 || !state.carrier_lanes.contains_key(&lane_id)
+    }
+
     /// Applies one exactly-once uplink batch to an independent HTTPS lane.
     pub(crate) fn process_up_lane(
         self: &Arc<Self>,
@@ -53,7 +59,8 @@ impl WebSession {
             }
             self.ensure_carrier_active_locked(&state)?;
             state.last_activity = Instant::now();
-            if !state.carrier_lanes.contains_key(&lane_id) {
+            let new_lane = !state.carrier_lanes.contains_key(&lane_id);
+            if new_lane {
                 if lane_id != 0
                     && frames
                         .first()
@@ -71,18 +78,20 @@ impl WebSession {
                     self.close();
                     return Err(ManagerError::Protocol);
                 }
-                if insert_carrier_lane(&mut state, lane_id).is_none() {
-                    drop(state);
-                    self.close();
-                    return Err(ManagerError::Protocol);
+                if state.carrier_lanes.len()
+                    >= self.profile.max_streams_per_session.saturating_add(1)
+                {
+                    return Err(ManagerError::Limit);
                 }
             }
-            let lane = state
+            let (last_sequence, last_digest, up_active) = state
                 .carrier_lanes
-                .get_mut(&lane_id)
-                .ok_or(ManagerError::Protocol)?;
-            if sequence == lane.last_up_sequence && sequence != 0 {
-                return if bool::from(lane.last_up_digest.ct_eq(&digest)) {
+                .get(&lane_id)
+                .map_or((0, [0; 32], false), |lane| {
+                    (lane.last_up_sequence, lane.last_up_digest, lane.up_active)
+                });
+            if sequence == last_sequence && sequence != 0 {
+                return if bool::from(last_digest.ct_eq(&digest)) {
                     Ok(sequence)
                 } else {
                     drop(state);
@@ -90,15 +99,14 @@ impl WebSession {
                     Err(ManagerError::Protocol)
                 };
             }
-            if sequence == 0 || sequence != lane.last_up_sequence.saturating_add(1) {
+            if sequence == 0 || sequence != last_sequence.saturating_add(1) {
                 drop(state);
                 self.close();
                 return Err(ManagerError::Protocol);
             }
-            if lane.up_active {
+            if up_active {
                 return Err(ManagerError::Concurrent);
             }
-            lane.up_active = true;
             if !validate_batch(&state, &frames) {
                 drop(state);
                 self.close();
@@ -116,6 +124,17 @@ impl WebSession {
                 }
                 return Err(ManagerError::Backpressure);
             }
+            if new_lane && insert_carrier_lane(&mut state, lane_id).is_none() {
+                self.release_locked(&mut state, reserve_bytes, reserve_items, false);
+                drop(state);
+                self.close();
+                return Err(ManagerError::Protocol);
+            }
+            let Some(lane) = state.carrier_lanes.get_mut(&lane_id) else {
+                self.release_locked(&mut state, reserve_bytes, reserve_items, false);
+                return Err(ManagerError::Closed);
+            };
+            lane.up_active = true;
             let mut unused_bytes = reserve_bytes;
             let mut unused_items = reserve_items;
             let applied = self.apply_batch_locked(
@@ -150,6 +169,7 @@ impl WebSession {
         if committed {
             self.finish_carrier_commit();
         }
+        self.lane_open_notify.notify_waiters();
         for completion in opened {
             self.spawn_stream(completion, false);
         }
@@ -168,14 +188,26 @@ impl WebSession {
         if !self.carrier().uses_lanes() || lane_id > frame::MAX_STREAM_ID {
             return Err(ManagerError::Protocol);
         }
-        let (epoch, notify) = {
+        if !self.wait_for_lane_open(lane_id, cursor).await? {
+            return Ok(PollResult {
+                body: Bytes::new(),
+                next_cursor: cursor,
+                lane_closed: false,
+            });
+        }
+        let (instance, epoch, notify) = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(ManagerError::Closed);
             }
+            state.last_activity = Instant::now();
             let acknowledged = {
                 let Some(lane) = state.carrier_lanes.get_mut(&lane_id) else {
-                    return Err(ManagerError::Protocol);
+                    return Ok(PollResult {
+                        body: Bytes::new(),
+                        next_cursor: cursor,
+                        lane_closed: true,
+                    });
                 };
                 if let Some(unacked) = &lane.unacked {
                     if cursor == unacked.base_cursor {
@@ -201,6 +233,14 @@ impl WebSession {
                 }
             };
             if let Some(batch) = acknowledged {
+                if let Some(lane) = state.carrier_lanes.get_mut(&lane_id) {
+                    lane.pending_bytes = lane
+                        .pending_bytes
+                        .saturating_sub(batch.data_bytes.saturating_add(batch.control_bytes));
+                    lane.pending_items = lane
+                        .pending_items
+                        .saturating_sub(batch.data_items.saturating_add(batch.control_items));
+                }
                 self.release_locked(&mut state, batch.data_bytes, batch.data_items, false);
                 self.release_locked(&mut state, batch.control_bytes, batch.control_items, true);
                 if let Some(stream) = state.streams.get_mut(&lane_id)
@@ -209,13 +249,12 @@ impl WebSession {
                     waker.wake();
                 }
             }
-            state.last_activity = Instant::now();
             let lane = state
                 .carrier_lanes
                 .get_mut(&lane_id)
                 .ok_or(ManagerError::Protocol)?;
             lane.down_epoch = lane.down_epoch.wrapping_add(1).max(1);
-            (lane.down_epoch, Arc::clone(&lane.notify))
+            (lane.instance, lane.down_epoch, Arc::clone(&lane.notify))
         };
         notify.notify_waiters();
 
@@ -235,7 +274,7 @@ impl WebSession {
                             lane_closed: true,
                         });
                     };
-                    if lane.down_epoch != epoch {
+                    if lane.instance != instance || lane.down_epoch != epoch {
                         return Ok(PollResult {
                             body: Bytes::new(),
                             next_cursor: cursor,
@@ -304,7 +343,7 @@ impl WebSession {
                 if state
                     .carrier_lanes
                     .get(&lane_id)
-                    .is_some_and(|lane| lane.down_epoch == epoch)
+                    .is_some_and(|lane| lane.instance == instance && lane.down_epoch == epoch)
                 {
                     state.last_activity = Instant::now();
                 }
@@ -315,6 +354,60 @@ impl WebSession {
                 })
             }
         }
+    }
+
+    async fn wait_for_lane_open(
+        &self,
+        lane_id: u32,
+        cursor: u64,
+    ) -> Result<bool, ManagerError> {
+        let wait = {
+            let mut state = self.state.lock();
+            if state.closed {
+                return Err(ManagerError::Closed);
+            }
+            if state.carrier_lanes.contains_key(&lane_id) {
+                return Ok(true);
+            }
+            if cursor != 0 || lane_id == 0 {
+                drop(state);
+                self.close();
+                return Err(ManagerError::Protocol);
+            }
+            if state.closed_streams.contains(&lane_id)
+                || state.closing_streams.contains_key(&lane_id)
+            {
+                return Ok(true);
+            }
+            if state.lane_open_waits >= self.limits.max_lane_open_waits_per_session {
+                return Err(ManagerError::Limit);
+            }
+            state.lane_open_waits += 1;
+            LaneOpenWaitGuard { session: self }
+        };
+        let deadline = Duration::from_secs(self.timeouts.lane_open_wait_secs);
+        let opened = tokio::time::timeout(deadline, async {
+            loop {
+                let notified = self.lane_open_notify.notified();
+                {
+                    let state = self.state.lock();
+                    if state.closed
+                        || state.carrier_lanes.contains_key(&lane_id)
+                        || state.closed_streams.contains(&lane_id)
+                        || state.closing_streams.contains_key(&lane_id)
+                    {
+                        return state.carrier_lanes.contains_key(&lane_id)
+                            || state.closed_streams.contains(&lane_id)
+                            || state.closing_streams.contains_key(&lane_id);
+                    }
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or(false);
+        drop(wait);
+        Ok(opened)
     }
 
     pub(super) fn queue_lane_frame_locked(
@@ -363,6 +456,15 @@ impl WebSession {
                             <= self.limits.max_frame_payload_bytes
                 });
         if can_coalesce {
+            if state.carrier_lanes.get(&stream_id).is_none_or(|lane| {
+                lane.pending_bytes
+                    > self
+                        .limits
+                        .pending_bytes_per_lane
+                        .saturating_sub(payload.len())
+            }) {
+                return false;
+            }
             if !self.reserve_locked(state, payload.len(), 0, PendingClass::Downlink) {
                 return false;
             }
@@ -378,6 +480,7 @@ impl WebSession {
             last.cost += payload.len();
             let payload_len = (last.encoded.len() - frame::HEADER_BYTES) as u32;
             last.encoded[4..8].copy_from_slice(&payload_len.to_be_bytes());
+            lane.pending_bytes += payload.len();
             lane.notify.notify_waiters();
             return true;
         }
@@ -387,6 +490,14 @@ impl WebSession {
         } else {
             PendingClass::Downlink
         };
+        if state.carrier_lanes.get(&stream_id).is_none_or(|lane| {
+            lane.pending_bytes
+                > self.limits.pending_bytes_per_lane.saturating_sub(cost)
+                || lane.pending_items
+                    >= self.limits.pending_items_per_lane
+        }) {
+            return false;
+        }
         if !self.reserve_locked(state, cost, 1, class) {
             return false;
         }
@@ -409,6 +520,8 @@ impl WebSession {
             control,
             cost,
         });
+        lane.pending_bytes += cost;
+        lane.pending_items += 1;
         if frame_type == FrameType::Window {
             lane.pending_windows.insert(stream_id, index);
         }
@@ -455,6 +568,18 @@ impl WebSession {
         }
         self.release_locked(state, data_bytes, data_items, false);
         self.release_locked(state, control_bytes, control_items, true);
+        self.lane_open_notify.notify_waiters();
+    }
+}
+
+struct LaneOpenWaitGuard<'a> {
+    session: &'a WebSession,
+}
+
+impl Drop for LaneOpenWaitGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.session.state.lock();
+        state.lane_open_waits = state.lane_open_waits.saturating_sub(1);
     }
 }
 

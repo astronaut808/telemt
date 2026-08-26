@@ -100,6 +100,8 @@ impl WebSession {
             );
             return Err(ManagerError::Protocol);
         }
+        drop(state);
+        self.lane_open_notify.notify_waiters();
         Ok(WebSocketLaneReservation {
             session: Arc::clone(self),
             lane_id,
@@ -229,6 +231,7 @@ impl WebSession {
             let mut state = self.state.lock();
             let reserved = state.websocket_lane_reservations.remove(&lane_id);
             if let Some(stream) = state.streams.remove(&lane_id) {
+                state.closing_streams.insert(lane_id, stream.instance);
                 let (bytes, items) = inbound_queue_cost(&stream.inbound);
                 self.release_locked(&mut state, bytes, items, false);
                 if let Some(waker) = stream.read_waker {
@@ -245,6 +248,7 @@ impl WebSession {
         if let Some(peer_port) = reserved {
             self.release_websocket_lane_reservation(lane_id, peer_port);
         }
+        self.lane_open_notify.notify_waiters();
     }
 
     fn release_websocket_lane_reservation(&self, lane_id: u32, peer_port: u16) {
