@@ -160,6 +160,7 @@ pub(super) async fn send(
     socket: &mut CarrierSocket,
     runtime: &WebProcessRuntime,
     message: Message,
+    cancellation: &CancellationToken,
 ) -> Result<(), ()> {
     let timeout = Duration::from_secs(
         runtime
@@ -169,15 +170,18 @@ pub(super) async fn send(
             .timeouts
             .websocket_write_secs,
     );
-    tokio::time::timeout(timeout, socket.send(message))
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(()),
+        result = tokio::time::timeout(timeout, socket.send(message)) => {
+            result.map_err(|_| ())?.map_err(|_| ())
+        }
+    }
 }
 
 pub(super) async fn flush(
     socket: &mut CarrierSocket,
     runtime: &WebProcessRuntime,
+    cancellation: &CancellationToken,
 ) -> Result<(), ()> {
     let timeout = Duration::from_secs(
         runtime
@@ -187,10 +191,12 @@ pub(super) async fn flush(
             .timeouts
             .websocket_write_secs,
     );
-    tokio::time::timeout(timeout, socket.flush())
-        .await
-        .map_err(|_| ())?
-        .map_err(|_| ())
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(()),
+        result = tokio::time::timeout(timeout, socket.flush()) => {
+            result.map_err(|_| ())?.map_err(|_| ())
+        }
+    }
 }
 
 pub(super) fn record_message(

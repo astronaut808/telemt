@@ -21,6 +21,8 @@ use crate::web::manager::CarrierLearningContext;
 mod backend;
 // Downlink queues own cursor replay, flow control, and memory reservations.
 mod downlink;
+// Response ownership keeps detached batches charged until the last body clone drops.
+mod resident;
 // Lane carrier state isolates request sequencing and downlink replay per logical stream.
 mod lanes;
 // WebSocket carrier state owns pre-OPEN lane reservations and failure isolation.
@@ -71,6 +73,7 @@ struct QueuedFrame {
 
 struct DownBatch {
     body: Bytes,
+    lease: Arc<resident::PendingResponseLease>,
     base_cursor: u64,
     next_cursor: u64,
     data_bytes: usize,
@@ -83,6 +86,7 @@ struct CarrierLane {
     instance: u64,
     pending_bytes: usize,
     pending_items: usize,
+    resident: Arc<resident::ResidentCounters>,
     pending_frames: VecDeque<QueuedFrame>,
     pending_windows: HashMap<u32, usize>,
     unacked: Option<DownBatch>,
@@ -100,6 +104,7 @@ impl CarrierLane {
             instance,
             pending_bytes: 0,
             pending_items: 0,
+            resident: Arc::new(resident::ResidentCounters::default()),
             pending_frames: VecDeque::new(),
             pending_windows: HashMap::new(),
             unacked: None,
@@ -169,6 +174,7 @@ pub(crate) struct WebSession {
     cancel: CancellationToken,
     tasks_live: AtomicUsize,
     tasks_done: Arc<Notify>,
+    resident: Arc<resident::ResidentCounters>,
     finished: AtomicBool,
     up_active: AtomicBool,
 }
@@ -251,6 +257,7 @@ impl WebSession {
             cancel: CancellationToken::new(),
             tasks_live: AtomicUsize::new(0),
             tasks_done: Arc::new(Notify::new()),
+            resident: Arc::new(resident::ResidentCounters::default()),
             finished: AtomicBool::new(false),
             up_active: AtomicBool::new(false),
         })
@@ -279,6 +286,11 @@ impl WebSession {
     /// Returns the process-unique non-secret trace identifier.
     pub(crate) fn trace_session_id(&self) -> u64 {
         self.trace_session_id
+    }
+
+    /// Creates a child cancellation boundary for one owned carrier task.
+    pub(crate) fn carrier_cancellation(&self) -> CancellationToken {
+        self.cancel.child_token()
     }
 
     /// Returns whether accepted carrier progress made this attempt immutable.

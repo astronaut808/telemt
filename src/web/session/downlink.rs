@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+use super::resident::{OwnedBatchBody, PendingCounts, PendingResponseLease};
 use super::{
     DownBatch, PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState, WebSession,
 };
@@ -60,6 +62,9 @@ impl WebSession {
                     if !state.pending_frames.is_empty() {
                         let batch = match self.take_down_batch_locked(&mut state, cursor) {
                             Ok(batch) => batch,
+                            Err(ManagerError::Backpressure) => {
+                                return Err(ManagerError::Backpressure);
+                            }
                             Err(error) => {
                                 drop(state);
                                 self.close();
@@ -121,6 +126,15 @@ impl WebSession {
             .limits
             .pending_items_per_session
             .saturating_sub(item_reserve);
+        let resident = self.resident.snapshot();
+        let pending_bytes = state.pending_bytes.saturating_add(resident.bytes());
+        let pending_items = state.pending_items.saturating_add(resident.items());
+        let pending_control_bytes = state
+            .pending_control_bytes
+            .saturating_add(resident.control_bytes);
+        let pending_control_items = state
+            .pending_control_items
+            .saturating_add(resident.control_items);
         if state.closed {
             return false;
         }
@@ -128,20 +142,16 @@ impl WebSession {
         let fits = if control {
             bytes <= self.limits.control_bytes_per_session
                 && items <= item_reserve
-                && state.pending_bytes
+                && pending_bytes
                     <= self.limits.pending_bytes_per_session.saturating_sub(bytes)
-                && state.pending_items
+                && pending_items
                     <= self.limits.pending_items_per_session.saturating_sub(items)
-                && state.pending_control_bytes
+                && pending_control_bytes
                     <= self.limits.control_bytes_per_session.saturating_sub(bytes)
-                && state.pending_control_items <= item_reserve.saturating_sub(items)
+                && pending_control_items <= item_reserve.saturating_sub(items)
         } else {
-            let data_bytes = state
-                .pending_bytes
-                .saturating_sub(state.pending_control_bytes);
-            let data_items = state
-                .pending_items
-                .saturating_sub(state.pending_control_items);
+            let data_bytes = pending_bytes.saturating_sub(pending_control_bytes);
+            let data_items = pending_items.saturating_sub(pending_control_items);
             let (byte_limit, item_limit) = if class == PendingClass::Downlink {
                 let uplink_bytes = self.limits.max_body_bytes.saturating_add(
                     self.limits
@@ -200,6 +210,21 @@ impl WebSession {
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.release_pending(self.profile_key, bytes, items, control);
+        }
+    }
+
+    pub(super) fn release_local_locked(
+        &self,
+        state: &mut SessionState,
+        bytes: usize,
+        items: usize,
+        control: bool,
+    ) {
+        state.pending_bytes = state.pending_bytes.saturating_sub(bytes);
+        state.pending_items = state.pending_items.saturating_sub(items);
+        if control {
+            state.pending_control_bytes = state.pending_control_bytes.saturating_sub(bytes);
+            state.pending_control_items = state.pending_control_items.saturating_sub(items);
         }
     }
 
@@ -351,6 +376,12 @@ impl WebSession {
             body_len += queued.encoded.len();
             count += 1;
         }
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(ManagerError::Closed);
+        };
+        let Some(_staging) = manager.try_downlink_staging_budget(body_len) else {
+            return Err(ManagerError::Backpressure);
+        };
         let mut body = BytesMut::with_capacity(body_len);
         let mut data_bytes = 0usize;
         let mut data_items = 0usize;
@@ -383,8 +414,17 @@ impl WebSession {
             *index = index.saturating_sub(count);
         }
         state.down_cursor = next_cursor;
+        let counts = PendingCounts {
+            data_bytes,
+            data_items,
+            control_bytes,
+            control_items,
+        };
+        let lease = PendingResponseLease::new(self, counts, None);
+        let body = Bytes::from_owner(OwnedBatchBody::new(body.freeze(), Arc::clone(&lease)));
         Ok(DownBatch {
-            body: body.freeze(),
+            body,
+            lease,
             base_cursor: cursor,
             next_cursor,
             data_bytes,
@@ -398,8 +438,9 @@ impl WebSession {
         let Some(batch) = state.unacked.take() else {
             return;
         };
-        self.release_locked(state, batch.data_bytes, batch.data_items, false);
-        self.release_locked(state, batch.control_bytes, batch.control_items, true);
+        batch.lease.detach();
+        self.release_local_locked(state, batch.data_bytes, batch.data_items, false);
+        self.release_local_locked(state, batch.control_bytes, batch.control_items, true);
         for stream in state.streams.values_mut() {
             if let Some(waker) = stream.write_waker.take() {
                 waker.wake();

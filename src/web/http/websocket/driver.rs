@@ -30,7 +30,16 @@ pub(super) async fn run_upgraded(
     trace: Option<TraceWebSocketContext>,
     acknowledge_commit: bool,
 ) {
-    let Ok(upgraded) = on_upgrade.await else {
+    let cancellation = connection.cancellation();
+    let timeouts = runtime.active_generation().config().web.timeouts.clone();
+    let upgraded = tokio::select! {
+        _ = cancellation.cancelled() => return,
+        result = tokio::time::timeout(
+            Duration::from_secs(timeouts.websocket_upgrade_secs),
+            on_upgrade,
+        ) => result,
+    };
+    let Ok(Ok(upgraded)) = upgraded else {
         return;
     };
     let Ok(parts) = upgraded.downcast::<TokioIo<ConnectionIo>>() else {
@@ -51,7 +60,6 @@ pub(super) async fn run_upgraded(
         .max_frame_size(Some(limits.carrier_batch_bytes));
     let mut socket = WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await;
     connection.mark_opened();
-    let cancellation = connection.cancellation();
     if let Some(reservation) = lane_reservation.as_mut() {
         let _ = run_lane(
             &mut socket,
@@ -84,7 +92,9 @@ pub(super) async fn run_upgraded(
             .timeouts
             .websocket_eviction_secs,
     );
-    let _ = tokio::time::timeout(eviction, socket.close(None)).await;
+    if !cancellation.is_cancelled() {
+        let _ = tokio::time::timeout(eviction, socket.close(None)).await;
+    }
     if let Some(reservation) = lane_reservation {
         session.close_websocket_lane(reservation.lane_id());
         drop(reservation);
@@ -111,11 +121,22 @@ async fn run_multiplex(
     let mut read_budget = None;
     let liveness_interval = connection.liveness_interval();
     let mut next_ping = Instant::now() + liveness_interval;
+    let open_deadline = Instant::now()
+        + Duration::from_secs(
+            runtime
+                .active_generation()
+                .config()
+                .web
+                .timeouts
+                .websocket_open_secs,
+        );
+    let mut active = false;
     loop {
         let down = session.poll_down(cursor);
         tokio::pin!(down);
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Err(()),
+            _ = tokio::time::sleep_until(open_deadline.into()), if !active => return Err(()),
             _ = tokio::time::sleep_until(next_ping.into()) => DriverEvent::Liveness,
             incoming = read_message(
                 socket,
@@ -145,7 +166,13 @@ async fn run_multiplex(
                     result?;
                     if acknowledge_commit && sequence == 1 && session.is_carrier_committed() {
                         let started = Instant::now();
-                        send(socket, runtime, Message::Binary(Bytes::new())).await?;
+                        send(
+                            socket,
+                            runtime,
+                            Message::Binary(Bytes::new()),
+                            &cancellation,
+                        )
+                        .await?;
                         record_message(
                             runtime,
                             trace,
@@ -154,6 +181,10 @@ async fn run_multiplex(
                             &[],
                             started,
                         );
+                    }
+                    if !active {
+                        connection.mark_active();
+                        active = true;
                     }
                     sequence = sequence.checked_add(1).ok_or(())?;
                     connection.mark_peer_activity();
@@ -173,7 +204,7 @@ async fn run_multiplex(
                 }
                 Message::Ping(payload) => {
                     let started = Instant::now();
-                    flush(socket, runtime).await?;
+                    flush(socket, runtime, &cancellation).await?;
                     record_message(
                         runtime,
                         trace,
@@ -220,7 +251,7 @@ async fn run_multiplex(
             DriverEvent::Down(result) => {
                 if result.body.is_empty() {
                     let started = Instant::now();
-                    send(socket, runtime, Message::Ping(Bytes::new())).await?;
+                    send(socket, runtime, Message::Ping(Bytes::new()), &cancellation).await?;
                     record_message(
                         runtime,
                         trace,
@@ -241,7 +272,7 @@ async fn run_multiplex(
                     let body = result.body;
                     let started = Instant::now();
                     if trace.is_some() {
-                        send(socket, runtime, Message::Binary(body.clone())).await?;
+                        send(socket, runtime, Message::Binary(body.clone()), &cancellation).await?;
                         record_message(
                             runtime,
                             trace,
@@ -251,7 +282,7 @@ async fn run_multiplex(
                             started,
                         );
                     } else {
-                        send(socket, runtime, Message::Binary(body)).await?;
+                        send(socket, runtime, Message::Binary(body), &cancellation).await?;
                     }
                     connection.mark_progress();
                 }
@@ -259,7 +290,7 @@ async fn run_multiplex(
             }
             DriverEvent::Liveness => {
                 let started = Instant::now();
-                send(socket, runtime, Message::Ping(Bytes::new())).await?;
+                send(socket, runtime, Message::Ping(Bytes::new()), &cancellation).await?;
                 record_message(
                     runtime,
                     trace,
@@ -291,11 +322,22 @@ async fn run_lane(
     let mut read_budget = None;
     let liveness_interval = connection.liveness_interval();
     let mut next_ping = Instant::now() + liveness_interval;
+    let open_deadline = Instant::now()
+        + Duration::from_secs(
+            runtime
+                .active_generation()
+                .config()
+                .web
+                .timeouts
+                .websocket_open_secs,
+        );
+    let mut active = false;
     loop {
         let down = session.poll_down_lane(reservation.lane_id(), cursor);
         tokio::pin!(down);
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Err(()),
+            _ = tokio::time::sleep_until(open_deadline.into()), if !active => return Err(()),
             _ = tokio::time::sleep_until(next_ping.into()) => DriverEvent::Liveness,
             incoming = read_message(
                 socket,
@@ -332,7 +374,18 @@ async fn run_lane(
                     result?;
                     if acknowledge_commit && sequence == 1 && session.is_carrier_committed() {
                         let started = Instant::now();
-                        send(socket, runtime, Message::Binary(Bytes::new())).await?;
+                        if send(
+                            socket,
+                            runtime,
+                            Message::Binary(Bytes::new()),
+                            &cancellation,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            session.close();
+                            return Err(());
+                        }
                         record_message(
                             runtime,
                             trace,
@@ -341,6 +394,10 @@ async fn run_lane(
                             &[],
                             started,
                         );
+                    }
+                    if !active {
+                        connection.mark_active();
+                        active = true;
                     }
                     sequence = sequence.checked_add(1).ok_or(())?;
                     connection.mark_peer_activity();
@@ -360,7 +417,7 @@ async fn run_lane(
                 }
                 Message::Ping(payload) => {
                     let started = Instant::now();
-                    flush(socket, runtime).await?;
+                    flush(socket, runtime, &cancellation).await?;
                     record_message(
                         runtime,
                         trace,
@@ -410,7 +467,7 @@ async fn run_lane(
                 }
                 if result.body.is_empty() {
                     let started = Instant::now();
-                    send(socket, runtime, Message::Ping(Bytes::new())).await?;
+                    send(socket, runtime, Message::Ping(Bytes::new()), &cancellation).await?;
                     record_message(
                         runtime,
                         trace,
@@ -431,7 +488,7 @@ async fn run_lane(
                     let body = result.body;
                     let started = Instant::now();
                     if trace.is_some() {
-                        send(socket, runtime, Message::Binary(body.clone())).await?;
+                        send(socket, runtime, Message::Binary(body.clone()), &cancellation).await?;
                         record_message(
                             runtime,
                             trace,
@@ -441,7 +498,7 @@ async fn run_lane(
                             started,
                         );
                     } else {
-                        send(socket, runtime, Message::Binary(body)).await?;
+                        send(socket, runtime, Message::Binary(body), &cancellation).await?;
                     }
                     connection.mark_progress();
                 }
@@ -449,7 +506,7 @@ async fn run_lane(
             }
             DriverEvent::Liveness => {
                 let started = Instant::now();
-                send(socket, runtime, Message::Ping(Bytes::new())).await?;
+                send(socket, runtime, Message::Ping(Bytes::new()), &cancellation).await?;
                 record_message(
                     runtime,
                     trace,

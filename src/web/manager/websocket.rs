@@ -275,20 +275,10 @@ impl WebProcessRuntime {
 
     pub(super) fn cleanup_websockets(&self) {
         let now = self.websocket_tick();
-        let mut victims = self
-            .websockets
-            .lock()
-            .entries
-            .values()
-            .filter(|entry| {
-                now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire))
-                    >= dead_after(entry)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut victims = claim_stale_victims(self, now);
         if victims.is_empty()
             && self.data_budget.take_pressure()
-            && let Some(victim) = select_pressure_victim(self, now)
+            && let Some(victim) = select_pressure_victim(self, now, true)
         {
             victims.push(victim);
         }
@@ -315,16 +305,22 @@ fn select_victim(
     session_id: u64,
     client_ip: IpAddr,
     excluded_id: Option<u64>,
+    claim: bool,
 ) -> Option<Arc<WebSocketEntry>> {
     let fair_share = runtime.data_budget.fair_share(Some(owner));
     let requester_usage = runtime.data_budget.owner_usage(owner);
     let now = runtime.websocket_tick();
-    runtime
-        .websockets
-        .lock()
+    let mut registry = runtime.websockets.lock();
+    if claim
+        && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight
+    {
+        return None;
+    }
+    let selected = registry
         .entries
         .values()
         .filter(|entry| Some(entry.id) != excluded_id)
+        .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .filter_map(|entry| {
             let owner_rank = if entry.session_id == session_id {
                 0
@@ -353,15 +349,28 @@ fn select_victim(
             ))
         })
         .min_by_key(|(key, _)| *key)
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| entry)?;
+    if claim && !claim_entry(&mut registry, &selected, runtime) {
+        return None;
+    }
+    Some(selected)
 }
 
-fn select_pressure_victim(runtime: &WebProcessRuntime, now: u64) -> Option<Arc<WebSocketEntry>> {
-    runtime
-        .websockets
-        .lock()
+fn select_pressure_victim(
+    runtime: &WebProcessRuntime,
+    now: u64,
+    claim: bool,
+) -> Option<Arc<WebSocketEntry>> {
+    let mut registry = runtime.websockets.lock();
+    if claim
+        && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight
+    {
+        return None;
+    }
+    let selected = registry
         .entries
         .values()
+        .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .map(|entry| {
             (
                 (
@@ -374,11 +383,58 @@ fn select_pressure_victim(runtime: &WebProcessRuntime, now: u64) -> Option<Arc<W
             )
         })
         .min_by_key(|(key, _)| *key)
-        .map(|(_, entry)| entry)
+        .map(|(_, entry)| entry)?;
+    if claim && !claim_entry(&mut registry, &selected, runtime) {
+        return None;
+    }
+    Some(selected)
+}
+
+fn claim_stale_victims(runtime: &WebProcessRuntime, now: u64) -> Vec<Arc<WebSocketEntry>> {
+    let mut registry = runtime.websockets.lock();
+    let available = runtime
+        .limits
+        .max_websocket_evictions_in_flight
+        .saturating_sub(registry.evictions_in_flight);
+    let candidates = registry
+        .entries
+        .values()
+        .filter(|entry| !entry.closing.load(Ordering::Acquire))
+        .filter(|entry| {
+            now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire))
+                >= dead_after(entry)
+        })
+        .take(available)
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates
+        .into_iter()
+        .filter(|entry| claim_entry(&mut registry, entry, runtime))
+        .collect()
+}
+
+fn claim_entry(
+    registry: &mut WebSocketRegistry,
+    entry: &Arc<WebSocketEntry>,
+    runtime: &WebProcessRuntime,
+) -> bool {
+    if registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight
+        || entry
+            .closing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return false;
+    }
+    entry
+        .phase
+        .store(WebSocketPhase::Closing as u8, Ordering::Release);
+    registry.evictions_in_flight += 1;
+    true
 }
 
 fn entry_priority(entry: &WebSocketEntry, now: u64) -> u8 {
-    if !entry.opened.load(Ordering::Acquire)
+    if entry.phase.load(Ordering::Acquire) < WebSocketPhase::Active as u8
         || now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire)) >= dead_after(entry)
     {
         0

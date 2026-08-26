@@ -284,11 +284,13 @@ pub(super) async fn handle(
         .admit_websocket(
             session.profile_key(),
             session.trace_session_id(),
+            session.token_hash(),
             effective_ip,
             kind,
             BASE_BUDGET_BYTES,
             Duration::from_secs(timeouts.long_poll_secs),
             Duration::from_secs(timeouts.websocket_eviction_secs),
+            session.carrier_cancellation(),
         )
         .await
     {

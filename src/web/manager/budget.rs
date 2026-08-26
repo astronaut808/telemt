@@ -163,7 +163,6 @@ impl WebDataBudget {
         }
         remove_owner(&mut state.owner_bytes, owner, bytes);
         drop(state);
-        self.pressured.store(false, Ordering::Release);
         self.notify.notify_waiters();
     }
 
@@ -259,7 +258,6 @@ impl WebDataBudget {
         state.websocket_bytes = state.websocket_bytes.saturating_sub(bytes);
         remove_owner(&mut state.owner_bytes, owner, bytes);
         drop(state);
-        self.pressured.store(false, Ordering::Release);
         self.notify.notify_waiters();
     }
 }

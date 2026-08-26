@@ -290,6 +290,21 @@ impl WebProcessRuntime {
         Some((reader, body))
     }
 
+    /// Reserves transient bytes while one downlink batch replaces queued frames.
+    pub(crate) fn try_downlink_staging_budget(
+        &self,
+        bytes: usize,
+    ) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        let permit = Arc::clone(&self.body_bytes)
+            .try_acquire_many_owned(bytes)
+            .ok();
+        if permit.is_none() {
+            self.record_limit_hit();
+        }
+        permit
+    }
+
     /// Reserves bounded process-wide queue capacity for data or control traffic.
     pub(crate) fn try_reserve_pending(
         &self,
@@ -351,21 +366,25 @@ impl WebProcessRuntime {
         self: &Arc<Self>,
         owner: ProfileKey,
         session_id: u64,
+        session_hash: TokenHash,
         client_ip: IpAddr,
         kind: WebSocketKind,
         base_bytes: usize,
         liveness_interval: Duration,
         eviction_timeout: Duration,
+        parent_cancellation: CancellationToken,
     ) -> Result<WebSocketConnection, ManagerError> {
         websocket::admit(
             self,
             owner,
             session_id,
+            session_hash,
             client_ip,
             kind,
             base_bytes,
             liveness_interval,
             eviction_timeout,
+            parent_cancellation,
         )
         .await
     }

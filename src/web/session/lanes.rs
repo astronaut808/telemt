@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use super::uplink::{inbound_reservation, validate_batch};
+use super::resident::{OwnedBatchBody, PendingCounts, PendingResponseLease};
 use super::{
     CarrierLane, DownBatch, PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState,
     WebSession, insert_carrier_lane, remember_closed,
@@ -241,8 +242,14 @@ impl WebSession {
                         .pending_items
                         .saturating_sub(batch.data_items.saturating_add(batch.control_items));
                 }
-                self.release_locked(&mut state, batch.data_bytes, batch.data_items, false);
-                self.release_locked(&mut state, batch.control_bytes, batch.control_items, true);
+                batch.lease.detach();
+                self.release_local_locked(&mut state, batch.data_bytes, batch.data_items, false);
+                self.release_local_locked(
+                    &mut state,
+                    batch.control_bytes,
+                    batch.control_items,
+                    true,
+                );
                 if let Some(stream) = state.streams.get_mut(&lane_id)
                     && let Some(waker) = stream.write_waker.take()
                 {
@@ -282,8 +289,11 @@ impl WebSession {
                         });
                     }
                     if !lane.pending_frames.is_empty() {
-                        let batch = match take_lane_down_batch(&self.limits, lane, cursor) {
+                        let batch = match take_lane_down_batch(self, &self.limits, lane, cursor) {
                             Ok(batch) => batch,
+                            Err(ManagerError::Backpressure) => {
+                                return Err(ManagerError::Backpressure);
+                            }
                             Err(error) => {
                                 drop(state);
                                 self.close();
@@ -457,7 +467,8 @@ impl WebSession {
                 });
         if can_coalesce {
             if state.carrier_lanes.get(&stream_id).is_none_or(|lane| {
-                lane.pending_bytes
+                let resident = lane.resident.snapshot();
+                lane.pending_bytes.saturating_add(resident.bytes())
                     > self
                         .limits
                         .pending_bytes_per_lane
@@ -491,9 +502,10 @@ impl WebSession {
             PendingClass::Downlink
         };
         if state.carrier_lanes.get(&stream_id).is_none_or(|lane| {
-            lane.pending_bytes
+            let resident = lane.resident.snapshot();
+            lane.pending_bytes.saturating_add(resident.bytes())
                 > self.limits.pending_bytes_per_lane.saturating_sub(cost)
-                || lane.pending_items
+                || lane.pending_items.saturating_add(resident.items())
                     >= self.limits.pending_items_per_lane
         }) {
             return false;
@@ -561,10 +573,9 @@ impl WebSession {
             }
         }
         if let Some(batch) = lane.unacked.take() {
-            data_bytes = data_bytes.saturating_add(batch.data_bytes);
-            data_items = data_items.saturating_add(batch.data_items);
-            control_bytes = control_bytes.saturating_add(batch.control_bytes);
-            control_items = control_items.saturating_add(batch.control_items);
+            batch.lease.detach();
+            self.release_local_locked(state, batch.data_bytes, batch.data_items, false);
+            self.release_local_locked(state, batch.control_bytes, batch.control_items, true);
         }
         self.release_locked(state, data_bytes, data_items, false);
         self.release_locked(state, control_bytes, control_items, true);
@@ -593,6 +604,7 @@ fn only_late_frames(frames: &[Frame<'_>]) -> bool {
 }
 
 fn take_lane_down_batch(
+    session: &WebSession,
     limits: &WebLimitsConfig,
     lane: &mut CarrierLane,
     cursor: u64,
@@ -613,6 +625,12 @@ fn take_lane_down_batch(
         body_len += queued.encoded.len();
         count += 1;
     }
+    let Some(manager) = session.manager.upgrade() else {
+        return Err(ManagerError::Closed);
+    };
+    let Some(_staging) = manager.try_downlink_staging_budget(body_len) else {
+        return Err(ManagerError::Backpressure);
+    };
     let mut body = BytesMut::with_capacity(body_len);
     let mut data_bytes = 0usize;
     let mut data_items = 0usize;
@@ -645,8 +663,17 @@ fn take_lane_down_batch(
         *index = index.saturating_sub(count);
     }
     lane.down_cursor = next_cursor;
+    let counts = PendingCounts {
+        data_bytes,
+        data_items,
+        control_bytes,
+        control_items,
+    };
+    let lease = PendingResponseLease::new(session, counts, Some(Arc::clone(&lane.resident)));
+    let body = Bytes::from_owner(OwnedBatchBody::new(body.freeze(), Arc::clone(&lease)));
     Ok(DownBatch {
-        body: body.freeze(),
+        body,
+        lease,
         base_cursor: cursor,
         next_cursor,
         data_bytes,
