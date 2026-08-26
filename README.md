@@ -6,11 +6,8 @@
 
 > [!NOTE]
 >
-> From June 5th, 2026: we are already analyzing the causes of a new wave of "malfunctions"
-> 
-> Telegram Clients TLS ClientHello has been banned by JA4/JA4+ Fingerprint: we are already looking for ways to solve this problem
->
-> You can try build your client with our Telegram Devlibrary - [tdlib-obf](https://github.com/telemt/tdlib-obf)
+> From August 22nd, 2026: we're drafting MTProxy WEB Implementation in Telemt!
+> It uses WebView on your device to create a datachannel!
 
 <p align="center">
   <a href="https://t.me/telemtrs">
