@@ -70,6 +70,10 @@ fn test_runtime_with_dc(
         user: "default".to_string(),
         secret_mode: WebSecretMode::Plain,
         carrier,
+        carrier_negotiation_enabled: false,
+        carrier_learning: true,
+        carriers: Arc::from([carrier]),
+        carrier_negotiation_deadlines_secs: [3, 5, 8, 12],
         capability: [7; 32],
         key_fingerprint: "0000000000000000".to_string(),
         max_sessions: 4,
@@ -120,6 +124,13 @@ fn test_runtime_with_dc(
         1,
         profile,
         [7; 32],
+        carrier,
+        1,
+        [9; 32],
+        None,
+        crate::web::manager::CarrierClientClass::Legacy,
+        None,
+        false,
         limits,
         timeouts,
     );
@@ -323,10 +334,11 @@ async fn silent_streams_do_not_consume_active_handshake_capacity() {
     assert_eq!(runtime.process_frame(2, 4, FrameType::Data, &[2]), Ok(4));
     settle_tasks().await;
 
-    let state = runtime.session.state.lock();
-    assert!(state.streams.contains_key(&1));
-    assert!(!state.streams.contains_key(&2));
-    drop(state);
+    {
+        let state = runtime.session.state.lock();
+        assert!(state.streams.contains_key(&1));
+        assert!(!state.streams.contains_key(&2));
+    }
     runtime.shutdown().await;
 }
 
@@ -359,5 +371,19 @@ async fn cancellation_while_waiting_for_data_releases_stream_ownership() {
         runtime.session.profile.public_addr,
         peer_port,
     );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_stream_identity_does_not_acquire_synthetic_port_ownership() {
+    let runtime = test_runtime(WebCarrier::Https, 1);
+    runtime.session.state.lock().next_stream_instance = u64::MAX;
+
+    assert_eq!(
+        runtime.process_frame(1, 1, FrameType::Open, &[]),
+        Err(ManagerError::Closed)
+    );
+    assert!(runtime.session.state.lock().active_peer_ports.is_empty());
+
     runtime.shutdown().await;
 }

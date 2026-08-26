@@ -56,8 +56,11 @@ pub(super) async fn handle_down(
     if !body.is_empty() {
         return serve_decoy(request, vhost, true, &runtime).await;
     }
-    let _lane_poll = if lane_id.is_some() {
-        let Some(permit) = runtime.try_lane_poll() else {
+    let Some(_down_poll) = runtime.try_lane_poll(false) else {
+        return service_unavailable();
+    };
+    let _control_lane_poll = if lane_id == Some(0) {
+        let Some(permit) = runtime.try_lane_poll(true) else {
             return service_unavailable();
         };
         Some(permit)
@@ -86,11 +89,7 @@ pub(super) async fn handle_down(
         }
         Ok(result) => {
             if let Some(trace) = request_trace(&request) {
-                trace.record_frames(
-                    TraceDirection::Response,
-                    &result.body,
-                    &runtime.active_generation().config().web.limits,
-                );
+                trace.record_frames(TraceDirection::Response, &result.body, session.limits());
             }
             let mut response = full_response(StatusCode::OK, result.body);
             carrier_headers(&mut response);

@@ -65,16 +65,15 @@ impl WebTraceStore {
         )
         .unwrap_or(0);
         let capture_bytes = payload.len().min(capture_limit);
-        let frame_reservation = policy
-            .capture_frames
-            .then(|| {
-                payload
-                    .len()
-                    .div_ceil(frame::HEADER_BYTES)
-                    .clamp(1, self.frame_limits.max_frames_per_body)
-                    .saturating_mul(std::mem::size_of::<TraceFrame>())
-            })
-            .unwrap_or(0);
+        let frame_reservation = if policy.capture_frames {
+            payload
+                .len()
+                .div_ceil(frame::HEADER_BYTES)
+                .clamp(1, self.frame_limits.max_frames_per_body)
+                .saturating_mul(std::mem::size_of::<TraceFrame>())
+        } else {
+            0
+        };
         let identity_bytes = context
             .identity
             .user
@@ -168,14 +167,18 @@ mod tests {
 
     #[test]
     fn websocket_message_capture_retains_bounded_identity_body_timing_and_frames() {
-        let mut policy = WebDebugConfig::default();
-        policy.enabled = true;
-        policy.capture_frames = true;
-        policy.capture_timings = true;
-        policy.body_capture = WebDebugBodyCapture::Full;
-        let mut limits = WebLimitsConfig::default();
-        limits.debug_records_capacity = 4;
-        limits.debug_bytes_global = 64 * 1024;
+        let policy = WebDebugConfig {
+            enabled: true,
+            capture_frames: true,
+            capture_timings: true,
+            body_capture: WebDebugBodyCapture::Full,
+            ..Default::default()
+        };
+        let limits = WebLimitsConfig {
+            debug_records_capacity: 4,
+            debug_bytes_global: 64 * 1024,
+            ..Default::default()
+        };
         let store = WebTraceStore::new(policy, &limits);
         let request = hyper::Request::builder()
             .header(hyper::header::USER_AGENT, "trace-client")

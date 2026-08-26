@@ -164,7 +164,7 @@ pub(super) fn reload_config(
     let old_hot = HotFields::from_config(&old_cfg);
     let applied_hot = HotFields::from_config(&applied_cfg);
     let non_hot_changed = !config_equal(&applied_cfg, &new_cfg);
-    let hot_changed = old_hot != applied_hot;
+    let hot_changed = !config_equal(&old_cfg, &applied_cfg);
 
     if non_hot_changed {
         warn_non_hot_changes(&old_cfg, &new_cfg, non_hot_changed);

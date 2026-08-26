@@ -1,18 +1,35 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{ProfileKey, TOKEN_BYTES, TokenHash};
-use crate::config::{WebRuntimeConfig, WebRuntimeProfile};
+use super::{CarrierRequest, ProfileKey, TOKEN_BYTES, TokenHash};
+use crate::config::{WebCarrier, WebRuntimeConfig, WebRuntimeProfile};
 use crate::maestro::generation::RuntimeGeneration;
 use crate::web::session::WebSession;
 
 const WEB_PROFILE_OWNER_CONTEXT: &[u8] = b"telemt-web-profile-owner-v1\0";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CarrierChainPhase {
+    Provisional,
+    CommittedPendingHealth,
+    Healthy,
+}
+
+impl CarrierChainPhase {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Provisional => "provisional",
+            Self::CommittedPendingHealth => "committed",
+            Self::Healthy => "healthy",
+        }
+    }
+}
 
 /// One issued bootstrap and optional idempotent session-creation replay state.
 pub(super) struct Bootstrap {
@@ -32,6 +49,32 @@ pub(super) struct Bootstrap {
     pub(super) session_token: Zeroizing<String>,
     /// Created session retained while retry replay remains valid.
     pub(super) session: Option<Arc<WebSession>>,
+    /// Metadata that defines exact attempt replay and candidate advancement.
+    pub(super) carrier_request: Option<CarrierRequest>,
+    /// Learning-ranked carrier order frozen by the first automatic attempt.
+    pub(super) carrier_candidates: Arc<[WebCarrier]>,
+    /// Weighted learning scores captured when the candidate order was frozen.
+    pub(super) carrier_scores: [i16; 4],
+    /// Current one-based carrier attempt, or zero before session creation.
+    pub(super) carrier_attempt: u8,
+    /// Prevents concurrent retries from replacing the same attempt twice.
+    pub(super) carrier_transitioning: bool,
+    /// Manager-owned attempt-chain phase used for replacement linearization.
+    pub(super) carrier_phase: CarrierChainPhase,
+    /// Monotonic start of the first automatic session attempt.
+    pub(super) carrier_started_at: Option<Instant>,
+    /// Absolute server-side end of the automatic attempt chain.
+    pub(super) carrier_deadline_at: Option<Instant>,
+    /// Failed candidates staged until one winner becomes healthy.
+    pub(super) carrier_failures: [Option<WebCarrier>; 3],
+    /// Learning-policy epoch frozen by the first automatic attempt.
+    pub(super) carrier_learning_epoch: u64,
+    /// DELETE observed before an in-flight replacement committed its swap.
+    pub(super) close_requested: bool,
+    /// Effective address frozen by the first session-creation request.
+    pub(super) session_client_ip: Option<IpAddr>,
+    /// Whether the first request carried an authoritative public forwarded address.
+    pub(super) session_ip_learning_eligible: bool,
     /// Distinguishes unused issuance quota from completed creation replay state.
     pub(super) used: bool,
 }
@@ -56,6 +99,20 @@ struct StreamPortState {
     next: u16,
 }
 
+/// Stream admission and KDF tuple ownership isolated from credential transitions.
+#[derive(Default)]
+pub(super) struct StreamAdmissionState {
+    /// Process shutdown admission latch.
+    pub(super) closed: bool,
+    /// Live stream counts by stable profile key.
+    pub(super) streams_per_profile: HashMap<ProfileKey, usize>,
+    /// Process-wide live relay-task count.
+    pub(super) streams_live: usize,
+    stream_ports: HashMap<(IpAddr, SocketAddr), StreamPortState>,
+    /// Logical-stream creation rate limiter.
+    pub(super) stream_rate: RateState,
+}
+
 /// Process-wide WEB registries and quota accounting protected by one short lock.
 #[derive(Default)]
 pub(super) struct ManagerState {
@@ -71,17 +128,10 @@ pub(super) struct ManagerState {
     pub(super) sessions_per_ip: HashMap<IpAddr, usize>,
     /// Live session counts by stable profile key.
     pub(super) sessions_per_profile: HashMap<ProfileKey, usize>,
-    /// Live relay-task counts by stable profile key.
-    pub(super) streams_per_profile: HashMap<ProfileKey, usize>,
-    /// Process-wide live relay-task count.
-    pub(super) streams_live: usize,
-    stream_ports: HashMap<(IpAddr, SocketAddr), StreamPortState>,
     /// Bootstrap issuance rate limiter.
     pub(super) bootstrap_rate: RateState,
     /// Session creation rate limiter.
     pub(super) session_rate: RateState,
-    /// Logical-stream creation rate limiter.
-    pub(super) stream_rate: RateState,
     /// Process shutdown admission latch.
     pub(super) closed: bool,
 }
@@ -135,6 +185,11 @@ pub(super) fn matching_profile(
                 && profile.user == expected.user
                 && profile.secret_mode == expected.secret_mode
                 && profile.carrier == expected.carrier
+                && profile.carrier_negotiation_enabled == expected.carrier_negotiation_enabled
+                && profile.carrier_learning == expected.carrier_learning
+                && profile.carriers == expected.carriers
+                && profile.carrier_negotiation_deadlines_secs
+                    == expected.carrier_negotiation_deadlines_secs
                 && profile.capability == expected.capability
                 && profile.key_fingerprint == expected.key_fingerprint
         })
@@ -198,6 +253,34 @@ pub(super) fn remove_bootstrap_locked(state: &mut ManagerState, hash: TokenHash)
     }
 }
 
+/// Retains one bounded host-bound marker for an invalidated session credential.
+pub(super) fn remember_closed_token_locked(
+    state: &mut ManagerState,
+    hash: TokenHash,
+    host: &str,
+    lifetime: Duration,
+    capacity: usize,
+) {
+    state.closed_tokens.insert(
+        hash,
+        ClosedToken {
+            expires_at: Instant::now() + lifetime,
+            host: host.to_string(),
+        },
+    );
+    while state.closed_tokens.len() > capacity {
+        let Some(oldest) = state
+            .closed_tokens
+            .iter()
+            .min_by_key(|(_, closed)| closed.expires_at)
+            .map(|(hash, _)| *hash)
+        else {
+            break;
+        };
+        state.closed_tokens.remove(&oldest);
+    }
+}
+
 /// Decrements one counted owner and removes its map entry at zero.
 pub(super) fn decrement_map<K, Q>(values: &mut HashMap<K, usize>, key: &Q)
 where
@@ -217,7 +300,7 @@ where
 
 /// Allocates a non-zero source port unique among live streams for one KDF route.
 pub(super) fn allocate_stream_port(
-    state: &mut ManagerState,
+    state: &mut StreamAdmissionState,
     client_ip: IpAddr,
     public_addr: SocketAddr,
 ) -> Option<u16> {
@@ -240,7 +323,7 @@ pub(super) fn allocate_stream_port(
 
 /// Releases one source port and reclaims empty per-route allocator state.
 pub(super) fn release_stream_port(
-    state: &mut ManagerState,
+    state: &mut StreamAdmissionState,
     client_ip: IpAddr,
     public_addr: SocketAddr,
     peer_port: u16,
@@ -262,7 +345,7 @@ mod tests {
 
     #[test]
     fn synthetic_ports_are_unique_per_live_route_and_state_is_reclaimed() {
-        let mut state = ManagerState::default();
+        let mut state = StreamAdmissionState::default();
         let client_ip = "192.0.2.10".parse().unwrap();
         let public_addr = "203.0.113.10:443".parse().unwrap();
         let first = allocate_stream_port(&mut state, client_ip, public_addr).unwrap();

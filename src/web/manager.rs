@@ -16,8 +16,19 @@ use crate::web::trace::WebTraceStore;
 
 // Credential maps, quotas, and token-bucket helpers remain private to the manager.
 mod state;
+// Carrier attempt metadata remains explicit and independent from HTTP parsing.
+mod negotiation;
+// Bounded process-local carrier evidence is isolated from session registries.
+#[path = "manager/carrier_learning.rs"]
+mod learning;
 // Bootstrap credentials and idempotent session creation are isolated from queue accounting.
 mod credentials;
+// First-session admission and bounded carrier replacement share one state machine.
+mod session_creation;
+// Session admission remains separate from stream tuple ownership.
+mod session_admission;
+// Carrier commit, health, and conflict echoes share one outcome publication path.
+mod carrier_outcome;
 // Stream admission and synthetic tuple ownership are process-scoped.
 mod admission;
 // Shutdown and expiry work remain outside request-path coordination.
@@ -28,7 +39,10 @@ mod budget;
 mod websocket;
 pub(crate) use budget::WebSocketBudgetLease;
 use budget::{WebDataBudget, WebSocketBudgetClass};
-use state::ManagerState;
+pub(crate) use negotiation::{
+    CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierLearningContext, CarrierRequest,
+};
+use state::{ManagerState, StreamAdmissionState};
 pub(crate) use websocket::{WebSocketConnection, WebSocketKind};
 
 const TOKEN_BYTES: usize = 32;
@@ -52,8 +66,25 @@ pub(crate) enum ManagerError {
     Protocol,
     /// The operation conflicts with another in-flight operation.
     Concurrent,
+    /// An authenticated attempt chain is already committed.
+    Committed,
     /// The process or session has stopped accepting work.
     Closed,
+}
+
+impl ManagerError {
+    /// Returns the stable non-sensitive failure token used by WEB diagnostics.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Backpressure => "backpressure",
+            Self::Limit => "limit",
+            Self::Protocol => "protocol",
+            Self::Concurrent => "concurrent",
+            Self::Committed => "committed",
+            Self::Closed => "closed",
+        }
+    }
 }
 
 /// Successful idempotent session creation result.
@@ -62,6 +93,28 @@ pub(crate) struct CreateResult {
     pub(crate) token: String,
     /// Carrier frozen into the created or replayed session.
     pub(crate) carrier: WebCarrier,
+    /// One-based carrier attempt echoed only for negotiated sessions.
+    pub(crate) attempt: Option<u8>,
+    /// Effective frozen candidate count on the first automatic response.
+    pub(crate) candidate_count: Option<u8>,
+    /// Cumulative final chain deadline on the first automatic response.
+    pub(crate) deadline_secs: Option<u64>,
+    /// Actual attempt-chain phase echoed for automatic sessions.
+    pub(crate) carrier_state: Option<&'static str>,
+}
+
+/// Authenticated non-secret attempt-chain metadata returned with a conflict.
+pub(crate) struct CarrierEcho {
+    /// Carrier frozen into the current committed attempt.
+    pub(crate) carrier: WebCarrier,
+    /// One-based current attempt.
+    pub(crate) attempt: u8,
+    /// Frozen supported candidate count.
+    pub(crate) candidate_count: u8,
+    /// Frozen cumulative final deadline.
+    pub(crate) deadline_secs: u64,
+    /// Actual current chain phase.
+    pub(crate) state: &'static str,
 }
 
 /// Successful bridge bootstrap issuance result.
@@ -78,9 +131,12 @@ pub(crate) struct WebProcessRuntime {
     trace: Arc<WebTraceStore>,
     limits: WebLimitsConfig,
     state: Mutex<ManagerState>,
+    stream_admission: Mutex<StreamAdmissionState>,
+    learning: Mutex<learning::CarrierLearning>,
     http_connections: Arc<Semaphore>,
     http_handlers: Arc<Semaphore>,
     lane_polls: Arc<Semaphore>,
+    lane_aux_polls: Arc<Semaphore>,
     body_readers: Arc<Semaphore>,
     body_bytes: Arc<Semaphore>,
     stream_handshakes: Arc<Semaphore>,
@@ -115,16 +171,28 @@ impl WebProcessRuntime {
         active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
         trace: Arc<WebTraceStore>,
     ) -> Arc<Self> {
-        let limits = active_runtime.load().config().web.limits.clone();
+        let config = active_runtime.load().config();
+        let limits = config.web.limits.clone();
+        let learning_capacity = limits.max_carrier_learning_entries;
+        let mut carrier_learning = learning::CarrierLearning::new(learning_capacity);
+        let _ = carrier_learning.apply_policy(
+            std::time::Instant::now(),
+            config.web.carrier_negotiation_enabled() && config.web.carrier_learning,
+            config.web.carrier_negotiation_aggressiveness,
+            Duration::from_secs(config.web.timeouts.carrier_learning_secs),
+        );
         let websocket_connections = limits
             .max_http_connections
             .saturating_sub(limits.websocket_http_connection_reserve);
+        let lane_poll_limit = limits.max_http_handlers / 2;
+        let lane_aux_poll_limit = (lane_poll_limit / 2).max(1);
         let runtime = Arc::new(Self {
             active_runtime,
             trace,
             http_connections: Arc::new(Semaphore::new(limits.max_http_connections)),
             http_handlers: Arc::new(Semaphore::new(limits.max_http_handlers)),
-            lane_polls: Arc::new(Semaphore::new((limits.max_http_handlers / 2).max(1))),
+            lane_polls: Arc::new(Semaphore::new(lane_poll_limit)),
+            lane_aux_polls: Arc::new(Semaphore::new(lane_aux_poll_limit)),
             body_readers: Arc::new(Semaphore::new(limits.max_body_readers)),
             body_bytes: Arc::new(Semaphore::new(limits.max_body_bytes_global)),
             stream_handshakes: Arc::new(Semaphore::new(limits.max_stream_handshakes)),
@@ -136,6 +204,8 @@ impl WebProcessRuntime {
             data_budget: WebDataBudget::new(limits.clone()),
             limits,
             state: Mutex::new(ManagerState::default()),
+            stream_admission: Mutex::new(StreamAdmissionState::default()),
+            learning: Mutex::new(carrier_learning),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
             sessions_created: AtomicU64::new(0),
@@ -197,8 +267,13 @@ impl WebProcessRuntime {
     }
 
     /// Reserves one parked lane poll without exhausting all HTTP handlers.
-    pub(crate) fn try_lane_poll(&self) -> Option<OwnedSemaphorePermit> {
-        let permit = Arc::clone(&self.lane_polls).try_acquire_owned().ok();
+    pub(crate) fn try_lane_poll(&self, auxiliary: bool) -> Option<OwnedSemaphorePermit> {
+        let slots = if auxiliary {
+            &self.lane_aux_polls
+        } else {
+            &self.lane_polls
+        };
+        let permit = Arc::clone(slots).try_acquire_owned().ok();
         if permit.is_none() {
             self.record_limit_hit();
         }
@@ -249,6 +324,18 @@ impl WebProcessRuntime {
             return None;
         };
         Some((reader, body))
+    }
+
+    /// Reserves transient bytes while one downlink batch replaces queued frames.
+    pub(crate) fn try_downlink_staging_budget(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let bytes = u32::try_from(bytes).ok()?;
+        let permit = Arc::clone(&self.body_bytes)
+            .try_acquire_many_owned(bytes)
+            .ok();
+        if permit.is_none() {
+            self.record_limit_hit();
+        }
+        permit
     }
 
     /// Reserves bounded process-wide queue capacity for data or control traffic.
@@ -307,25 +394,30 @@ impl WebProcessRuntime {
     }
 
     /// Admits one WebSocket with owner-first bounded replacement.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_websocket(
         self: &Arc<Self>,
         owner: ProfileKey,
         session_id: u64,
+        session_hash: TokenHash,
         client_ip: IpAddr,
         kind: WebSocketKind,
         base_bytes: usize,
         liveness_interval: Duration,
         eviction_timeout: Duration,
+        parent_cancellation: CancellationToken,
     ) -> Result<WebSocketConnection, ManagerError> {
         websocket::admit(
             self,
             owner,
             session_id,
+            session_hash,
             client_ip,
             kind,
             base_bytes,
             liveness_interval,
             eviction_timeout,
+            parent_cancellation,
         )
         .await
     }

@@ -6,6 +6,10 @@ use super::*;
 mod debug;
 // Memory-envelope arithmetic remains isolated from protocol validation.
 mod memory;
+// Carrier ordering, cumulative deadlines, and fallback identity are validated together.
+mod negotiation;
+// Request and lifecycle timeout relationships are validated together.
+mod timeouts;
 // WebSocket transport policy is validated independently from HTTP body policy.
 mod websocket;
 
@@ -67,11 +71,17 @@ pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
 
     validate_limits(&config.web.limits)?;
     debug::validate(&config.web.debug, &config.web.limits)?;
-    if config.web.carrier == WebCarrier::HttpsLanes && config.web.limits.max_http_handlers < 2 {
-        return config_error("web.carrier=https-lanes requires web.limits.max_http_handlers >= 2");
+    let carriers = negotiation::validate(&config.web)?;
+    if carriers.contains(&WebCarrier::Https) && config.web.limits.max_http_handlers < 2 {
+        return config_error("WEB https candidates require web.limits.max_http_handlers >= 2");
     }
-    validate_timeouts(&config.web.timeouts)?;
-    websocket::validate(config.web.carrier, &config.web.limits, &config.web.timeouts)?;
+    if carriers.contains(&WebCarrier::HttpsLanes) && config.web.limits.max_http_handlers < 4 {
+        return config_error(
+            "WEB https-lanes candidates require web.limits.max_http_handlers >= 4",
+        );
+    }
+    timeouts::validate(&config.web.timeouts)?;
+    websocket::validate(&carriers, &config.web.limits, &config.web.timeouts)?;
     validate_vhosts(config)?;
     Ok(())
 }
@@ -136,6 +146,11 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
     if !(1..=MAX_WEB_TOMBSTONES_PER_SESSION).contains(&limits.max_tombstones_per_session) {
         return config_error("web.limits.max_tombstones_per_session must be within [1, 4096]");
     }
+    if limits.pending_bytes_per_lane <= WEB_FRAME_HEADER_BYTES + WEB_QUEUE_ITEM_COST {
+        return config_error(
+            "web.limits.pending_bytes_per_lane must preserve one non-empty DATA frame",
+        );
+    }
     if limits.carrier_batch_bytes > limits.max_body_bytes
         || limits.carrier_batch_bytes
             < limits
@@ -155,6 +170,20 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
     let positive = [
         ("max_http_connections", limits.max_http_connections),
         ("max_http_handlers", limits.max_http_handlers),
+        (
+            "max_lane_open_waits_per_session",
+            limits.max_lane_open_waits_per_session,
+        ),
+        ("pending_bytes_per_lane", limits.pending_bytes_per_lane),
+        ("pending_items_per_lane", limits.pending_items_per_lane),
+        (
+            "max_websocket_evictions_in_flight",
+            limits.max_websocket_evictions_in_flight,
+        ),
+        (
+            "max_carrier_learning_entries",
+            limits.max_carrier_learning_entries,
+        ),
         ("max_body_readers", limits.max_body_readers),
         ("max_body_bytes_global", limits.max_body_bytes_global),
         ("max_sessions_global", limits.max_sessions_global),
@@ -227,8 +256,11 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         || limits.max_bootstraps_per_ip > limits.max_bootstraps_global
         || limits.max_http_handlers > limits.max_http_connections
         || limits.max_body_readers > limits.max_http_handlers
+        || limits.max_lane_open_waits_per_session > limits.max_streams_per_session
         || limits.pending_bytes_per_session > limits.pending_bytes_global
         || limits.pending_items_per_session > limits.pending_items_global
+        || limits.pending_bytes_per_lane > limits.pending_bytes_per_session
+        || limits.pending_items_per_lane > limits.pending_items_per_session
         || limits.control_bytes_per_session > limits.control_bytes_global
         || limits.control_bytes_per_session > limits.pending_bytes_per_session
         || limits.control_bytes_global > limits.pending_bytes_global
@@ -321,41 +353,6 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         );
     }
     memory::validate(limits)?;
-    Ok(())
-}
-
-fn validate_timeouts(timeouts: &WebTimeoutsConfig) -> Result<()> {
-    let values = [
-        ("header_secs", timeouts.header_secs),
-        ("body_secs", timeouts.body_secs),
-        ("stream_handshake_secs", timeouts.stream_handshake_secs),
-        ("long_poll_secs", timeouts.long_poll_secs),
-        ("websocket_write_secs", timeouts.websocket_write_secs),
-        (
-            "websocket_backpressure_secs",
-            timeouts.websocket_backpressure_secs,
-        ),
-        ("websocket_eviction_secs", timeouts.websocket_eviction_secs),
-        ("bootstrap_lifetime_secs", timeouts.bootstrap_lifetime_secs),
-        ("reconnect_grace_secs", timeouts.reconnect_grace_secs),
-        ("http_idle_secs", timeouts.http_idle_secs),
-        ("shutdown_secs", timeouts.shutdown_secs),
-        ("decoy_header_secs", timeouts.decoy_header_secs),
-    ];
-    if let Some((field, _)) = values
-        .into_iter()
-        .find(|(_, value)| !(1..=3600).contains(value))
-    {
-        return config_error(&format!("web.timeouts.{field} must be within [1, 3600]"));
-    }
-    let request_deadline = timeouts
-        .header_secs
-        .max(timeouts.body_secs)
-        .max(timeouts.long_poll_secs)
-        .max(timeouts.decoy_header_secs);
-    if request_deadline >= timeouts.http_idle_secs {
-        return config_error("web.timeouts request deadlines must be lower than http_idle_secs");
-    }
     Ok(())
 }
 

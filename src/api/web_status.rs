@@ -18,7 +18,7 @@ mod details;
 // Query parsing and matching remain independent from bounded HTML rendering.
 mod query;
 
-use details::{push_body, push_frames, push_headers};
+use details::{push_body, push_frames, push_headers, push_lifecycle};
 use query::{GroupBy, StatusQuery, client_ip, parse_query, record_matches};
 
 struct GroupSummary {
@@ -56,11 +56,11 @@ pub(super) async fn render(
         );
     };
     let now_millis = crate::web::trace::store_epoch_millis();
-    let since_millis = query
-        .record
-        .is_none()
-        .then(|| now_millis.saturating_sub(query.window_secs.saturating_mul(1000)))
-        .unwrap_or(0);
+    let since_millis = if query.record.is_none() {
+        now_millis.saturating_sub(query.window_secs.saturating_mul(1000))
+    } else {
+        0
+    };
     let records = store.snapshot_matching(|record| record_matches(record, &query, since_millis));
     let status = store.status();
     let mut html = String::with_capacity(MAX_PAGE_BYTES);
@@ -367,20 +367,7 @@ fn push_record(html: &mut String, record: &TraceRecord) {
             push_body(html, "message body", message.body.as_ref());
             push_frames(html, &message.frames);
         }
-        TraceRecordKind::Lifecycle(event) => {
-            html.push_str("<pre>event: ");
-            html.push_str(event.event.as_str());
-            html.push_str("\nstream: ");
-            html.push_str(
-                &event
-                    .stream_id
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            html.push_str("\nreason: ");
-            html.push_str(event.reason.unwrap_or("-"));
-            html.push_str("</pre>");
-        }
+        TraceRecordKind::Lifecycle(event) => push_lifecycle(html, event),
     }
     html.push_str("</details></td></tr>");
 }

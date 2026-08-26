@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-use super::state::{ClosedToken, decrement_map, remove_bootstrap_locked, remove_expired_locked};
+use super::state::{
+    decrement_map, remember_closed_token_locked, remove_bootstrap_locked, remove_expired_locked,
+};
 use super::{ProfileKey, TokenHash, WebProcessRuntime};
 
 impl WebProcessRuntime {
@@ -22,33 +24,20 @@ impl WebProcessRuntime {
         }
         decrement_map(&mut state.sessions_per_ip, &client_ip);
         decrement_map(&mut state.sessions_per_profile, &profile_key);
-        let expiry = Instant::now()
-            + Duration::from_secs(
+        remember_closed_token_locked(
+            &mut state,
+            hash,
+            profile_host,
+            Duration::from_secs(
                 self.active_runtime
                     .load()
                     .config()
                     .web
                     .timeouts
                     .bootstrap_lifetime_secs,
-            );
-        state.closed_tokens.insert(
-            hash,
-            ClosedToken {
-                expires_at: expiry,
-                host: profile_host.to_string(),
-            },
+            ),
+            self.limits.max_sessions_global.saturating_mul(16),
         );
-        while state.closed_tokens.len() > self.limits.max_sessions_global.saturating_mul(16) {
-            let Some(oldest) = state
-                .closed_tokens
-                .iter()
-                .min_by_key(|(_, closed)| closed.expires_at)
-                .map(|(hash, _)| *hash)
-            else {
-                break;
-            };
-            state.closed_tokens.remove(&oldest);
-        }
         let bootstrap_hashes = state
             .bootstraps
             .iter()
@@ -78,6 +67,7 @@ impl WebProcessRuntime {
             state.bootstraps_per_ip.clear();
             state.sessions.values().cloned().collect::<Vec<_>>()
         };
+        self.stream_admission.lock().closed = true;
         for session in &sessions {
             session.close();
         }
@@ -96,10 +86,8 @@ impl WebProcessRuntime {
         let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), waits).await;
         self.tasks.close();
         let _ = tokio::time::timeout(Duration::from_secs(timeout_secs), self.tasks.wait()).await;
-        let (sessions_live, streams_live) = {
-            let state = self.state.lock();
-            (state.sessions.len(), state.streams_live)
-        };
+        let sessions_live = self.state.lock().sessions.len();
+        let streams_live = self.stream_admission.lock().streams_live;
         let budget = self.data_budget.snapshot();
         info!(
             target: "telemt::web",
@@ -124,13 +112,53 @@ impl WebProcessRuntime {
     pub(super) fn cleanup(&self) {
         self.cleanup_websockets();
         let now = Instant::now();
-        let sessions = {
+        let generation = self.active_generation();
+        let config = &generation.config().web;
+        let learning_enabled = config.carrier_negotiation_enabled() && config.carrier_learning;
+        let mut learning = self.learning.lock();
+        let _ = learning.apply_policy(
+            now,
+            learning_enabled,
+            config.carrier_negotiation_aggressiveness,
+            Duration::from_secs(config.timeouts.carrier_learning_secs),
+        );
+        learning.prune(now);
+        drop(learning);
+        let (sessions, expired_chains) = {
             let mut state = self.state.lock();
+            let expired = state
+                .bootstraps
+                .iter()
+                .filter_map(|(hash, bootstrap)| {
+                    (bootstrap.carrier_phase == super::state::CarrierChainPhase::Provisional
+                        && bootstrap
+                            .carrier_deadline_at
+                            .is_some_and(|deadline| now >= deadline)
+                        && bootstrap
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| !session.is_carrier_committed()))
+                    .then_some((*hash, bootstrap.session.clone()))
+                })
+                .collect::<Vec<_>>();
+            let expired_chains = expired
+                .iter()
+                .filter_map(|(_, session)| session.clone())
+                .collect::<Vec<_>>();
+            for (hash, _) in expired {
+                remove_bootstrap_locked(&mut state, hash);
+            }
             remove_expired_locked(&mut state, now);
-            state.sessions.values().cloned().collect::<Vec<_>>()
+            (
+                state.sessions.values().cloned().collect::<Vec<_>>(),
+                expired_chains,
+            )
         };
-        for session in sessions.into_iter().filter(|session| session.is_idle(now)) {
+        for session in expired_chains {
             session.close();
+        }
+        for session in sessions {
+            session.close_if_due(now);
         }
     }
 }

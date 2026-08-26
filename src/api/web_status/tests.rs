@@ -20,11 +20,15 @@ fn html_escaping_covers_active_markup_characters() {
 
 #[tokio::test]
 async fn renderer_filters_groups_and_sets_control_plane_security_headers() {
-    let mut policy = WebDebugConfig::default();
-    policy.enabled = true;
-    let mut limits = crate::config::WebLimitsConfig::default();
-    limits.debug_records_capacity = 8;
-    limits.debug_bytes_global = 16 * 1024;
+    let policy = WebDebugConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let limits = crate::config::WebLimitsConfig {
+        debug_records_capacity: 8,
+        debug_bytes_global: 16 * 1024,
+        ..Default::default()
+    };
     let store = WebTraceStore::new(policy.clone(), &limits);
     store.record_lifecycle(
         None,
@@ -79,7 +83,7 @@ async fn render_permits_remain_owned_by_inflight_response_bodies() {
 
 #[test]
 fn page_truncation_preserves_utf8_boundary_and_cap() {
-    let mut html = "я".repeat(MAX_PAGE_BYTES);
+    let mut html = "\u{044f}".repeat(MAX_PAGE_BYTES);
     truncate_page(&mut html);
     assert!(html.len() <= MAX_PAGE_BYTES);
     assert!(html.ends_with("[page output truncated]"));

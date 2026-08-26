@@ -1,18 +1,29 @@
 use super::*;
 
 fn entry(kind: WebSocketKind, opened: bool, peer_tick: u64) -> WebSocketEntry {
+    let phase = if opened {
+        WebSocketPhase::Active
+    } else {
+        WebSocketPhase::Claimed
+    };
     WebSocketEntry {
         id: 1,
         owner: [0; 32],
         session_id: 1,
+        claim: WebSocketClaimKey {
+            session_hash: [0; 32],
+            kind,
+        },
         client_ip: "192.0.2.10".parse().unwrap(),
         kind,
         liveness_interval_ms: 10,
         created_tick: 1,
         last_peer_tick: AtomicU64::new(peer_tick),
         last_progress_tick: AtomicU64::new(peer_tick),
-        opened: AtomicBool::new(opened),
+        phase: AtomicU8::new(phase as u8),
+        closing: AtomicBool::new(false),
         cancel: CancellationToken::new(),
+        released: CancellationToken::new(),
     }
 }
 

@@ -200,7 +200,6 @@ impl AsyncRead for ConnectionIo {
             Poll::Ready(Ok(())) => {
                 let filled = limited.filled().len();
                 boundary.observe(limited.filled());
-                drop(limited);
                 buffer.advance(filled);
                 Poll::Ready(Ok(()))
             }
@@ -244,6 +243,7 @@ struct ParsedUpgrade {
     protocol: String,
     accept: String,
     carrier: ParsedCarrier,
+    acknowledge_commit: bool,
 }
 
 pub(super) async fn handle(
@@ -272,6 +272,10 @@ pub(super) async fn handle(
         (ParsedCarrier::Lane(lane_id), WebCarrier::WebsocketLanes) => WebSocketKind::Lane(lane_id),
         _ => return serve_decoy(request, vhost, true, &runtime).await,
     };
+    let mut probe_reservation = match session.reserve_websocket_probe(parsed.acknowledge_commit) {
+        Ok(reservation) => reservation,
+        Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
+    };
     let mut lane_reservation = match kind {
         WebSocketKind::Multiplex => None,
         WebSocketKind::Lane(lane_id) => match session.reserve_websocket_lane(lane_id) {
@@ -279,22 +283,29 @@ pub(super) async fn handle(
             Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
         },
     };
-    let timeouts = runtime.active_generation().config().web.timeouts.clone();
+    let timeouts = session.timeouts().clone();
     let connection = match runtime
         .admit_websocket(
             session.profile_key(),
             session.trace_session_id(),
+            session.token_hash(),
             effective_ip,
             kind,
             BASE_BUDGET_BYTES,
             Duration::from_secs(timeouts.long_poll_secs),
             Duration::from_secs(timeouts.websocket_eviction_secs),
+            session.carrier_cancellation(),
         )
         .await
     {
         Ok(connection) => connection,
         Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
     };
+    if let Some(reservation) = probe_reservation.as_mut()
+        && reservation.bind(connection.id()).is_err()
+    {
+        return serve_decoy(request, vhost, true, &runtime).await;
+    }
     let trace_context = runtime.trace().websocket_context(
         &request,
         peer.ip(),
@@ -324,7 +335,9 @@ pub(super) async fn handle(
             driver_session,
             connection,
             lane_reservation.take(),
+            probe_reservation.take(),
             trace_context,
+            parsed.acknowledge_commit,
         )
         .await;
     });
@@ -376,24 +389,20 @@ fn parse_upgrade<B>(request: &Request<B>) -> Option<ParsedUpgrade> {
     {
         return None;
     }
-    let (token, carrier) = if let Some(token) = protocol.strip_prefix("tproxy-v1.") {
-        (token, ParsedCarrier::Multiplex)
-    } else if let Some(lane) = protocol.strip_prefix("tproxy-lane-v1.") {
-        let (token, lane_id) = lane.split_once('.')?;
-        if lane_id.is_empty()
-            || lane_id.starts_with('+')
-            || (lane_id.len() > 1 && lane_id.starts_with('0'))
-        {
+    let (token, carrier, acknowledge_commit) =
+        if let Some(token) = protocol.strip_prefix("tproxy-auto-v1.") {
+            (token, ParsedCarrier::Multiplex, true)
+        } else if let Some(lane) = protocol.strip_prefix("tproxy-auto-lane-v1.") {
+            let (token, lane_id) = parse_lane_protocol(lane)?;
+            (token, ParsedCarrier::Lane(lane_id), true)
+        } else if let Some(token) = protocol.strip_prefix("tproxy-v1.") {
+            (token, ParsedCarrier::Multiplex, false)
+        } else if let Some(lane) = protocol.strip_prefix("tproxy-lane-v1.") {
+            let (token, lane_id) = parse_lane_protocol(lane)?;
+            (token, ParsedCarrier::Lane(lane_id), false)
+        } else {
             return None;
-        }
-        let lane_id = lane_id
-            .parse::<u32>()
-            .ok()
-            .filter(|value| (1..=crate::web::frame::MAX_STREAM_ID).contains(value))?;
-        (token, ParsedCarrier::Lane(lane_id))
-    } else {
-        return None;
-    };
+        };
     let raw_token = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .ok()?;
@@ -412,13 +421,26 @@ fn parse_upgrade<B>(request: &Request<B>) -> Option<ParsedUpgrade> {
         protocol: protocol.to_string(),
         accept: base64::engine::general_purpose::STANDARD.encode(accept.finalize()),
         carrier,
+        acknowledge_commit,
     })
 }
 
-fn single_header<'a, B>(
-    request: &'a Request<B>,
-    name: impl hyper::header::AsHeaderName,
-) -> Option<&'a str> {
+fn parse_lane_protocol(value: &str) -> Option<(&str, u32)> {
+    let (token, lane_id) = value.split_once('.')?;
+    if lane_id.is_empty()
+        || lane_id.starts_with('+')
+        || (lane_id.len() > 1 && lane_id.starts_with('0'))
+    {
+        return None;
+    }
+    let lane_id = lane_id
+        .parse::<u32>()
+        .ok()
+        .filter(|value| (1..=crate::web::frame::MAX_STREAM_ID).contains(value))?;
+    Some((token, lane_id))
+}
+
+fn single_header<B>(request: &Request<B>, name: impl hyper::header::AsHeaderName) -> Option<&str> {
     let mut values = request.headers().get_all(name).iter();
     let value = values.next()?.to_str().ok()?;
     values.next().is_none().then_some(value)

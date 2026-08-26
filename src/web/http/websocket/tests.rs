@@ -14,8 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::maestro::generation::{RuntimeGeneration, test_runtime_generation};
 use crate::web::frame::{self, FrameType};
-use crate::web::http::tests::runtime_config;
-use crate::web::manager::WebProcessRuntime;
+use crate::web::http::tests::{negotiation_runtime_config, runtime_config};
+use crate::web::manager::{
+    CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierRequest, WebProcessRuntime,
+};
 
 fn request(protocol: &str) -> Request<()> {
     Request::builder()
@@ -39,6 +41,14 @@ fn canonical_multiplex_and_lane_protocols_are_accepted() {
 
     let lane = parse_upgrade(&request(&format!("tproxy-lane-v1.{token}.16777215"))).unwrap();
     assert!(matches!(lane.carrier, ParsedCarrier::Lane(16_777_215)));
+
+    let automatic = parse_upgrade(&request(&format!("tproxy-auto-v1.{token}"))).unwrap();
+    assert!(automatic.acknowledge_commit);
+    let automatic_lane =
+        parse_upgrade(&request(&format!("tproxy-auto-lane-v1.{token}.7"))).unwrap();
+    assert!(matches!(automatic_lane.carrier, ParsedCarrier::Lane(7)));
+    assert!(automatic_lane.acknowledge_commit);
+    assert!(!multiplex.acknowledge_commit);
 }
 
 #[test]
@@ -92,7 +102,20 @@ fn live_runtime(carrier: WebCarrier) -> LiveRuntime {
 }
 
 fn live_runtime_with_long_poll(carrier: WebCarrier, long_poll_secs: u64) -> LiveRuntime {
-    let mut config = runtime_config([31; 32], carrier);
+    live_runtime_from_config(runtime_config([31; 32], carrier), long_poll_secs)
+}
+
+fn live_negotiation_runtime(carrier: WebCarrier, carriers: Arc<[WebCarrier]>) -> LiveRuntime {
+    live_runtime_from_config(
+        negotiation_runtime_config([31; 32], carrier, false, carriers),
+        1,
+    )
+}
+
+fn live_runtime_from_config(
+    mut config: crate::config::ProxyConfig,
+    long_poll_secs: u64,
+) -> LiveRuntime {
     config.web.timeouts.long_poll_secs = long_poll_secs;
     config.web.timeouts.websocket_write_secs = 2;
     config.web.timeouts.websocket_backpressure_secs = 2;
@@ -103,6 +126,49 @@ fn live_runtime_with_long_poll(carrier: WebCarrier, long_poll_secs: u64) -> Live
         runtime,
         generation,
     }
+}
+
+fn create_automatic_session(
+    runtime: &Arc<WebProcessRuntime>,
+) -> (TokenHash, Bytes, String, TokenHash) {
+    let profile = runtime
+        .active_generation()
+        .config()
+        .web
+        .runtime
+        .as_ref()
+        .unwrap()
+        .profiles[0]
+        .clone();
+    let client_ip = "192.0.2.10".parse().unwrap();
+    let bootstrap = runtime.issue_bootstrap(profile, client_ip).unwrap().token;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&bootstrap)
+        .unwrap();
+    let bootstrap_hash = Sha256::digest(raw).into();
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+    let session = runtime
+        .create_session(
+            bootstrap_hash,
+            "proxy.example.com",
+            client_ip,
+            &hello,
+            CarrierRequest::automatic(
+                CarrierClientClass::Bridge,
+                CarrierCapabilities::all(),
+                1,
+                None,
+                [9; 32],
+            ),
+            false,
+        )
+        .unwrap()
+        .token;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&session)
+        .unwrap();
+    let session_hash = Sha256::digest(raw).into();
+    (bootstrap_hash, hello, session, session_hash)
 }
 
 fn create_session(runtime: &Arc<WebProcessRuntime>) -> (String, TokenHash) {
@@ -123,7 +189,14 @@ fn create_session(runtime: &Arc<WebProcessRuntime>) -> (String, TokenHash) {
     let bootstrap_hash = Sha256::digest(raw).into();
     let hello = frame::encode(FrameType::Hello, 0, &[1]);
     let session = runtime
-        .create_session(bootstrap_hash, "proxy.example.com", client_ip, &hello)
+        .create_session(
+            bootstrap_hash,
+            "proxy.example.com",
+            client_ip,
+            &hello,
+            CarrierRequest::legacy([0; 32]),
+            false,
+        )
         .unwrap()
         .token;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -307,5 +380,108 @@ async fn malformed_websocket_lane_closes_only_that_lane() {
     assert_eq!(pong, Message::Pong(Bytes::from_static(b"lane")));
 
     let _ = second.close(None).await;
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn automatic_websocket_carriers_commit_after_acknowledged_peer_progress() {
+    for carrier in [WebCarrier::Websocket, WebCarrier::WebsocketLanes] {
+        let live = live_negotiation_runtime(carrier, Arc::from([carrier]));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_, _, session, session_hash) = create_automatic_session(&live.runtime);
+        let protocol = match carrier {
+            WebCarrier::Websocket => format!("tproxy-auto-v1.{session}"),
+            WebCarrier::WebsocketLanes => format!("tproxy-auto-lane-v1.{session}.7"),
+            _ => unreachable!(),
+        };
+        let mut socket = upgrade(&listener, &live.runtime, &protocol).await;
+        socket
+            .send(Message::Binary(frame::encode(FrameType::Open, 7, &[])))
+            .await
+            .unwrap();
+        let acknowledgement = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(acknowledgement, Message::Binary(Bytes::new()));
+        assert!(
+            live.runtime
+                .get_session(session_hash, "proxy.example.com")
+                .unwrap()
+                .is_carrier_committed()
+        );
+        socket
+            .send(Message::Binary(frame::encode(
+                FrameType::Window,
+                7,
+                &frame::window_payload(1),
+            )))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Ping(Bytes::from_static(b"commit")))
+            .await
+            .unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if message == Message::Pong(Bytes::from_static(b"commit")) {
+                break;
+            }
+        }
+        assert!(
+            live.runtime
+                .get_session(session_hash, "proxy.example.com")
+                .unwrap()
+                .is_carrier_committed()
+        );
+
+        let _ = socket.close(None).await;
+        live.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn failed_automatic_multiplex_socket_remains_supersedable() {
+    let live = live_negotiation_runtime(
+        WebCarrier::Https,
+        Arc::from([WebCarrier::Websocket, WebCarrier::Https]),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (bootstrap_hash, hello, session, session_hash) = create_automatic_session(&live.runtime);
+    let protocol = format!("tproxy-auto-v1.{session}");
+    let mut socket = upgrade(&listener, &live.runtime, &protocol).await;
+    socket.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        live.runtime
+            .get_session(session_hash, "proxy.example.com")
+            .is_ok()
+    );
+
+    let replacement = live
+        .runtime
+        .create_session(
+            bootstrap_hash,
+            "proxy.example.com",
+            "192.0.2.10".parse().unwrap(),
+            &hello,
+            CarrierRequest::automatic(
+                CarrierClientClass::Bridge,
+                CarrierCapabilities::all(),
+                2,
+                Some(CarrierFailure::Upgrade),
+                [9; 32],
+            ),
+            false,
+        )
+        .unwrap();
+    assert_eq!(replacement.carrier, WebCarrier::Https);
+    assert_eq!(replacement.attempt, Some(2));
+
     live.shutdown().await;
 }

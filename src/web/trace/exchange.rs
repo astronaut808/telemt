@@ -81,10 +81,11 @@ impl HttpTraceExchange {
                     .headers()
                     .get(hyper::header::USER_AGENT)
                     .map(|value| bounded_text(value.as_bytes(), USER_AGENT_MAX_BYTES)),
-                policy
-                    .capture_headers
-                    .then(|| sanitized_headers(request.headers()))
-                    .unwrap_or_default(),
+                if policy.capture_headers {
+                    sanitized_headers(request.headers())
+                } else {
+                    Vec::new()
+                },
                 sensitive_values(request.headers(), request.uri().query()),
             )
         } else {
@@ -423,13 +424,17 @@ mod tests {
             .header("authorization", format!("Bearer {request_token}"))
             .body(())
             .unwrap();
-        let mut policy = WebDebugConfig::default();
-        policy.enabled = true;
-        policy.body_capture = WebDebugBodyCapture::Prefix;
-        policy.body_prefix_bytes = 256;
-        let mut limits = WebLimitsConfig::default();
-        limits.debug_records_capacity = 4;
-        limits.debug_bytes_global = 16 * 1024;
+        let policy = WebDebugConfig {
+            enabled: true,
+            body_capture: WebDebugBodyCapture::Prefix,
+            body_prefix_bytes: 256,
+            ..Default::default()
+        };
+        let limits = WebLimitsConfig {
+            debug_records_capacity: 4,
+            debug_bytes_global: 16 * 1024,
+            ..Default::default()
+        };
         let store = WebTraceStore::new(policy, &limits);
         let exchange = store
             .begin_http(&request, "192.0.2.30".parse().unwrap())

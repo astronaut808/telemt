@@ -30,6 +30,23 @@ fn write_reload_config(path: &Path, ad_tag: Option<&str>, server_port: Option<u1
     std::fs::write(path, config).unwrap();
 }
 
+fn write_web_reload_config(path: &Path, carriers: &str, carrier_learning: bool) {
+    let config = format!(
+        r#"
+                [censorship]
+                tls_domain = "example.com"
+
+                [access.users]
+                user = "00000000000000000000000000000000"
+
+                [web]
+                carriers = {carriers}
+                carrier_learning = {carrier_learning}
+            "#,
+    );
+    std::fs::write(path, config).unwrap();
+}
+
 fn temp_config_path(prefix: &str) -> PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -260,6 +277,29 @@ fn reload_keeps_hot_apply_when_non_hot_fields_change() {
     let applied = config_tx.borrow().clone();
     assert_eq!(applied.general.ad_tag.as_deref(), Some(final_tag));
     assert_eq!(applied.server.port, initial_cfg.server.port);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reload_publishes_web_negotiation_policy_outside_hot_field_reporting() {
+    let path = temp_config_path("telemt_web_negotiation_reload");
+
+    write_web_reload_config(&path, "false", true);
+    let initial_cfg = Arc::new(ProxyConfig::load(&path).unwrap());
+    let initial_hash = ProxyConfig::load_with_metadata(&path)
+        .unwrap()
+        .rendered_hash;
+    let (config_tx, _config_rx) = watch::channel(initial_cfg.clone());
+    let (log_tx, _log_rx) = watch::channel(initial_cfg.general.log_level.clone());
+    let mut reload_state = ReloadState::new(Some(initial_hash));
+
+    write_web_reload_config(&path, "[\"websocket\", \"https\"]", false);
+    reload_config(&path, &config_tx, &log_tx, None, None, &mut reload_state).unwrap();
+
+    let applied = config_tx.borrow().clone();
+    assert!(applied.web.carrier_negotiation_enabled());
+    assert!(!applied.web.carrier_learning);
 
     let _ = std::fs::remove_file(path);
 }
