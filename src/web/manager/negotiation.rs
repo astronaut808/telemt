@@ -11,6 +11,8 @@ pub(crate) enum CarrierClientClass {
     Bridge,
     /// Strict same-origin browser metadata survived while the marker did not.
     BrowserHint,
+    /// A native iOS client that supports only the serialized HTTPS carrier.
+    Ios,
 }
 
 impl CarrierClientClass {
@@ -20,6 +22,7 @@ impl CarrierClientClass {
             Self::Legacy => "legacy",
             Self::Bridge => "bridge",
             Self::BrowserHint => "browser-hint",
+            Self::Ios => "ios",
         }
     }
 }
@@ -74,6 +77,11 @@ impl CarrierCapabilities {
         Self(0b1111)
     }
 
+    /// Returns the only carrier implemented by the native iOS client.
+    pub(crate) const fn ios() -> Self {
+        Self(0b0001)
+    }
+
     /// Builds a set from a validated bit representation.
     pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
         if bits != 0 && bits & !0b1111 == 0 {
@@ -97,6 +105,7 @@ pub(crate) struct CarrierRequest {
     attempt: Option<u8>,
     failure: Option<CarrierFailure>,
     user_agent_hash: [u8; 32],
+    initial_only: bool,
 }
 
 impl CarrierRequest {
@@ -108,6 +117,19 @@ impl CarrierRequest {
             attempt: None,
             failure: None,
             user_agent_hash,
+            initial_only: false,
+        }
+    }
+
+    /// Constructs a known fixed-capability client without retry negotiation.
+    pub(crate) const fn ios(user_agent_hash: [u8; 32]) -> Self {
+        Self {
+            class: CarrierClientClass::Ios,
+            capabilities: Some(CarrierCapabilities::ios()),
+            attempt: None,
+            failure: None,
+            user_agent_hash,
+            initial_only: true,
         }
     }
 
@@ -125,11 +147,17 @@ impl CarrierRequest {
             attempt: Some(attempt),
             failure,
             user_agent_hash,
+            initial_only: false,
         }
     }
 
     /// Returns whether this request participates in server-side negotiation.
     pub(crate) const fn is_automatic(self) -> bool {
+        self.capabilities.is_some() && !self.initial_only
+    }
+
+    /// Returns whether server capability filtering applies to this request.
+    pub(crate) const fn uses_capabilities(self) -> bool {
         self.capabilities.is_some()
     }
 
@@ -166,6 +194,14 @@ impl CarrierRequest {
         self.class == other.class
             && self.capabilities_bits() == other.capabilities_bits()
             && self.user_agent_hash == other.user_agent_hash
+            && self.initial_only == other.initial_only
+    }
+
+    /// Checks the complete idempotent identity of one exact attempt request.
+    pub(crate) fn matches_attempt(self, other: Self) -> bool {
+        self.matches_client(other)
+            && self.attempt == other.attempt
+            && self.failure == other.failure
     }
 
     fn capabilities_bits(self) -> Option<u8> {
@@ -184,4 +220,8 @@ pub(crate) struct CarrierLearningContext {
     pub(crate) class: CarrierClientClass,
     /// Domain-separated normalized User-Agent digest.
     pub(crate) user_agent_hash: [u8; 32],
+    /// Hot-reload epoch that rejects late outcomes from an older policy.
+    pub(crate) epoch: u64,
+    /// Whether the authoritative client address is safe to use as learning evidence.
+    pub(crate) ip_learning_eligible: bool,
 }

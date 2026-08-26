@@ -73,7 +73,7 @@ usize_default!(default_web_max_static_file_bytes, 8 * 1024 * 1024);
 usize_default!(default_web_max_static_bytes, 64 * 1024 * 1024);
 usize_default!(default_web_debug_records_capacity, 65_536);
 usize_default!(default_web_debug_bytes_global, 64 * 1024 * 1024);
-usize_default!(default_web_memory_envelope_bytes, 768 * 1024 * 1024);
+usize_default!(default_web_memory_envelope_bytes, 1280 * 1024 * 1024);
 u32_default!(default_web_new_bootstraps_per_minute, 1200);
 u32_default!(default_web_new_bootstraps_burst, 256);
 u32_default!(default_web_new_sessions_per_minute, 600);

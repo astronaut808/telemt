@@ -16,19 +16,24 @@ pub(super) async fn read_message(
     owner: crate::web::manager::ProfileKey,
     cancellation: &CancellationToken,
     retained_budget: &mut Option<WebSocketBudgetLease>,
+    maximum: usize,
+    backpressure_timeout: Duration,
 ) -> Result<(Message, Option<WebSocketBudgetLease>), ()> {
     tokio::select! {
         _ = cancellation.cancelled() => return Err(()),
         ready = socket.get_ref().readable() => ready.map_err(|_| ())?,
     }
     if retained_budget.is_none() {
-        let maximum = runtime
-            .active_generation()
-            .config()
-            .web
-            .limits
-            .carrier_batch_bytes;
-        *retained_budget = Some(reserve_data(runtime, owner, maximum, cancellation).await?);
+        *retained_budget = Some(
+            reserve_data(
+                runtime,
+                owner,
+                maximum,
+                cancellation,
+                backpressure_timeout,
+            )
+            .await?,
+        );
     }
     let message = tokio::select! {
         _ = cancellation.cancelled() => return Err(()),
@@ -47,17 +52,13 @@ pub(super) async fn reserve_data(
     owner: crate::web::manager::ProfileKey,
     bytes: usize,
     cancellation: &CancellationToken,
+    timeout: Duration,
 ) -> Result<WebSocketBudgetLease, ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_backpressure_secs,
-    );
     tokio::time::timeout(timeout, async {
         loop {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
             let notify = runtime.budget_notify();
             let notified = notify.notified();
             if let Some(budget) = runtime.try_websocket_data_budget(owner, bytes.max(1)) {
@@ -79,9 +80,10 @@ pub(super) async fn process_multiplex(
     sequence: u64,
     body: &[u8],
     cancellation: &CancellationToken,
-) -> Result<(), ()> {
-    retry_backpressure(runtime, cancellation, || {
-        session.process_up(sequence, body).map(|_| ())
+    timeout: Duration,
+) -> Result<bool, ()> {
+    retry_backpressure(runtime, cancellation, timeout, || {
+        session.process_websocket_multiplex(sequence, body)
     })
     .await
 }
@@ -93,21 +95,17 @@ pub(super) async fn process_lane(
     sequence: u64,
     body: &[u8],
     cancellation: &CancellationToken,
-) -> Result<(), ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_backpressure_secs,
-    );
+    timeout: Duration,
+) -> Result<bool, ()> {
     tokio::time::timeout(timeout, async {
         loop {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
             let notify = runtime.budget_notify();
             let notified = notify.notified();
             match session.process_websocket_lane(reservation, sequence, body) {
-                Ok(()) => return Ok(()),
+                Ok(progressed) => return Ok(progressed),
                 Err(ManagerError::Backpressure) => {}
                 Err(_) => return Err(()),
             }
@@ -121,28 +119,24 @@ pub(super) async fn process_lane(
     .map_err(|_| ())?
 }
 
-async fn retry_backpressure<F>(
+async fn retry_backpressure<F, T>(
     runtime: &Arc<WebProcessRuntime>,
     cancellation: &CancellationToken,
+    timeout: Duration,
     mut operation: F,
-) -> Result<(), ()>
+) -> Result<T, ()>
 where
-    F: FnMut() -> Result<(), ManagerError>,
+    F: FnMut() -> Result<T, ManagerError>,
 {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_backpressure_secs,
-    );
     tokio::time::timeout(timeout, async {
         loop {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
             let notify = runtime.budget_notify();
             let notified = notify.notified();
             match operation() {
-                Ok(()) => return Ok(()),
+                Ok(value) => return Ok(value),
                 Err(ManagerError::Backpressure) => {}
                 Err(_) => return Err(()),
             }
@@ -158,18 +152,10 @@ where
 
 pub(super) async fn send(
     socket: &mut CarrierSocket,
-    runtime: &WebProcessRuntime,
     message: Message,
     cancellation: &CancellationToken,
+    timeout: Duration,
 ) -> Result<(), ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_write_secs,
-    );
     tokio::select! {
         _ = cancellation.cancelled() => Err(()),
         result = tokio::time::timeout(timeout, socket.send(message)) => {
@@ -180,17 +166,9 @@ pub(super) async fn send(
 
 pub(super) async fn flush(
     socket: &mut CarrierSocket,
-    runtime: &WebProcessRuntime,
     cancellation: &CancellationToken,
+    timeout: Duration,
 ) -> Result<(), ()> {
-    let timeout = Duration::from_secs(
-        runtime
-            .active_generation()
-            .config()
-            .web
-            .timeouts
-            .websocket_write_secs,
-    );
     tokio::select! {
         _ = cancellation.cancelled() => Err(()),
         result = tokio::time::timeout(timeout, socket.flush()) => {

@@ -272,6 +272,10 @@ pub(super) async fn handle(
         (ParsedCarrier::Lane(lane_id), WebCarrier::WebsocketLanes) => WebSocketKind::Lane(lane_id),
         _ => return serve_decoy(request, vhost, true, &runtime).await,
     };
+    let mut probe_reservation = match session.reserve_websocket_probe(parsed.acknowledge_commit) {
+        Ok(reservation) => reservation,
+        Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
+    };
     let mut lane_reservation = match kind {
         WebSocketKind::Multiplex => None,
         WebSocketKind::Lane(lane_id) => match session.reserve_websocket_lane(lane_id) {
@@ -279,7 +283,7 @@ pub(super) async fn handle(
             Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
         },
     };
-    let timeouts = runtime.active_generation().config().web.timeouts.clone();
+    let timeouts = session.timeouts().clone();
     let connection = match runtime
         .admit_websocket(
             session.profile_key(),
@@ -297,6 +301,11 @@ pub(super) async fn handle(
         Ok(connection) => connection,
         Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
     };
+    if let Some(reservation) = probe_reservation.as_mut()
+        && reservation.bind(connection.id()).is_err()
+    {
+        return serve_decoy(request, vhost, true, &runtime).await;
+    }
     let trace_context = runtime.trace().websocket_context(
         &request,
         peer.ip(),
@@ -326,6 +335,7 @@ pub(super) async fn handle(
             driver_session,
             connection,
             lane_reservation.take(),
+            probe_reservation.take(),
             trace_context,
             parsed.acknowledge_commit,
         )

@@ -101,10 +101,10 @@ pub struct WebLimitsConfig {
     /// Per-session ceiling for downlink polls waiting for a lane OPEN.
     #[serde(default = "default_web_max_lane_open_waits_per_session")]
     pub max_lane_open_waits_per_session: usize,
-    /// Queued and in-flight downlink bytes allowed for one independent lane.
+    /// Queued and resident DATA bytes allowed for one independent lane.
     #[serde(default = "default_web_pending_bytes_per_lane")]
     pub pending_bytes_per_lane: usize,
-    /// Queued and in-flight downlink items allowed for one independent lane.
+    /// Queued and resident DATA items allowed for one independent lane.
     #[serde(default = "default_web_pending_items_per_lane")]
     pub pending_items_per_lane: usize,
     /// Process-wide transient WebSocket byte sub-budget inside pending bytes.
@@ -194,7 +194,7 @@ pub struct WebLimitsConfig {
     /// Process-wide retained and in-flight WEB debug byte ceiling.
     #[serde(default = "default_web_debug_bytes_global")]
     pub debug_bytes_global: usize,
-    /// Declared process envelope for HTTP heads, bodies, queues, and static snapshots.
+    /// Declared process envelope for HTTP, queues, lane state, learning, and static snapshots.
     #[serde(default = "default_web_memory_envelope_bytes")]
     pub memory_envelope_bytes: usize,
     /// Sustained process-wide bootstrap issuance rate.
@@ -414,10 +414,12 @@ impl WebConfig {
         let Some(configured) = self.carriers.enabled() else {
             return vec![self.carrier];
         };
-        let mut candidates = configured.to_vec();
-        if !candidates.contains(&self.carrier) {
-            candidates.push(self.carrier);
-        }
+        let mut candidates = configured
+            .iter()
+            .copied()
+            .filter(|carrier| *carrier != self.carrier)
+            .collect::<Vec<_>>();
+        candidates.push(self.carrier);
         candidates
     }
 

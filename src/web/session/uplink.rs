@@ -15,6 +15,18 @@ use super::{
 use crate::web::frame::{self, Frame, FrameType};
 use crate::web::manager::{ManagerError, TokenHash};
 
+#[derive(Clone, Copy, Default)]
+pub(super) struct AppliedProgress {
+    pub(super) accepted_open: bool,
+    pub(super) accepted_data: bool,
+}
+
+impl AppliedProgress {
+    pub(super) fn any(self) -> bool {
+        self.accepted_open || self.accepted_data
+    }
+}
+
 impl WebSession {
     /// Applies one exactly-once uplink batch.
     pub(crate) fn process_up(
@@ -22,6 +34,25 @@ impl WebSession {
         sequence: u64,
         body: &[u8],
     ) -> Result<u64, ManagerError> {
+        self.process_up_inner(sequence, body)
+            .map(|(acknowledged, _)| acknowledged)
+    }
+
+    /// Applies one WebSocket uplink batch and reports actual carrier progress.
+    pub(crate) fn process_websocket_multiplex(
+        self: &Arc<Self>,
+        sequence: u64,
+        body: &[u8],
+    ) -> Result<bool, ManagerError> {
+        self.process_up_inner(sequence, body)
+            .map(|(_, progress)| progress)
+    }
+
+    fn process_up_inner(
+        self: &Arc<Self>,
+        sequence: u64,
+        body: &[u8],
+    ) -> Result<(u64, bool), ManagerError> {
         if !self.carrier().is_multiplexed() {
             return Err(ManagerError::Protocol);
         }
@@ -49,11 +80,9 @@ impl WebSession {
             return Err(ManagerError::Protocol);
         }
         let digest: TokenHash = Sha256::digest(body).into();
-        let progress = frames
-            .iter()
-            .any(|frame| matches!(frame.frame_type, FrameType::Open | FrameType::Data));
         let mut opened = Vec::new();
         let mut committed = false;
+        let mut healthy = false;
         let result = {
             let mut state = self.state.lock();
             if state.closed {
@@ -63,7 +92,7 @@ impl WebSession {
             state.last_activity = Instant::now();
             if sequence == state.last_up_sequence && sequence != 0 {
                 return if bool::from(state.last_up_digest.ct_eq(&digest)) {
-                    Ok(sequence)
+                    Ok((sequence, false))
                 } else {
                     drop(state);
                     self.close();
@@ -91,6 +120,7 @@ impl WebSession {
             }
             let mut unused_bytes = reserve_bytes;
             let mut unused_items = reserve_items;
+            let mut progress = AppliedProgress::default();
             let applied = self.apply_batch_locked(
                 &mut state,
                 &frames,
@@ -98,6 +128,7 @@ impl WebSession {
                 &mut None,
                 &mut unused_bytes,
                 &mut unused_items,
+                &mut progress,
             );
             self.release_locked(&mut state, unused_bytes, unused_items, false);
             if !applied {
@@ -105,8 +136,9 @@ impl WebSession {
             } else {
                 state.last_up_sequence = sequence;
                 state.last_up_digest = digest;
-                committed = self.commit_carrier_locked(&mut state, progress);
-                Ok(sequence)
+                (committed, healthy) =
+                    self.record_uplink_progress_locked(&mut state, progress);
+                Ok((sequence, progress.any()))
             }
         };
         if matches!(result, Err(ManagerError::Backpressure)) {
@@ -119,6 +151,9 @@ impl WebSession {
         }
         if committed {
             self.finish_carrier_commit();
+        }
+        if healthy {
+            self.finish_carrier_health();
         }
         for completion in opened {
             self.spawn_stream(completion, false);
@@ -137,6 +172,7 @@ impl WebSession {
         reserved_open: &mut Option<(u32, u16)>,
         unused_bytes: &mut usize,
         unused_items: &mut usize,
+        progress: &mut AppliedProgress,
     ) -> bool {
         for value in frames {
             if value.stream_id == 0 {
@@ -186,6 +222,7 @@ impl WebSession {
                             write_waker: None,
                         },
                     );
+                    progress.accepted_open = true;
                     opened.push(self.own_stream_task(stream, peer_port));
                 }
                 FrameType::Data if !was_closed => {
@@ -197,6 +234,7 @@ impl WebSession {
                         bytes: Bytes::copy_from_slice(value.payload),
                         offset: 0,
                     });
+                    progress.accepted_data = true;
                     *unused_bytes =
                         unused_bytes.saturating_sub(value.payload.len() + QUEUE_ITEM_COST);
                     *unused_items = unused_items.saturating_sub(1);
@@ -409,6 +447,9 @@ mod tests {
             1,
             [3; 32],
             None,
+            crate::web::manager::CarrierClientClass::Legacy,
+            None,
+            false,
             WebLimitsConfig::default(),
             WebTimeoutsConfig::default(),
         )
@@ -445,6 +486,7 @@ mod tests {
             state.streams.insert(
                 1,
                 StreamState {
+                    instance: 1,
                     inbound: VecDeque::new(),
                     receive_window: frame::INITIAL_STREAM_WINDOW,
                     send_credit: u64::from(frame::INITIAL_STREAM_WINDOW),

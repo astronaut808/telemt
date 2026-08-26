@@ -216,6 +216,10 @@ impl WebDataBudget {
         self.pressured.swap(false, Ordering::AcqRel)
     }
 
+    pub(super) fn restore_pressure(&self) {
+        self.pressured.store(true, Ordering::Release);
+    }
+
     pub(super) fn owner_usage(&self, owner: ProfileKey) -> usize {
         self.state
             .lock()

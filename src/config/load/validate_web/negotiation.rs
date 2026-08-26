@@ -33,9 +33,12 @@ pub(super) fn validate(config: &WebConfig) -> Result<Vec<WebCarrier>> {
             "web.timeouts.carrier_negotiation_deadlines_secs must be non-zero and strictly increasing",
         );
     }
-    if deadlines[3] > config.timeouts.bootstrap_lifetime_secs {
+    let retained_chain_secs = deadlines[3]
+        .checked_add(config.timeouts.carrier_health_secs)
+        .and_then(|value| value.checked_add(1));
+    if retained_chain_secs.is_none_or(|value| value >= config.timeouts.bootstrap_lifetime_secs) {
         return config_error(
-            "web.timeouts carrier negotiation deadline must not exceed bootstrap_lifetime_secs",
+            "web.timeouts final carrier deadline plus health and cleanup must be lower than bootstrap_lifetime_secs",
         );
     }
     Ok(candidates)
@@ -112,5 +115,9 @@ mod tests {
         assert!(validate(&config).is_err());
         config.timeouts.carrier_negotiation_deadlines_secs = [3, 5, 8, 121];
         assert!(validate(&config).is_err());
+        config.timeouts.carrier_negotiation_deadlines_secs = [3, 5, 8, 89];
+        assert!(validate(&config).is_err());
+        config.timeouts.carrier_negotiation_deadlines_secs = [3, 5, 8, 88];
+        assert!(validate(&config).is_ok());
     }
 }

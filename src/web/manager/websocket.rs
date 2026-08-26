@@ -82,19 +82,45 @@ impl WebSocketConnection {
     }
 
     /// Marks successful ownership transfer from HTTP to the WebSocket codec.
-    pub(crate) fn mark_opened(&self) {
-        self.entry
-            .phase
-            .store(WebSocketPhase::Upgraded as u8, Ordering::Release);
+    pub(crate) fn mark_opened(&self) -> bool {
+        if self.entry.closing.load(Ordering::Acquire)
+            || self
+                .entry
+                .phase
+                .compare_exchange(
+                    WebSocketPhase::Claimed as u8,
+                    WebSocketPhase::Upgraded as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            || self.entry.closing.load(Ordering::Acquire)
+        {
+            return false;
+        }
         self.mark_progress();
+        true
     }
 
     /// Marks the first validated carrier binary message as active progress.
-    pub(crate) fn mark_active(&self) {
-        self.entry
-            .phase
-            .store(WebSocketPhase::Active as u8, Ordering::Release);
+    pub(crate) fn mark_active(&self) -> bool {
+        if self.entry.closing.load(Ordering::Acquire)
+            || self
+                .entry
+                .phase
+                .compare_exchange(
+                    WebSocketPhase::Upgraded as u8,
+                    WebSocketPhase::Active as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            || self.entry.closing.load(Ordering::Acquire)
+        {
+            return false;
+        }
         self.mark_peer_activity();
+        true
     }
 
     /// Refreshes the peer-liveness deadline after any received WebSocket message.
@@ -125,12 +151,16 @@ impl Drop for WebSocketConnection {
                 registry.claims.remove(&self.entry.claim);
             }
             if self.entry.closing.load(Ordering::Acquire) {
-                registry.evictions_in_flight = registry.evictions_in_flight.saturating_sub(1);
+                if registry.evictions_in_flight == 0 {
+                    registry.closed = true;
+                } else {
+                    registry.evictions_in_flight -= 1;
+                }
             }
             drop(registry);
-            self.entry.released.cancel();
             drop(self.base_budget.take());
             drop(self.slot.take());
+            self.entry.released.cancel();
             runtime.websocket_notify.notify_waiters();
         }
     }
@@ -149,6 +179,9 @@ pub(super) async fn admit(
     eviction_timeout: Duration,
     parent_cancellation: CancellationToken,
 ) -> Result<WebSocketConnection, ManagerError> {
+    if parent_cancellation.is_cancelled() {
+        return Err(ManagerError::Closed);
+    }
     let liveness_interval_ms = liveness_interval.as_millis().min(u128::from(u64::MAX)) as u64;
     match try_admit(
         runtime,
@@ -172,7 +205,13 @@ pub(super) async fn admit(
     };
     let released = victim.released.cancelled();
     victim.cancel.cancel();
-    let _ = tokio::time::timeout(eviction_timeout, released).await;
+    tokio::select! {
+        _ = parent_cancellation.cancelled() => return Err(ManagerError::Closed),
+        _ = tokio::time::timeout(eviction_timeout, released) => {}
+    }
+    if parent_cancellation.is_cancelled() {
+        return Err(ManagerError::Closed);
+    }
     match try_admit(
         runtime,
         owner,
@@ -211,6 +250,9 @@ fn try_admit(
     liveness_interval_ms: u64,
     parent_cancellation: &CancellationToken,
 ) -> Result<WebSocketConnection, TryAdmitError> {
+    if parent_cancellation.is_cancelled() {
+        return Err(TryAdmitError::Closed);
+    }
     let claim = WebSocketClaimKey { session_hash, kind };
     {
         let registry = runtime.websockets.lock();
@@ -227,6 +269,9 @@ fn try_admit(
     let base_budget = runtime
         .try_websocket_base_budget(owner, base_bytes)
         .ok_or(TryAdmitError::Capacity)?;
+    if parent_cancellation.is_cancelled() {
+        return Err(TryAdmitError::Closed);
+    }
     let id = runtime
         .websocket_next_id
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -251,7 +296,7 @@ fn try_admit(
         released: CancellationToken::new(),
     });
     let mut registry = runtime.websockets.lock();
-    if registry.closed {
+    if registry.closed || parent_cancellation.is_cancelled() {
         return Err(TryAdmitError::Closed);
     }
     if registry.claims.contains_key(&claim) {
@@ -276,11 +321,12 @@ impl WebProcessRuntime {
     pub(super) fn cleanup_websockets(&self) {
         let now = self.websocket_tick();
         let mut victims = claim_stale_victims(self, now);
-        if victims.is_empty()
-            && self.data_budget.take_pressure()
-            && let Some(victim) = select_pressure_victim(self, now, true)
-        {
-            victims.push(victim);
+        if victims.is_empty() && self.data_budget.take_pressure() {
+            if let Some(victim) = select_pressure_victim(self, now, true) {
+                victims.push(victim);
+            } else {
+                self.data_budget.restore_pressure();
+            }
         }
         for victim in victims {
             victim.cancel.cancel();

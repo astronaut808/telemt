@@ -65,7 +65,8 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
                 secret_mode: profile.secret_mode,
                 carrier: config.web.carrier,
                 carrier_negotiation_enabled: config.web.carrier_negotiation_enabled(),
-                carrier_learning: config.web.carrier_learning,
+                carrier_learning: config.web.carrier_negotiation_enabled()
+                    && config.web.carrier_learning,
                 carriers: Arc::clone(&carrier_candidates),
                 carrier_negotiation_deadlines_secs: config
                     .web

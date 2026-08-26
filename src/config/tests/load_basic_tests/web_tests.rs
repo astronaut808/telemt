@@ -57,6 +57,7 @@ fn web_config_builds_canonical_runtime_snapshot() {
 fn web_carriers_missing_or_false_disable_negotiation() {
     let missing = load_config_from_temp_toml(WEB_CONFIG);
     assert!(!missing.web.carrier_negotiation_enabled());
+    assert!(!missing.web.runtime.unwrap().profiles[0].carrier_learning);
 
     let disabled = WEB_CONFIG.replace(
         "carrier = \"https-lanes\"",
@@ -64,6 +65,7 @@ fn web_carriers_missing_or_false_disable_negotiation() {
     );
     let disabled = load_config_from_temp_toml(&disabled);
     assert!(!disabled.web.carrier_negotiation_enabled());
+    assert!(!disabled.web.runtime.as_ref().unwrap().profiles[0].carrier_learning);
     assert_eq!(
         disabled.web.runtime.unwrap().profiles[0].carriers.as_ref(),
         [WebCarrier::HttpsLanes]

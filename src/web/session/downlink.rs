@@ -16,7 +16,7 @@ impl WebSession {
         if !self.carrier().is_multiplexed() {
             return Err(ManagerError::Protocol);
         }
-        let epoch = {
+        let (epoch, healthy) = {
             let mut state = self.state.lock();
             if state.closed {
                 return Err(ManagerError::Closed);
@@ -35,15 +35,29 @@ impl WebSession {
                     self.close();
                     return Err(ManagerError::Protocol);
                 }
+                let carrier_health_eligible = unacked.carrier_health_eligible;
                 self.release_unacked_locked(&mut state);
+                state.carrier_health_downlink |= carrier_health_eligible;
+                if carrier_health_eligible {
+                    state.carrier_health_activity_at = Some(Instant::now());
+                }
             } else if cursor != state.down_cursor {
                 drop(state);
                 self.close();
                 return Err(ManagerError::Protocol);
             }
-            state.down_epoch = state.down_epoch.wrapping_add(1).max(1);
-            state.down_epoch
+            let Some(epoch) = state.down_epoch.checked_add(1) else {
+                drop(state);
+                self.close();
+                return Err(ManagerError::Protocol);
+            };
+            state.down_epoch = epoch;
+            let healthy = self.carrier_health_ready_locked(&mut state, Instant::now());
+            (state.down_epoch, healthy)
         };
+        if healthy {
+            self.finish_carrier_health();
+        }
         self.down_notify.notify_waiters();
 
         let deadline = Duration::from_secs(self.timeouts.long_poll_secs);
@@ -431,6 +445,8 @@ impl WebSession {
             data_items,
             control_bytes,
             control_items,
+            carrier_health_eligible: state.negotiation_phase
+                == super::SessionNegotiationPhase::Committed,
         })
     }
 
@@ -450,114 +466,5 @@ impl WebSession {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::SocketAddr;
-    use std::sync::Arc;
-
-    use crate::config::{
-        WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
-    };
-    use crate::web::manager::WebProcessRuntime;
-
-    fn session() -> Arc<WebSession> {
-        let profile = Arc::new(WebRuntimeProfile {
-            host: "proxy.example.com".to_string(),
-            public_addr: SocketAddr::from(([203, 0, 113, 10], 443)),
-            user: "alice".to_string(),
-            secret_mode: WebSecretMode::Plain,
-            carrier: WebCarrier::Https,
-            carrier_negotiation_enabled: false,
-            carrier_learning: true,
-            carriers: Arc::from([WebCarrier::Https]),
-            carrier_negotiation_deadlines_secs: [3, 5, 8, 12],
-            capability: [0; 32],
-            key_fingerprint: "0000000000000000".to_string(),
-            max_sessions: 1,
-            max_streams: 1,
-            max_streams_per_session: 1,
-        });
-        WebSession::new(
-            std::sync::Weak::<WebProcessRuntime>::new(),
-            [1; 32],
-            "192.0.2.10".parse().unwrap(),
-            1,
-            profile,
-            [2; 32],
-            WebCarrier::Https,
-            1,
-            [3; 32],
-            None,
-            WebLimitsConfig::default(),
-            WebTimeoutsConfig::default(),
-        )
-    }
-
-    fn queue_close(session: &WebSession) {
-        let encoded = frame::encode(FrameType::Close, 1, &[]);
-        session.state.lock().pending_frames.push_back(QueuedFrame {
-            encoded: BytesMut::from(encoded.as_ref()),
-            frame_type: FrameType::Close,
-            stream_id: 1,
-            control: true,
-            cost: frame::HEADER_BYTES + QUEUE_ITEM_COST,
-        });
-    }
-
-    #[tokio::test]
-    async fn downlink_replays_unacknowledged_batch_byte_for_byte() {
-        let session = session();
-        queue_close(&session);
-        let first = session.poll_down(0).await.unwrap();
-        let replay = session.poll_down(0).await.unwrap();
-        assert_eq!(first.next_cursor, 1);
-        assert_eq!(replay.next_cursor, 1);
-        assert_eq!(first.body, replay.body);
-    }
-
-    #[tokio::test]
-    async fn invalid_or_overflowing_cursor_closes_session() {
-        let invalid = session();
-        assert!(matches!(
-            invalid.poll_down(1).await,
-            Err(ManagerError::Protocol)
-        ));
-        assert!(invalid.state.lock().closed);
-
-        let overflow = session();
-        {
-            let mut state = overflow.state.lock();
-            state.down_cursor = u64::MAX;
-        }
-        queue_close(&overflow);
-        assert!(matches!(
-            overflow.poll_down(u64::MAX).await,
-            Err(ManagerError::Protocol)
-        ));
-        assert!(overflow.state.lock().closed);
-    }
-
-    #[tokio::test]
-    async fn newer_poll_supersedes_older_poll_without_closing_session() {
-        let session = session();
-        let first_session = Arc::clone(&session);
-        let first = tokio::spawn(async move { first_session.poll_down(0).await });
-        while session.state.lock().down_epoch < 1 {
-            tokio::task::yield_now().await;
-        }
-        let second_session = Arc::clone(&session);
-        let second = tokio::spawn(async move { second_session.poll_down(0).await });
-        while session.state.lock().down_epoch < 2 {
-            tokio::task::yield_now().await;
-        }
-        let superseded = tokio::time::timeout(Duration::from_secs(1), first)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert!(superseded.body.is_empty());
-        assert_eq!(superseded.next_cursor, 0);
-        assert!(!session.state.lock().closed);
-        second.abort();
-    }
-}
+#[path = "downlink_tests.rs"]
+mod tests;

@@ -106,6 +106,10 @@ impl WebSession {
         }
         let queued = {
             let mut state = self.state.lock();
+            if state.closing_streams.get(&stream.id) == Some(&stream.instance) {
+                state.closing_streams.remove(&stream.id);
+                self.remember_closed_locked(&mut state, stream.id);
+            }
             state
                 .streams
                 .get(&stream.id)

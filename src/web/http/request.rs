@@ -1,69 +1,23 @@
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use base64::Engine as _;
 use hyper::Request;
 use hyper::header;
-use ipnetwork::IpNetwork;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::config::{WebClientIpSource, WebRuntimeProfile, WebRuntimeVhost};
+use crate::config::{WebRuntimeProfile, WebRuntimeVhost};
 use crate::web::manager::{
     CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierRequest, TokenHash,
 };
 
 const USER_AGENT_CONTEXT: &[u8] = b"telemt-web-carrier-user-agent-v1\0";
 
-/// Parses one lowercase canonical Host value restricted to the public HTTPS port.
-pub(super) fn canonical_request_host<B>(request: &Request<B>) -> Option<&str> {
-    let values = request.headers().get_all(header::HOST);
-    let mut values = values.iter();
-    let value = values.next()?.to_str().ok()?;
-    if values.next().is_some() {
-        return None;
-    }
-    let authority = value.parse::<hyper::http::uri::Authority>().ok()?;
-    if authority.port_u16().is_some_and(|port| port != 443) {
-        return None;
-    }
-    let host = value.strip_suffix(":443").unwrap_or(value);
-    if authority.host() != host || host.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        return None;
-    }
-    Some(host)
-}
-
-/// Accepts one forwarded client address or the direct address of a trusted peer.
-pub(super) fn client_ip<B>(
-    request: &Request<B>,
-    peer: SocketAddr,
-    source: WebClientIpSource,
-    trusted_proxy_cidrs: &[IpNetwork],
-) -> Option<IpAddr> {
-    if !trusted_proxy_cidrs
-        .iter()
-        .any(|network| network.contains(peer.ip()))
-    {
-        return None;
-    }
-    let header_name = match source {
-        WebClientIpSource::XForwardedFor => "x-forwarded-for",
-    };
-    let values = request.headers().get_all(header_name);
-    let mut values = values.iter();
-    let Some(value) = values.next() else {
-        return Some(peer.ip());
-    };
-    let value = value.to_str().ok()?;
-    if values.next().is_some() || value.trim() != value || value.contains(',') {
-        return None;
-    }
-    if value.is_empty() {
-        return Some(peer.ip());
-    }
-    value.parse::<IpAddr>().ok()
-}
+// Canonical host and forwarded-address provenance remain isolated from credentials.
+mod identity;
+pub(super) use identity::{
+    canonical_request_host, carrier_ip_learning_eligible, client_ip,
+};
 
 /// Decodes an exact canonical bridge query without allocating credential strings.
 pub(super) fn bridge_candidate(query: Option<&str>) -> ([u8; 32], bool) {
@@ -177,16 +131,31 @@ pub(super) fn carrier_request<B>(request: &Request<B>, host: &str) -> Option<Car
     let capabilities = single_header(request, "x-carrier-capabilities");
     let attempt = optional_canonical_u8_header(request, "x-carrier-attempt")?;
     let failure = optional_failure_header(request)?;
+    let native_ios = native_ios_user_agent(request);
     match (capabilities, attempt) {
-        (None, None) if failure.is_none() => Some(CarrierRequest::legacy(user_agent_hash)),
+        (None, None) if failure.is_none() => {
+            if native_ios {
+                Some(CarrierRequest::ios(user_agent_hash))
+            } else {
+                Some(CarrierRequest::legacy(user_agent_hash))
+            }
+        }
         (Some(capabilities), Some(attempt)) => {
             let capabilities = parse_capabilities(capabilities)?;
             if (attempt == 1) != failure.is_none() {
                 return None;
             }
             Some(CarrierRequest::automatic(
-                CarrierClientClass::Bridge,
-                capabilities,
+                if native_ios {
+                    CarrierClientClass::Ios
+                } else {
+                    CarrierClientClass::Bridge
+                },
+                if native_ios {
+                    CarrierCapabilities::ios()
+                } else {
+                    capabilities
+                },
                 attempt,
                 failure,
                 user_agent_hash,
@@ -197,8 +166,16 @@ pub(super) fn carrier_request<B>(request: &Request<B>, host: &str) -> Option<Car
                 return None;
             }
             Some(CarrierRequest::automatic(
-                CarrierClientClass::BrowserHint,
-                CarrierCapabilities::all(),
+                if native_ios {
+                    CarrierClientClass::Ios
+                } else {
+                    CarrierClientClass::BrowserHint
+                },
+                if native_ios {
+                    CarrierCapabilities::ios()
+                } else {
+                    CarrierCapabilities::all()
+                },
                 attempt,
                 failure,
                 user_agent_hash,
@@ -206,6 +183,13 @@ pub(super) fn carrier_request<B>(request: &Request<B>, host: &str) -> Option<Car
         }
         _ => None,
     }
+}
+
+fn native_ios_user_agent<B>(request: &Request<B>) -> bool {
+    single_header(request, header::USER_AGENT).is_some_and(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains("cfnetwork/") && value.contains("darwin/")
+    })
 }
 
 fn parse_capabilities(value: &str) -> Option<CarrierCapabilities> {
@@ -292,6 +276,9 @@ fn single_header<B>(request: &Request<B>, name: impl header::AsHeaderName) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipnetwork::IpNetwork;
+
+    use crate::config::{WebCarrier, WebClientIpSource};
 
     #[test]
     fn canonical_bridge_query_rejects_aliases() {
@@ -483,6 +470,46 @@ mod tests {
             .body(())
             .unwrap();
         assert!(carrier_request(&reordered, "proxy.example.com").is_none());
+    }
+
+    #[test]
+    fn native_ios_capability_claims_cannot_enable_parallel_carriers() {
+        let request = Request::builder()
+            .header(
+                "x-carrier-capabilities",
+                "https,https-lanes,websocket,websocket-lanes",
+            )
+            .header("x-carrier-attempt", "1")
+            .header(
+                header::USER_AGENT,
+                "Telemt/1 CFNetwork/1498.700.2 Darwin/23.6.0",
+            )
+            .body(())
+            .unwrap();
+        let parsed = carrier_request(&request, "proxy.example.com").unwrap();
+        assert_eq!(parsed.class(), CarrierClientClass::Ios);
+        assert!(parsed.supports(WebCarrier::Https));
+        assert!(!parsed.supports(WebCarrier::HttpsLanes));
+        assert!(!parsed.supports(WebCarrier::Websocket));
+        assert!(!parsed.supports(WebCarrier::WebsocketLanes));
+    }
+
+    #[test]
+    fn mapped_private_addresses_are_not_learning_evidence() {
+        for address in ["::ffff:127.0.0.1", "::ffff:10.0.0.1"] {
+            let effective_ip = address.parse().unwrap();
+            let request = Request::builder()
+                .header("x-forwarded-for", address)
+                .body(())
+                .unwrap();
+            assert!(!carrier_ip_learning_eligible(&request, effective_ip));
+        }
+        let effective_ip = "::ffff:8.8.8.8".parse().unwrap();
+        let request = Request::builder()
+            .header("x-forwarded-for", "::ffff:8.8.8.8")
+            .body(())
+            .unwrap();
+        assert!(carrier_ip_learning_eligible(&request, effective_ip));
     }
 
     #[test]

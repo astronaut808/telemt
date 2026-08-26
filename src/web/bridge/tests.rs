@@ -49,9 +49,8 @@ fn effective_deadline_formula_uses_the_final_checkpoint() {
         "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
         3,
     );
-    assert!(page.body.contains(
-        "candidateDeadlines.slice(0,candidateCount-1).concat(candidateDeadlines[3])"
-    ));
+    assert!(page.body.contains("negotiatedFinalDeadline=candidateDeadlines[3]"));
+    assert!(page.body.contains("carrierAttempt>=negotiatedCandidateCount?negotiatedFinalDeadline"));
 }
 
 #[test]
@@ -68,9 +67,40 @@ fn disabled_negotiation_does_not_arm_a_carrier_deadline() {
         &SecureRandom::new(),
     );
     assert!(page.body.contains(
-        "if(negotiationEnabled&&!negotiationStartedAt)"
+        "if(negotiationEnabled){negotiationStartedAt=Date.now();armCarrierDeadline(attemptEpoch)}"
     ));
     assert!(page.body.contains(
         "negotiationEnabled?'tproxy-auto-v1.':'tproxy-v1.'"
     ));
+}
+
+#[test]
+fn retry_and_attempt_state_are_frozen_before_fetch() {
+    let page = render_page(
+        "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+        4,
+    );
+    assert!(page.body.contains("async function request(path,frozenOptions)"));
+    assert!(!page.body.contains("makeOptions"));
+    assert!(
+        page.body
+            .contains("if(closed||(external&&external.aborted))throw new Error('request aborted')")
+    );
+    assert!(page.body.contains(
+        "const frozen=options('POST',bootstrap,snapshot.hello,attemptHeaders(snapshot.attempt,snapshot.failure),controller.signal)"
+    ));
+}
+
+#[test]
+fn ambiguous_commit_is_resolved_before_carrier_advance() {
+    let page = render_page(
+        "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+        4,
+    );
+    assert!(page.body.contains("resolveAttempt(reason,epoch,snapshot)"));
+    assert!(page.body.contains(
+        "sessionEcho(response,snapshot.attempt,['provisional','committed','healthy'],true)"
+    ));
+    assert!(page.body.contains("if(echo.state!=='provisional'){switching=false;fail();return}"));
+    assert!(page.body.contains("const token=cleanupToken||sessionToken"));
 }

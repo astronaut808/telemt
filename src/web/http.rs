@@ -50,7 +50,8 @@ use decoy::serve_decoy;
 use down::handle_down;
 use request::{
     bearer_token_hash, binary_content_type, bridge_candidate, canonical_request_host,
-    canonical_u64_header, carrier_request, client_ip, compatible_cookie_header, match_profile,
+    canonical_u64_header, carrier_ip_learning_eligible, carrier_request, client_ip,
+    compatible_cookie_header, match_profile,
 };
 use response::{
     bad_gateway, carrier_empty, carrier_headers, carrier_lane, full_response, generic_not_found,
@@ -358,6 +359,7 @@ async fn handle_session(
     let Some(carrier_request) = carrier_request(&request, &vhost.host) else {
         return serve_decoy(request, vhost, true, &runtime).await;
     };
+    let ip_learning_eligible = carrier_ip_learning_eligible(&request, client_ip);
     let Some((trace_session_id, profile)) =
         runtime.bootstrap_trace_identity(token_hash, &vhost.host)
     else {
@@ -391,6 +393,7 @@ async fn handle_session(
         client_ip,
         &body,
         carrier_request,
+        ip_learning_eligible,
     ) {
         Ok(result) => {
             let welcome = frame::encode(FrameType::Welcome, 0, &[]);
@@ -422,6 +425,60 @@ async fn handle_session(
                     &mut response,
                     HeaderName::from_static("x-carrier-attempt"),
                     &attempt.to_string(),
+                );
+            }
+            if let Some(candidate_count) = result.candidate_count {
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-candidate-count"),
+                    &candidate_count.to_string(),
+                );
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-deadline"),
+                    &result.deadline_secs.unwrap_or_default().to_string(),
+                );
+                if let Some(state) = result.carrier_state {
+                    insert_header(
+                        &mut response,
+                        HeaderName::from_static("x-carrier-state"),
+                        state,
+                    );
+                }
+            }
+            response
+        }
+        Err(ManagerError::Committed) => {
+            let mut response = carrier_empty(StatusCode::CONFLICT);
+            if let Some(echo) = runtime.carrier_echo(
+                token_hash,
+                &vhost.host,
+                client_ip,
+                carrier_request,
+            ) {
+                response.headers_mut().insert(
+                    HeaderName::from_static("x-carrier-mode"),
+                    HeaderValue::from_static(echo.carrier.as_str()),
+                );
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-attempt"),
+                    &echo.attempt.to_string(),
+                );
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-candidate-count"),
+                    &echo.candidate_count.to_string(),
+                );
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-deadline"),
+                    &echo.deadline_secs.to_string(),
+                );
+                insert_header(
+                    &mut response,
+                    HeaderName::from_static("x-carrier-state"),
+                    echo.state,
                 );
             }
             response
@@ -479,12 +536,7 @@ async fn handle_up(
     let Some(lane_id) = carrier_lane(&request, session.carrier()) else {
         return serve_decoy(request, vhost, true, &runtime).await;
     };
-    let limit = runtime
-        .active_generation()
-        .config()
-        .web
-        .limits
-        .max_body_bytes;
+    let limit = session.limits().max_body_bytes;
     let CollectedBody {
         request,
         body,
@@ -500,7 +552,7 @@ async fn handle_up(
         trace.record_frames(
             TraceDirection::Request,
             &body,
-            &runtime.active_generation().config().web.limits,
+            session.limits(),
         );
     }
     let result = match lane_id {

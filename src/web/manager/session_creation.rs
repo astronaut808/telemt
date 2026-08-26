@@ -8,17 +8,17 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use super::state::{
-    ManagerState, allow_rate, decrement_map, matching_profile, new_unique_token, profile_key,
+    CarrierChainPhase, decrement_map, matching_profile, new_unique_token, profile_key,
     remember_closed_token_locked, remove_expired_locked,
 };
+use super::session_admission::admit_initial;
 use super::{
-    CarrierLearningContext, CarrierRequest, CreateResult, ManagerError, TokenHash,
-    WebProcessRuntime,
+    CarrierLearningContext, CarrierRequest, CreateResult, ManagerError, TokenHash, WebProcessRuntime,
 };
-use crate::config::{WebCarrier, WebRuntimeProfile, WebTimeoutsConfig};
+use crate::config::{WebCarrier, WebRuntimeProfile};
 use crate::web::frame;
 use crate::web::session::WebSession;
-use crate::web::trace::{TraceIdentity, TraceLifecycleEvent};
+use crate::web::trace::TraceLifecycleEvent;
 
 struct Replacement {
     old_session: Arc<WebSession>,
@@ -29,6 +29,9 @@ struct Replacement {
     carrier: WebCarrier,
     request: CarrierRequest,
     scores: [i16; 4],
+    learning_epoch: u64,
+    ip_learning_eligible: bool,
+    carrier_deadline_at: Instant,
 }
 
 impl WebProcessRuntime {
@@ -40,6 +43,7 @@ impl WebProcessRuntime {
         client_ip: IpAddr,
         body: &[u8],
         carrier_request: CarrierRequest,
+        ip_learning_eligible: bool,
     ) -> std::result::Result<CreateResult, ManagerError> {
         if !frame::validate_hello(body, &self.limits) {
             return Err(ManagerError::Protocol);
@@ -57,8 +61,25 @@ impl WebProcessRuntime {
             return Err(ManagerError::Authentication);
         }
         if entry.used {
+            if entry.carrier_deadline_at.is_some_and(|deadline| now >= deadline)
+                && entry
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| !session.is_carrier_committed())
+            {
+                let session = entry.session.clone();
+                drop(state);
+                if let Some(session) = session {
+                    session.close();
+                }
+                return Err(ManagerError::Closed);
+            }
+            if entry.close_requested {
+                return Err(ManagerError::Closed);
+            }
             let digest_matches = bool::from(entry.body_digest.ct_eq(&body_digest));
-            let client_matches = entry.session_client_ip == Some(client_ip);
+            let client_matches = entry.session_client_ip == Some(client_ip)
+                && entry.session_ip_learning_eligible == ip_learning_eligible;
             let request_matches = entry
                 .carrier_request
                 .is_some_and(|current| current.matches_client(carrier_request));
@@ -71,11 +92,31 @@ impl WebProcessRuntime {
             if carrier_request.attempt() == Some(entry.carrier_attempt)
                 || (!carrier_request.is_automatic() && entry.carrier_attempt == 1)
             {
+                if entry
+                    .carrier_request
+                    .is_none_or(|current| !current.matches_attempt(carrier_request))
+                {
+                    return Err(ManagerError::Authentication);
+                }
                 let session = entry.session.as_ref().ok_or(ManagerError::Authentication)?;
+                let automatic = carrier_request.is_automatic();
+                let carrier_state = if entry.carrier_phase == CarrierChainPhase::Provisional
+                    && session.is_carrier_committed()
+                {
+                    CarrierChainPhase::CommittedPendingHealth.as_str()
+                } else {
+                    entry.carrier_phase.as_str()
+                };
                 let result = CreateResult {
                     token: entry.session_token.as_str().to_owned(),
                     carrier: session.carrier(),
                     attempt: carrier_request.attempt(),
+                    candidate_count: automatic.then(|| {
+                        u8::try_from(entry.carrier_candidates.len()).unwrap_or(4)
+                    }),
+                    deadline_secs: automatic
+                        .then_some(entry.profile.carrier_negotiation_deadlines_secs[3]),
+                    carrier_state: automatic.then_some(carrier_state),
                 };
                 let identity = session.trace_identity();
                 drop(state);
@@ -92,9 +133,19 @@ impl WebProcessRuntime {
             let next_attempt = entry.carrier_attempt.saturating_add(1);
             if !carrier_request.is_automatic()
                 || carrier_request.attempt() != Some(next_attempt)
-                || entry.carrier_committed
+                || matches!(
+                    entry.carrier_phase,
+                    CarrierChainPhase::CommittedPendingHealth | CarrierChainPhase::Healthy
+                )
             {
-                return Err(ManagerError::Protocol);
+                return Err(if matches!(
+                    entry.carrier_phase,
+                    CarrierChainPhase::CommittedPendingHealth | CarrierChainPhase::Healthy
+                ) {
+                    ManagerError::Committed
+                } else {
+                    ManagerError::Protocol
+                });
             }
             let Some(carrier) = entry
                 .carrier_candidates
@@ -103,6 +154,15 @@ impl WebProcessRuntime {
             else {
                 return Err(ManagerError::Protocol);
             };
+            let deadline_index = usize::from(next_attempt.saturating_sub(2));
+            if entry.carrier_started_at.is_some_and(|started| {
+                now.saturating_duration_since(started)
+                    >= Duration::from_secs(
+                        entry.profile.carrier_negotiation_deadlines_secs[deadline_index],
+                    )
+            }) {
+                return Err(ManagerError::Protocol);
+            }
             let old_session = entry.session.clone().ok_or(ManagerError::Authentication)?;
             let replacement = Replacement {
                 profile: Arc::clone(&entry.profile),
@@ -113,6 +173,9 @@ impl WebProcessRuntime {
                 carrier,
                 request: carrier_request,
                 scores: entry.carrier_scores,
+                learning_epoch: entry.carrier_learning_epoch,
+                ip_learning_eligible,
+                carrier_deadline_at: entry.carrier_deadline_at.ok_or(ManagerError::Protocol)?,
             };
             state
                 .bootstraps
@@ -120,12 +183,7 @@ impl WebProcessRuntime {
                 .ok_or(ManagerError::Authentication)?
                 .carrier_transitioning = true;
             drop(state);
-            return self.replace_session(
-                bootstrap_hash,
-                client_ip,
-                replacement,
-                &config.web.timeouts,
-            );
+            return self.replace_session(bootstrap_hash, client_ip, replacement);
         }
 
         if (carrier_request.is_automatic() && carrier_request.attempt() != Some(1))
@@ -149,15 +207,44 @@ impl WebProcessRuntime {
         if carrier_request.is_automatic() && !profile.carrier_negotiation_enabled {
             return Err(ManagerError::Protocol);
         }
-        let (candidates, scores) = if carrier_request.is_automatic() && profile.carrier_learning {
-            self.learning.lock().rank(
-                now,
-                &profile.carriers,
-                carrier_request,
-                profile_key,
-                client_ip,
-            )
-        } else if carrier_request.is_automatic() {
+        let capability_selection = carrier_request.uses_capabilities()
+            && profile.carrier_negotiation_enabled;
+        let learning_policy = (
+            config.web.carrier_negotiation_enabled() && config.web.carrier_learning,
+            config.web.carrier_negotiation_aggressiveness,
+            Duration::from_secs(config.web.timeouts.carrier_learning_secs),
+        );
+        let (candidates, scores, learning_epoch) = if capability_selection
+            && profile.carrier_learning
+        {
+            let learning = self.learning.lock();
+            if let Some(epoch) = learning.epoch_for_policy(
+                learning_policy.0,
+                learning_policy.1,
+                learning_policy.2,
+            ) {
+                let (candidates, scores) = learning.rank(
+                    now,
+                    &profile.carriers,
+                    carrier_request,
+                    profile_key,
+                    client_ip,
+                    ip_learning_eligible,
+                );
+                (candidates, scores, Some(epoch))
+            } else {
+                (
+                    profile
+                        .carriers
+                        .iter()
+                        .copied()
+                        .filter(|carrier| carrier_request.supports(*carrier))
+                        .collect(),
+                    [0; 4],
+                    None,
+                )
+            }
+        } else if capability_selection {
             (
                 profile
                     .carriers
@@ -166,9 +253,14 @@ impl WebProcessRuntime {
                     .filter(|carrier| carrier_request.supports(*carrier))
                     .collect(),
                 [0; 4],
+                None,
             )
+        } else if carrier_request.uses_capabilities()
+            && !carrier_request.supports(profile.carrier)
+        {
+            return Err(ManagerError::Protocol);
         } else {
-            (vec![profile.carrier], [0; 4])
+            (vec![profile.carrier], [0; 4], None)
         };
         let Some(carrier) = candidates.first().copied() else {
             return Err(ManagerError::Protocol);
@@ -180,12 +272,16 @@ impl WebProcessRuntime {
             self.limit_hits.fetch_add(1, Ordering::Relaxed);
             return Err(ManagerError::Limit);
         };
-        let learning_context = (carrier_request.is_automatic() && profile.carrier_learning)
-            .then_some(CarrierLearningContext {
+        let carrier_deadline_at = carrier_request.is_automatic().then_some(
+            now + Duration::from_secs(profile.carrier_negotiation_deadlines_secs[3]),
+        );
+        let learning_context = learning_epoch.map(|epoch| CarrierLearningContext {
                 profile_key,
                 client_ip,
                 class: carrier_request.class(),
                 user_agent_hash: carrier_request.user_agent_hash(),
+                epoch,
+                ip_learning_eligible,
             });
         let session = WebSession::new(
             Arc::downgrade(self),
@@ -197,7 +293,10 @@ impl WebProcessRuntime {
             carrier,
             1,
             bootstrap_hash,
+            carrier_deadline_at,
+            carrier_request.class(),
             learning_context,
+            carrier_request.is_automatic(),
             self.limits.clone(),
             config.web.timeouts.clone(),
         );
@@ -216,8 +315,16 @@ impl WebProcessRuntime {
         entry.carrier_candidates = candidates.into();
         entry.carrier_scores = scores;
         entry.carrier_attempt = 1;
+        entry.carrier_phase = CarrierChainPhase::Provisional;
+        entry.carrier_started_at = carrier_request.is_automatic().then_some(now);
+        entry.carrier_deadline_at = carrier_deadline_at;
+        entry.carrier_failures = [None; 3];
+        entry.carrier_learning_epoch = learning_epoch.unwrap_or(0);
+        entry.expires_at = now + Duration::from_secs(config.web.timeouts.bootstrap_lifetime_secs);
         entry.session_client_ip = Some(client_ip);
+        entry.session_ip_learning_eligible = ip_learning_eligible;
         let issuance_ip = entry.issuance_ip;
+        let candidate_count = u8::try_from(entry.carrier_candidates.len()).unwrap_or(4);
         decrement_map(&mut state.bootstraps_per_ip, &issuance_ip);
         self.sessions_created.fetch_add(1, Ordering::Relaxed);
         let identity = session.trace_identity();
@@ -225,6 +332,15 @@ impl WebProcessRuntime {
             token: session_token,
             carrier,
             attempt: carrier_request.attempt(),
+            candidate_count: carrier_request
+                .is_automatic()
+                .then_some(candidate_count),
+            deadline_secs: carrier_request
+                .is_automatic()
+                .then_some(profile.carrier_negotiation_deadlines_secs[3]),
+            carrier_state: carrier_request
+                .is_automatic()
+                .then_some(CarrierChainPhase::Provisional.as_str()),
         };
         drop(state);
         self.trace.record_carrier_lifecycle(
@@ -263,11 +379,15 @@ impl WebProcessRuntime {
         bootstrap_hash: TokenHash,
         client_ip: IpAddr,
         replacement: Replacement,
-        timeouts: &WebTimeoutsConfig,
     ) -> std::result::Result<CreateResult, ManagerError> {
         if !replacement.old_session.begin_carrier_supersede() {
+            let committed = replacement.old_session.is_carrier_committed();
             self.cancel_replacement(bootstrap_hash, &replacement.old_session);
-            return Err(ManagerError::Protocol);
+            return Err(if committed {
+                ManagerError::Committed
+            } else {
+                ManagerError::Closed
+            });
         }
         let generation = self.active_generation();
         let config = generation.config();
@@ -276,7 +396,10 @@ impl WebProcessRuntime {
         remove_expired_locked(&mut state, now);
         let valid = state.bootstraps.get(&bootstrap_hash).is_some_and(|entry| {
             entry.carrier_transitioning
+                && entry.carrier_phase == CarrierChainPhase::Provisional
+                && !entry.close_requested
                 && entry.carrier_attempt.saturating_add(1) == replacement.attempt
+                && now < replacement.carrier_deadline_at
                 && entry
                     .session
                     .as_ref()
@@ -302,14 +425,16 @@ impl WebProcessRuntime {
             self.cancel_replacement(bootstrap_hash, &replacement.old_session);
             return Err(ManagerError::Limit);
         };
-        let learning_context = replacement.profile.carrier_learning.then_some(
-            CarrierLearningContext {
+        let learning_context = (replacement.profile.carrier_learning
+            && replacement.learning_epoch != 0)
+            .then_some(CarrierLearningContext {
                 profile_key: replacement.profile_key,
                 client_ip,
                 class: replacement.request.class(),
                 user_agent_hash: replacement.request.user_agent_hash(),
-            },
-        );
+                epoch: replacement.learning_epoch,
+                ip_learning_eligible: replacement.ip_learning_eligible,
+            });
         let session = WebSession::new(
             Arc::downgrade(self),
             session_hash,
@@ -320,10 +445,19 @@ impl WebProcessRuntime {
             replacement.carrier,
             replacement.attempt,
             bootstrap_hash,
+            Some(replacement.carrier_deadline_at),
+            replacement.request.class(),
             learning_context,
+            true,
             self.limits.clone(),
-            timeouts.clone(),
+            replacement.old_session.timeouts().clone(),
         );
+        let Some(supersede) = replacement.old_session.prepare_carrier_supersede() else {
+            drop(state);
+            self.cancel_replacement(bootstrap_hash, &replacement.old_session);
+            session.close();
+            return Err(ManagerError::Closed);
+        };
         let old_hash = replacement.old_session.token_hash();
         state.sessions.remove(&old_hash);
         remember_closed_token_locked(
@@ -343,23 +477,29 @@ impl WebProcessRuntime {
         entry.carrier_request = Some(replacement.request);
         entry.carrier_attempt = replacement.attempt;
         entry.carrier_transitioning = false;
-        entry.carrier_committed = false;
+        entry.carrier_phase = CarrierChainPhase::Provisional;
+        if let Some(slot) = entry
+            .carrier_failures
+            .get_mut(usize::from(replacement.attempt.saturating_sub(2)))
+        {
+            *slot = Some(replacement.old_session.carrier());
+        }
         self.sessions_created.fetch_add(1, Ordering::Relaxed);
         self.sessions_closed.fetch_add(1, Ordering::Relaxed);
         let result = CreateResult {
             token: session_token,
             carrier: replacement.carrier,
             attempt: Some(replacement.attempt),
+            candidate_count: Some(
+                u8::try_from(entry.carrier_candidates.len()).unwrap_or(4),
+            ),
+            deadline_secs: Some(entry.profile.carrier_negotiation_deadlines_secs[3]),
+            carrier_state: Some(CarrierChainPhase::Provisional.as_str()),
         };
         let identity = session.trace_identity();
         let old_identity = replacement.old_session.trace_identity();
         drop(state);
-        if replacement.old_session.finish_carrier_supersede() {
-            session.close();
-        }
-        if let Some(context) = learning_context {
-            self.record_carrier_outcome(context, replacement.old_session.carrier(), false);
-        }
+        supersede.finish();
         self.trace.record_carrier_lifecycle(
             client_ip,
             old_identity.clone(),
@@ -401,107 +541,4 @@ impl WebProcessRuntime {
         Ok(result)
     }
 
-    fn cancel_replacement(&self, bootstrap_hash: TokenHash, old_session: &Arc<WebSession>) {
-        old_session.cancel_carrier_supersede();
-        let mut state = self.state.lock();
-        if let Some(entry) = state.bootstraps.get_mut(&bootstrap_hash)
-            && entry
-                .session
-                .as_ref()
-                .is_some_and(|session| Arc::ptr_eq(session, old_session))
-        {
-            entry.carrier_transitioning = false;
-        }
-    }
-
-    /// Commits learning only after one accepted OPEN or DATA batch.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn carrier_committed(
-        &self,
-        bootstrap_hash: TokenHash,
-        session_hash: TokenHash,
-        attempt: u8,
-        carrier: WebCarrier,
-        learning_context: Option<CarrierLearningContext>,
-        client_ip: IpAddr,
-        identity: TraceIdentity,
-    ) {
-        let mut state = self.state.lock();
-        let scores = state.bootstraps.get_mut(&bootstrap_hash).and_then(|entry| {
-            if entry.carrier_attempt == attempt
-                && entry
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.token_hash() == session_hash)
-            {
-                entry.carrier_committed = true;
-                Some(entry.carrier_scores)
-            } else {
-                None
-            }
-        });
-        drop(state);
-        let Some(scores) = scores else { return };
-        if let Some(context) = learning_context {
-            self.record_carrier_outcome(context, carrier, true);
-        }
-        self.trace.record_carrier_lifecycle(
-            client_ip,
-            identity,
-            TraceLifecycleEvent::CarrierCommitted,
-            learning_context
-                .map_or("legacy", |context| context.class.as_str()),
-            carrier,
-            attempt,
-            scores,
-            None,
-        );
-    }
-
-    fn record_carrier_outcome(
-        &self,
-        context: CarrierLearningContext,
-        carrier: WebCarrier,
-        success: bool,
-    ) {
-        let generation = self.active_generation();
-        if !generation.config().web.carrier_learning {
-            return;
-        }
-        let lifetime = Duration::from_secs(
-            generation.config().web.timeouts.carrier_learning_secs,
-        );
-        self.learning
-            .lock()
-            .record(Instant::now(), lifetime, context, carrier, success);
-    }
-}
-
-fn admit_initial(
-    runtime: &WebProcessRuntime,
-    state: &mut ManagerState,
-    now: Instant,
-    client_ip: IpAddr,
-    profile_key: super::ProfileKey,
-    profile: &WebRuntimeProfile,
-) -> bool {
-    let admitted = state.sessions.len() < runtime.limits.max_sessions_global
-        && state.sessions_per_ip.get(&client_ip).copied().unwrap_or(0)
-            < runtime.limits.max_sessions_per_ip
-        && state
-            .sessions_per_profile
-            .get(&profile_key)
-            .copied()
-            .unwrap_or(0)
-            < profile.max_sessions
-        && allow_rate(
-            &mut state.session_rate,
-            now,
-            runtime.limits.new_sessions_per_minute,
-            runtime.limits.new_sessions_burst,
-        );
-    if !admitted {
-        runtime.limit_hits.fetch_add(1, Ordering::Relaxed);
-    }
-    admitted
 }

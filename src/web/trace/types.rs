@@ -236,8 +236,10 @@ pub(crate) enum TraceLifecycleEvent {
     CarrierFailed,
     /// An uncommitted carrier session was atomically superseded.
     CarrierSuperseded,
-    /// The first OPEN or DATA batch made a carrier immutable.
+    /// Bidirectional carrier evidence made replacement unsafe.
     CarrierCommitted,
+    /// A committed carrier survived its configured health interval.
+    CarrierHealthy,
     /// A new session was created.
     SessionCreated,
     /// An idempotent session creation was replayed.
@@ -279,6 +281,7 @@ impl TraceLifecycleEvent {
             Self::CarrierFailed => "carrier_failed",
             Self::CarrierSuperseded => "carrier_superseded",
             Self::CarrierCommitted => "carrier_committed",
+            Self::CarrierHealthy => "carrier_healthy",
             Self::SessionCreated => "session_created",
             Self::SessionReplayed => "session_replayed",
             Self::SessionRejected => "session_rejected",

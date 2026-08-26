@@ -128,6 +128,9 @@ fn test_runtime_with_dc(
         1,
         [9; 32],
         None,
+        crate::web::manager::CarrierClientClass::Legacy,
+        None,
+        false,
         limits,
         timeouts,
     );

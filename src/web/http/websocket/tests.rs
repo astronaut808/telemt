@@ -160,6 +160,7 @@ fn create_automatic_session(
                 None,
                 [9; 32],
             ),
+            false,
         )
         .unwrap()
         .token;
@@ -194,6 +195,7 @@ fn create_session(runtime: &Arc<WebProcessRuntime>) -> (String, TokenHash) {
             client_ip,
             &hello,
             CarrierRequest::legacy([0; 32]),
+            false,
         )
         .unwrap()
         .token;
@@ -382,7 +384,7 @@ async fn malformed_websocket_lane_closes_only_that_lane() {
 }
 
 #[tokio::test]
-async fn automatic_websocket_carriers_ack_the_first_committing_message() {
+async fn automatic_websocket_carriers_commit_after_acknowledged_peer_progress() {
     for carrier in [WebCarrier::Websocket, WebCarrier::WebsocketLanes] {
         let live = live_negotiation_runtime(carrier, Arc::from([carrier]));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -403,6 +405,34 @@ async fn automatic_websocket_carriers_ack_the_first_committing_message() {
             .unwrap()
             .unwrap();
         assert_eq!(acknowledgement, Message::Binary(Bytes::new()));
+        assert!(
+            live.runtime
+                .get_session(session_hash, "proxy.example.com")
+                .unwrap()
+                .is_carrier_committed()
+        );
+        socket
+            .send(Message::Binary(frame::encode(
+                FrameType::Window,
+                7,
+                &frame::window_payload(1),
+            )))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Ping(Bytes::from_static(b"commit")))
+            .await
+            .unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if message == Message::Pong(Bytes::from_static(b"commit")) {
+                break;
+            }
+        }
         assert!(
             live.runtime
                 .get_session(session_hash, "proxy.example.com")
@@ -448,6 +478,7 @@ async fn failed_automatic_multiplex_socket_remains_supersedable() {
                 Some(CarrierFailure::Upgrade),
                 [9; 32],
             ),
+            false,
         )
         .unwrap();
     assert_eq!(replacement.carrier, WebCarrier::Https);

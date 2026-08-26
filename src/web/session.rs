@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebTimeoutsConfig};
 use crate::web::frame::{self, FrameType};
-use crate::web::manager::{ProfileKey, TokenHash, WebProcessRuntime};
-use crate::web::manager::CarrierLearningContext;
+use crate::web::manager::{
+    CarrierClientClass, CarrierLearningContext, ProfileKey, TokenHash, WebProcessRuntime,
+};
 
 // Backend tasks own generation admission and authenticated MTProxy relay lifetimes.
 mod backend;
@@ -25,9 +26,16 @@ mod downlink;
 mod resident;
 // Lane carrier state isolates request sequencing and downlink replay per logical stream.
 mod lanes;
+// Lane batch staging transfers queue ownership without escaping process budgets.
+mod lane_downlink;
+// Lane uplink creation remains transactional across validation and queue reservations.
+mod lane_uplink;
 // WebSocket carrier state owns pre-OPEN lane reservations and failure isolation.
 mod websocket;
 pub(crate) use websocket::WebSocketLaneReservation;
+pub(crate) use websocket::WebSocketProbeReservation;
+// Carrier commit and health evidence share one session-locked state machine.
+mod negotiation;
 // Session closure and carrier-attempt transitions share one cancellation boundary.
 mod lifecycle;
 // Uplink batches own exactly-once sequencing and client-frame validation.
@@ -80,6 +88,7 @@ struct DownBatch {
     data_items: usize,
     control_bytes: usize,
     control_items: usize,
+    carrier_health_eligible: bool,
 }
 
 struct CarrierLane {
@@ -142,6 +151,16 @@ struct SessionState {
     pending_control_items: usize,
     last_activity: Instant,
     negotiation_phase: SessionNegotiationPhase,
+    carrier_health_due_at: Option<Instant>,
+    carrier_health_activity_at: Option<Instant>,
+    carrier_health_uplink: bool,
+    carrier_health_downlink: bool,
+    carrier_health_reported: bool,
+    websocket_carrier_active: bool,
+    websocket_commit_ack_pending: bool,
+    websocket_commit_ack_owner: Option<u64>,
+    websocket_commit_ack_written: bool,
+    websocket_probe_claimed: bool,
     close_requested: bool,
     closed: bool,
 }
@@ -165,7 +184,10 @@ pub(crate) struct WebSession {
     selected_carrier: WebCarrier,
     carrier_attempt: u8,
     bootstrap_hash: TokenHash,
+    carrier_deadline_at: Option<Instant>,
+    carrier_class: CarrierClientClass,
     learning_context: Option<CarrierLearningContext>,
+    automatic_carrier: bool,
     limits: WebLimitsConfig,
     timeouts: WebTimeoutsConfig,
     state: Mutex<SessionState>,
@@ -202,7 +224,10 @@ impl WebSession {
         selected_carrier: WebCarrier,
         carrier_attempt: u8,
         bootstrap_hash: TokenHash,
+        carrier_deadline_at: Option<Instant>,
+        carrier_class: CarrierClientClass,
         learning_context: Option<CarrierLearningContext>,
+        automatic_carrier: bool,
         limits: WebLimitsConfig,
         timeouts: WebTimeoutsConfig,
     ) -> Arc<Self> {
@@ -222,7 +247,10 @@ impl WebSession {
             selected_carrier,
             carrier_attempt,
             bootstrap_hash,
+            carrier_deadline_at,
+            carrier_class,
             learning_context,
+            automatic_carrier,
             limits,
             timeouts,
             state: Mutex::new(SessionState {
@@ -249,6 +277,16 @@ impl WebSession {
                 pending_control_items: 0,
                 last_activity: Instant::now(),
                 negotiation_phase: SessionNegotiationPhase::Uncommitted,
+                carrier_health_due_at: None,
+                carrier_health_activity_at: None,
+                carrier_health_uplink: false,
+                carrier_health_downlink: false,
+                carrier_health_reported: false,
+                websocket_carrier_active: false,
+                websocket_commit_ack_pending: false,
+                websocket_commit_ack_owner: None,
+                websocket_commit_ack_written: false,
+                websocket_probe_claimed: false,
                 close_requested: false,
                 closed: false,
             }),
@@ -293,11 +331,6 @@ impl WebSession {
         self.cancel.child_token()
     }
 
-    /// Returns whether accepted carrier progress made this attempt immutable.
-    pub(crate) fn is_carrier_committed(&self) -> bool {
-        self.state.lock().negotiation_phase == SessionNegotiationPhase::Committed
-    }
-
     /// Returns a cloned non-secret identity only for enabled debug capture.
     pub(crate) fn trace_identity(&self) -> crate::web::trace::TraceIdentity {
         crate::web::trace::TraceIdentity::from_profile(self.trace_session_id, &self.profile)
@@ -322,45 +355,14 @@ impl WebSession {
         }
     }
 
-    fn ensure_carrier_active_locked(
-        &self,
-        state: &SessionState,
-    ) -> Result<(), crate::web::manager::ManagerError> {
-        match state.negotiation_phase {
-            SessionNegotiationPhase::Uncommitted | SessionNegotiationPhase::Committed => Ok(()),
-            SessionNegotiationPhase::Replacing | SessionNegotiationPhase::Superseded => {
-                Err(crate::web::manager::ManagerError::Closed)
-            }
-        }
+    /// Returns the immutable limits frozen when this carrier chain was created.
+    pub(crate) fn limits(&self) -> &WebLimitsConfig {
+        &self.limits
     }
 
-    fn commit_carrier_locked(&self, state: &mut SessionState, progress: bool) -> bool {
-        if !progress {
-            return false;
-        }
-        match state.negotiation_phase {
-            SessionNegotiationPhase::Uncommitted => {
-                state.negotiation_phase = SessionNegotiationPhase::Committed;
-                true
-            }
-            SessionNegotiationPhase::Committed
-            | SessionNegotiationPhase::Replacing
-            | SessionNegotiationPhase::Superseded => false,
-        }
-    }
-
-    fn finish_carrier_commit(&self) {
-        if let Some(manager) = self.manager.upgrade() {
-            manager.carrier_committed(
-                self.bootstrap_hash,
-                self.token_hash,
-                self.carrier_attempt,
-                self.selected_carrier,
-                self.learning_context,
-                self.client_ip,
-                self.trace_identity(),
-            );
-        }
+    /// Returns the immutable timeouts frozen when this carrier chain was created.
+    pub(crate) fn timeouts(&self) -> &WebTimeoutsConfig {
+        &self.timeouts
     }
 
     /// Polls client-to-server bytes and returns consumed flow-control credit.
@@ -431,6 +433,13 @@ impl WebSession {
             .len()
             .min(frame::DATA_CHUNK_BYTES)
             .min(self.limits.max_frame_payload_bytes)
+            .min(if self.carrier().uses_lanes() {
+                self.limits
+                    .pending_bytes_per_lane
+                    .saturating_sub(frame::HEADER_BYTES + QUEUE_ITEM_COST)
+            } else {
+                usize::MAX
+            })
             .min(stream_state.send_credit as usize);
         if count == 0 {
             stream_state.write_waker = Some(cx.waker().clone());

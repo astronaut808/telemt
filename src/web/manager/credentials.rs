@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use super::state::{
-    Bootstrap, allow_rate, evict_oldest_unused_bootstrap, matching_profile, new_unique_token,
-    remove_expired_locked,
+    Bootstrap, CarrierChainPhase, allow_rate, evict_oldest_unused_bootstrap, matching_profile,
+    new_unique_token, remove_expired_locked,
 };
 use super::{BootstrapResult, ManagerError, TOKEN_BYTES, TokenHash, WebProcessRuntime};
 use crate::config::WebRuntimeProfile;
@@ -78,8 +78,14 @@ impl WebProcessRuntime {
                 carrier_scores: [0; 4],
                 carrier_attempt: 0,
                 carrier_transitioning: false,
-                carrier_committed: false,
+                carrier_phase: CarrierChainPhase::Provisional,
+                carrier_started_at: None,
+                carrier_deadline_at: None,
+                carrier_failures: [None; 3],
+                carrier_learning_epoch: 0,
+                close_requested: false,
                 session_client_ip: None,
+                session_ip_learning_eligible: false,
                 used: false,
             },
         );
@@ -140,12 +146,24 @@ impl WebProcessRuntime {
         hash: TokenHash,
         host: &str,
     ) -> std::result::Result<(), ManagerError> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         let session = state
             .sessions
             .get(&hash)
             .filter(|session| session.matches_host(host))
             .cloned();
+        if session.is_some() {
+            for bootstrap in state.bootstraps.values_mut() {
+                if bootstrap
+                    .session
+                    .as_ref()
+                    .is_some_and(|current| current.token_hash() == hash)
+                {
+                    bootstrap.close_requested = true;
+                    break;
+                }
+            }
+        }
         let closed = state
             .closed_tokens
             .get(&hash)

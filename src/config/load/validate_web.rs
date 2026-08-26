@@ -72,6 +72,9 @@ pub(super) fn validate(config: &mut ProxyConfig) -> Result<()> {
     validate_limits(&config.web.limits)?;
     debug::validate(&config.web.debug, &config.web.limits)?;
     let carriers = negotiation::validate(&config.web)?;
+    if carriers.contains(&WebCarrier::Https) && config.web.limits.max_http_handlers < 2 {
+        return config_error("WEB https candidates require web.limits.max_http_handlers >= 2");
+    }
     if carriers.contains(&WebCarrier::HttpsLanes) && config.web.limits.max_http_handlers < 4 {
         return config_error(
             "WEB https-lanes candidates require web.limits.max_http_handlers >= 4",
@@ -142,6 +145,11 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
     }
     if !(1..=MAX_WEB_TOMBSTONES_PER_SESSION).contains(&limits.max_tombstones_per_session) {
         return config_error("web.limits.max_tombstones_per_session must be within [1, 4096]");
+    }
+    if limits.pending_bytes_per_lane <= WEB_FRAME_HEADER_BYTES + WEB_QUEUE_ITEM_COST {
+        return config_error(
+            "web.limits.pending_bytes_per_lane must preserve one non-empty DATA frame",
+        );
     }
     if limits.carrier_batch_bytes > limits.max_body_bytes
         || limits.carrier_batch_bytes
@@ -248,6 +256,7 @@ fn validate_limits(limits: &WebLimitsConfig) -> Result<()> {
         || limits.max_bootstraps_per_ip > limits.max_bootstraps_global
         || limits.max_http_handlers > limits.max_http_connections
         || limits.max_body_readers > limits.max_http_handlers
+        || limits.max_lane_open_waits_per_session > limits.max_streams_per_session
         || limits.pending_bytes_per_session > limits.pending_bytes_global
         || limits.pending_items_per_session > limits.pending_items_global
         || limits.pending_bytes_per_lane > limits.pending_bytes_per_session

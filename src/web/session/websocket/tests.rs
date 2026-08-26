@@ -68,6 +68,9 @@ fn runtime(admission: bool) -> TestRuntime {
         1,
         [9; 32],
         None,
+        crate::web::manager::CarrierClientClass::Legacy,
+        None,
+        false,
         limits,
         timeouts,
     );

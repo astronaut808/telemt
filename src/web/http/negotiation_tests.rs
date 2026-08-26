@@ -1,5 +1,7 @@
 use super::*;
 
+use std::time::Duration;
+
 use sha2::{Digest, Sha256};
 
 const CAPABILITIES: &str = "https,https-lanes,websocket,websocket-lanes";
@@ -95,7 +97,7 @@ async fn absent_carriers_reject_negotiation_and_preserve_legacy_creation() {
 #[tokio::test]
 async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
     let capability = [42; 32];
-    let config = negotiation_runtime_config(
+    let mut config = negotiation_runtime_config(
         capability,
         WebCarrier::Websocket,
         false,
@@ -105,6 +107,7 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
             WebCarrier::Websocket,
         ]),
     );
+    config.web.timeouts.long_poll_secs = 1;
     let generation = test_runtime_generation(1, config);
     let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,6 +124,8 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
     let replay = request(&listener, &runtime, first_request).await;
     let (replay_headers, _) = split_response(&replay);
     assert_eq!(response_header(replay_headers, "x-session-token"), first_token);
+    assert_eq!(response_header(replay_headers, "x-carrier-candidate-count"), "3");
+    assert_eq!(response_header(replay_headers, "x-carrier-state"), "provisional");
 
     let second_request = create_request(&bootstrap, &hello, Some(2), Some("timeout"));
     let second = request(&listener, &runtime, second_request.clone()).await;
@@ -140,20 +145,59 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
 
     let second_replay = request(&listener, &runtime, second_request).await;
     let (second_replay_headers, _) = split_response(&second_replay);
-    assert_eq!(
-        response_header(second_replay_headers, "x-session-token"),
-        second_token
-    );
+    for header in [
+        "x-session-token",
+        "x-carrier-mode",
+        "x-carrier-attempt",
+        "x-carrier-candidate-count",
+        "x-carrier-deadline",
+        "x-carrier-state",
+    ] {
+        assert_eq!(
+            response_header(second_replay_headers, header),
+            response_header(second_headers, header),
+        );
+    }
+
+    let changed_failure = request(
+        &listener,
+        &runtime,
+        create_request(&bootstrap, &hello, Some(2), Some("network")),
+    )
+    .await;
+    let (changed_failure_headers, _) = split_response(&changed_failure);
+    assert!(optional_response_header(changed_failure_headers, "x-session-token").is_none());
 
     let open = frame::encode(FrameType::Open, 7, &[]);
+    let data = frame::encode(FrameType::Data, 7, &[0]);
+    let mut body = Vec::with_capacity(open.len() + data.len());
+    body.extend_from_slice(&open);
+    body.extend_from_slice(&data);
     let mut uplink = format!(
         "POST /api/v1/up HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {second_token}\r\nContent-Type: application/octet-stream\r\nX-Up-Seq: 1\r\nX-Lane-ID: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        open.len()
+        body.len()
     )
     .into_bytes();
-    uplink.extend_from_slice(&open);
-    let committed = request(&listener, &runtime, uplink).await;
-    assert!(committed.starts_with(b"HTTP/1.1 204"));
+    uplink.extend_from_slice(&body);
+    let accepted = request(&listener, &runtime, uplink).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 204"));
+
+    let first_down = format!(
+        "POST /api/v1/down HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {second_token}\r\nX-Down-Cursor: 0\r\nX-Lane-ID: 7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let first_down = request(&listener, &runtime, first_down).await;
+    let (first_down_headers, first_down_body) = split_response(&first_down);
+    assert!(first_down_headers.starts_with(b"HTTP/1.1 200"));
+    assert!(!first_down_body.is_empty());
+    assert_eq!(response_header(first_down_headers, "x-down-cursor"), "1");
+
+    let acknowledgement = format!(
+        "POST /api/v1/down HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {second_token}\r\nX-Down-Cursor: 1\r\nX-Lane-ID: 7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let acknowledgement = request(&listener, &runtime, acknowledgement).await;
+    assert!(acknowledgement.starts_with(b"HTTP/1.1 204"));
 
     let third = request(
         &listener,
@@ -162,13 +206,85 @@ async fn negotiation_replays_replaces_and_freezes_after_carrier_commit() {
     )
     .await;
     let (third_headers, _) = split_response(&third);
+    assert!(third_headers.starts_with(b"HTTP/1.1 409"));
     assert!(optional_response_header(third_headers, "x-session-token").is_none());
+    assert_eq!(response_header(third_headers, "x-carrier-mode"), "https-lanes");
+    assert_eq!(response_header(third_headers, "x-carrier-attempt"), "2");
+    assert_eq!(response_header(third_headers, "x-carrier-candidate-count"), "3");
+    assert_eq!(response_header(third_headers, "x-carrier-deadline"), "12");
+    assert_eq!(response_header(third_headers, "x-carrier-state"), "committed");
     assert!(
         runtime
             .get_session(token_hash(&second_token), "proxy.example.com")
             .unwrap()
             .is_carrier_committed()
     );
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn https_lane_downlink_can_arrive_before_its_uplink_open() {
+    let capability = [43; 32];
+    let mut config = negotiation_runtime_config(
+        capability,
+        WebCarrier::HttpsLanes,
+        false,
+        Arc::from([WebCarrier::HttpsLanes]),
+    );
+    config.web.timeouts.lane_open_wait_secs = 1;
+    config.web.timeouts.long_poll_secs = 2;
+    let generation = test_runtime_generation(1, config);
+    let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(Arc::clone(&generation))));
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let bootstrap = issue_bootstrap(&runtime, "192.0.2.10");
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+    let created = request(
+        &listener,
+        &runtime,
+        create_request(&bootstrap, &hello, Some(1), None),
+    )
+    .await;
+    let (created_headers, _) = split_response(&created);
+    let token = response_header(created_headers, "x-session-token").to_string();
+
+    let down_request = format!(
+        "POST /api/v1/down HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {token}\r\nX-Down-Cursor: 0\r\nX-Lane-ID: 7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let down_listener = Arc::clone(&listener);
+    let down_runtime = Arc::clone(&runtime);
+    let down = tokio::spawn(async move {
+        request(&down_listener, &down_runtime, down_request).await
+    });
+    tokio::task::yield_now().await;
+
+    let open = frame::encode(FrameType::Open, 7, &[]);
+    let data = frame::encode(FrameType::Data, 7, &[1]);
+    let mut body = Vec::with_capacity(open.len() + data.len());
+    body.extend_from_slice(&open);
+    body.extend_from_slice(&data);
+    let mut uplink = format!(
+        "POST /api/v1/up HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {token}\r\nContent-Type: application/octet-stream\r\nX-Up-Seq: 1\r\nX-Lane-ID: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    uplink.extend_from_slice(&body);
+    let accepted = request(&listener, &runtime, uplink).await;
+    assert!(accepted.starts_with(b"HTTP/1.1 204"));
+
+    let down = tokio::time::timeout(Duration::from_secs(3), down)
+        .await
+        .unwrap()
+        .unwrap();
+    let (down_headers, _) = split_response(&down);
+    assert!(
+        down_headers.starts_with(b"HTTP/1.1 200")
+            || down_headers.starts_with(b"HTTP/1.1 204")
+    );
+    assert!(optional_response_header(down_headers, "x-down-cursor").is_some());
 
     runtime.shutdown().await;
     generation.stop_sessions().await;

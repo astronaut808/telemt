@@ -10,6 +10,20 @@ struct ReleasedQueues {
     control_items: usize,
 }
 
+/// Deferred queue release after manager publication linearizes a supersede.
+#[must_use]
+pub(crate) struct CarrierSupersedeCompletion<'a> {
+    session: &'a WebSession,
+    released: ReleasedQueues,
+}
+
+impl CarrierSupersedeCompletion<'_> {
+    /// Releases process budgets and signals cancellation after manager locks are dropped.
+    pub(crate) fn finish(self) {
+        self.session.finish_close(self.released, true);
+    }
+}
+
 impl WebSession {
     /// Closes carrier state while relay tasks retain their admission until exit.
     pub(crate) fn close(&self) {
@@ -50,14 +64,13 @@ impl WebSession {
         }
     }
 
-    /// Completes manager-owned replacement without unregistering the old session twice.
-    pub(crate) fn finish_carrier_supersede(&self) -> bool {
-        let close_requested = self.state.lock().close_requested;
-        let Some(released) = self.begin_close(true, None) else {
-            return close_requested;
-        };
-        self.finish_close(released, true);
-        close_requested
+    /// Linearizes manager publication against close requests on the old token.
+    pub(crate) fn prepare_carrier_supersede(&self) -> Option<CarrierSupersedeCompletion<'_>> {
+        let released = self.begin_close(true, None)?;
+        Some(CarrierSupersedeCompletion {
+            session: self,
+            released,
+        })
     }
 
     /// Waits for all logical-stream tasks after admission has closed.
@@ -73,6 +86,13 @@ impl WebSession {
 
     /// Atomically closes a session only when reconnect grace is still due.
     pub(crate) fn close_if_due(&self, now: Instant) -> bool {
+        let healthy = {
+            let mut state = self.state.lock();
+            self.carrier_health_ready_locked(&mut state, now)
+        };
+        if healthy {
+            self.finish_carrier_health();
+        }
         let Some(released) = self.begin_close(false, Some(now)) else {
             return false;
         };
@@ -82,7 +102,11 @@ impl WebSession {
 
     fn begin_close(&self, superseded: bool, idle_now: Option<Instant>) -> Option<ReleasedQueues> {
         let mut state = self.state.lock();
-        if state.closed || (superseded && state.negotiation_phase != SessionNegotiationPhase::Replacing) {
+        if state.closed
+            || (superseded
+                && (state.negotiation_phase != SessionNegotiationPhase::Replacing
+                    || state.close_requested))
+        {
             return None;
         }
         if let Some(now) = idle_now
@@ -111,10 +135,37 @@ impl WebSession {
         state.streams.clear();
         state.pending_frames.clear();
         state.pending_windows.clear();
-        state.unacked = None;
-        for lane in state.carrier_lanes.values() {
-            lane.notify.notify_waiters();
+        if let Some(batch) = state.unacked.take() {
+            batch.lease.detach();
+            self.release_local_locked(&mut state, batch.data_bytes, batch.data_items, false);
+            self.release_local_locked(
+                &mut state,
+                batch.control_bytes,
+                batch.control_items,
+                true,
+            );
         }
+        let mut lane_data_bytes = 0usize;
+        let mut lane_data_items = 0usize;
+        let mut lane_control_bytes = 0usize;
+        let mut lane_control_items = 0usize;
+        for lane in state.carrier_lanes.values_mut() {
+            lane.notify.notify_waiters();
+            if let Some(batch) = lane.unacked.take() {
+                batch.lease.detach();
+                lane_data_bytes = lane_data_bytes.saturating_add(batch.data_bytes);
+                lane_data_items = lane_data_items.saturating_add(batch.data_items);
+                lane_control_bytes = lane_control_bytes.saturating_add(batch.control_bytes);
+                lane_control_items = lane_control_items.saturating_add(batch.control_items);
+            }
+        }
+        self.release_local_locked(&mut state, lane_data_bytes, lane_data_items, false);
+        self.release_local_locked(
+            &mut state,
+            lane_control_bytes,
+            lane_control_items,
+            true,
+        );
         state.carrier_lanes.clear();
         let control_bytes = state.pending_control_bytes;
         let control_items = state.pending_control_items;
@@ -136,6 +187,9 @@ impl WebSession {
         self.cancel.cancel();
         if self.carrier().is_multiplexed() {
             self.down_notify.notify_waiters();
+        }
+        if self.carrier().uses_lanes() {
+            self.lane_open_notify.notify_waiters();
         }
         if let Some(manager) = self.manager.upgrade() {
             manager.release_pending(

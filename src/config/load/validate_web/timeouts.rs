@@ -30,8 +30,27 @@ pub(super) fn validate(timeouts: &WebTimeoutsConfig) -> Result<()> {
     {
         return config_error(&format!("web.timeouts.{field} must be within [1, 3600]"));
     }
-    if timeouts.carrier_learning_secs == 0 {
-        return config_error("web.timeouts.carrier_learning_secs must be > 0");
+    if !(2..=86_400).contains(&timeouts.carrier_learning_secs) {
+        return config_error("web.timeouts.carrier_learning_secs must be within [2, 86400]");
+    }
+    if timeouts.stream_first_byte_secs > 300 {
+        return config_error("web.timeouts.stream_first_byte_secs must be within [1, 300]");
+    }
+    if timeouts.websocket_upgrade_secs > 60 {
+        return config_error("web.timeouts.websocket_upgrade_secs must be within [1, 60]");
+    }
+    if timeouts.websocket_open_secs > 300 {
+        return config_error("web.timeouts.websocket_open_secs must be within [1, 300]");
+    }
+    if timeouts.lane_open_wait_secs > timeouts.long_poll_secs {
+        return config_error(
+            "web.timeouts.lane_open_wait_secs must not exceed long_poll_secs",
+        );
+    }
+    if timeouts.carrier_health_secs > timeouts.reconnect_grace_secs {
+        return config_error(
+            "web.timeouts.carrier_health_secs must not exceed reconnect_grace_secs",
+        );
     }
     let request_deadline = timeouts
         .header_secs

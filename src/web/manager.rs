@@ -19,11 +19,16 @@ mod state;
 // Carrier attempt metadata remains explicit and independent from HTTP parsing.
 mod negotiation;
 // Bounded process-local carrier evidence is isolated from session registries.
+#[path = "manager/carrier_learning.rs"]
 mod learning;
 // Bootstrap credentials and idempotent session creation are isolated from queue accounting.
 mod credentials;
 // First-session admission and bounded carrier replacement share one state machine.
 mod session_creation;
+// Session admission remains separate from stream tuple ownership.
+mod session_admission;
+// Carrier commit, health, and conflict echoes share one outcome publication path.
+mod carrier_outcome;
 // Stream admission and synthetic tuple ownership are process-scoped.
 mod admission;
 // Shutdown and expiry work remain outside request-path coordination.
@@ -34,7 +39,7 @@ mod budget;
 mod websocket;
 pub(crate) use budget::WebSocketBudgetLease;
 use budget::{WebDataBudget, WebSocketBudgetClass};
-use state::ManagerState;
+use state::{ManagerState, StreamAdmissionState};
 pub(crate) use negotiation::{
     CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierLearningContext, CarrierRequest,
 };
@@ -61,6 +66,8 @@ pub(crate) enum ManagerError {
     Protocol,
     /// The operation conflicts with another in-flight operation.
     Concurrent,
+    /// An authenticated attempt chain is already committed.
+    Committed,
     /// The process or session has stopped accepting work.
     Closed,
 }
@@ -74,6 +81,7 @@ impl ManagerError {
             Self::Limit => "limit",
             Self::Protocol => "protocol",
             Self::Concurrent => "concurrent",
+            Self::Committed => "committed",
             Self::Closed => "closed",
         }
     }
@@ -87,6 +95,26 @@ pub(crate) struct CreateResult {
     pub(crate) carrier: WebCarrier,
     /// One-based carrier attempt echoed only for negotiated sessions.
     pub(crate) attempt: Option<u8>,
+    /// Effective frozen candidate count on the first automatic response.
+    pub(crate) candidate_count: Option<u8>,
+    /// Cumulative final chain deadline on the first automatic response.
+    pub(crate) deadline_secs: Option<u64>,
+    /// Actual attempt-chain phase echoed for automatic sessions.
+    pub(crate) carrier_state: Option<&'static str>,
+}
+
+/// Authenticated non-secret attempt-chain metadata returned with a conflict.
+pub(crate) struct CarrierEcho {
+    /// Carrier frozen into the current committed attempt.
+    pub(crate) carrier: WebCarrier,
+    /// One-based current attempt.
+    pub(crate) attempt: u8,
+    /// Frozen supported candidate count.
+    pub(crate) candidate_count: u8,
+    /// Frozen cumulative final deadline.
+    pub(crate) deadline_secs: u64,
+    /// Actual current chain phase.
+    pub(crate) state: &'static str,
 }
 
 /// Successful bridge bootstrap issuance result.
@@ -103,6 +131,7 @@ pub(crate) struct WebProcessRuntime {
     trace: Arc<WebTraceStore>,
     limits: WebLimitsConfig,
     state: Mutex<ManagerState>,
+    stream_admission: Mutex<StreamAdmissionState>,
     learning: Mutex<learning::CarrierLearning>,
     http_connections: Arc<Semaphore>,
     http_handlers: Arc<Semaphore>,
@@ -142,8 +171,16 @@ impl WebProcessRuntime {
         active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
         trace: Arc<WebTraceStore>,
     ) -> Arc<Self> {
-        let limits = active_runtime.load().config().web.limits.clone();
+        let config = active_runtime.load().config();
+        let limits = config.web.limits.clone();
         let learning_capacity = limits.max_carrier_learning_entries;
+        let mut carrier_learning = learning::CarrierLearning::new(learning_capacity);
+        let _ = carrier_learning.apply_policy(
+            std::time::Instant::now(),
+            config.web.carrier_negotiation_enabled() && config.web.carrier_learning,
+            config.web.carrier_negotiation_aggressiveness,
+            Duration::from_secs(config.web.timeouts.carrier_learning_secs),
+        );
         let websocket_connections = limits
             .max_http_connections
             .saturating_sub(limits.websocket_http_connection_reserve);
@@ -155,7 +192,7 @@ impl WebProcessRuntime {
             http_connections: Arc::new(Semaphore::new(limits.max_http_connections)),
             http_handlers: Arc::new(Semaphore::new(limits.max_http_handlers)),
             lane_polls: Arc::new(Semaphore::new(
-                lane_poll_limit.saturating_sub(lane_aux_poll_limit),
+                lane_poll_limit,
             )),
             lane_aux_polls: Arc::new(Semaphore::new(lane_aux_poll_limit)),
             body_readers: Arc::new(Semaphore::new(limits.max_body_readers)),
@@ -169,7 +206,8 @@ impl WebProcessRuntime {
             data_budget: WebDataBudget::new(limits.clone()),
             limits,
             state: Mutex::new(ManagerState::default()),
-            learning: Mutex::new(learning::CarrierLearning::new(learning_capacity)),
+            stream_admission: Mutex::new(StreamAdmissionState::default()),
+            learning: Mutex::new(carrier_learning),
             shutdown: CancellationToken::new(),
             tasks: TaskTracker::new(),
             sessions_created: AtomicU64::new(0),

@@ -42,6 +42,14 @@ pub(super) fn validate(
             "WebSocket carriers require websocket_http_connection_reserve within [1, max_http_connections)",
         );
     }
+    let websocket_capacity = limits
+        .max_http_connections
+        .saturating_sub(limits.websocket_http_connection_reserve);
+    if limits.max_websocket_evictions_in_flight > websocket_capacity {
+        return config_error(
+            "web.limits.max_websocket_evictions_in_flight must not exceed WebSocket connection capacity",
+        );
+    }
     let socket_base = WEBSOCKET_IO_BUFFER_BYTES
         .checked_mul(2)
         .and_then(|value| value.checked_add(WEBSOCKET_DRIVER_OVERHEAD_BYTES))
