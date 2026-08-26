@@ -24,6 +24,7 @@
  - [server.api](#serverapi)
  - [server.listeners](#serverlisteners)
  - [web](#web)
+ - [web.debug](#webdebug)
  - [web.limits](#weblimits)
  - [web.timeouts](#webtimeouts)
  - [web.vhosts](#webvhosts)
@@ -2482,12 +2483,32 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | Ключ | Тип | По умолчанию | Hot-Reload |
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
-| `carrier` | `"https"` или `"https-lanes"` | `"https"` | `✔` |
+| `carrier` | `"https"`, `"https-lanes"`, `"websocket"` или `"websocket-lanes"` | `"https"` | `✔` |
+| `debug` | таблица | выключено, ограниченные defaults | `✔` |
 | `limits` | таблица | ограниченные defaults | `✘` |
 | `timeouts` | таблица | ограниченные defaults | `✔` |
 | `vhosts` | массив таблиц | `[]` | `✔` |
 
-Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `carrier = "https"` сохраняет сериализованный HTTPS transport. При `carrier = "https-lanes"` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; этот carrier требует `max_http_handlers >= 2` и публичного HTTP/2 на TLS-терминаторе, чтобы убрать application-level inter-stream head-of-line blocking. Reload применяет `carrier` только к новым bridge sessions. Отключение WEB после reload прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
+Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `https` сохраняет сериализованный HTTPS transport. В `https-lanes` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; carrier требует `max_http_handlers >= 2` и публичного HTTP/2 на TLS-терминаторе. `websocket` переносит все logical streams через одно упорядоченное RFC 6455 connection, а `websocket-lanes` выделяет отдельное connection каждому ненулевому stream и изолирует сбои lane. Оба WebSocket carrier используют `GET /api/v1/ws` после создания HTTPS-сессии и требуют от TLS-терминатора сохранять HTTP/1.1 Upgrade headers. Reload применяет `carrier` только к новым bridge sessions. Отключение WEB после reload прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
+
+# [web.debug]
+
+Эта hot-reloadable таблица управляет process-owned серверным WEB debug recorder, доступным на API-listener’е как аутентифицированный HTML по `GET /web-status`. Сбор по умолчанию отключён. Сохранённые и находящиеся в обработке записи ограничены значениями из `[web.limits]`, изменение которых требует перезапуска.
+
+| Ключ | Тип | По умолчанию | Описание |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | Включает WEB HTTP, WebSocket-message, frame и lifecycle debug records. |
+| `capture_lifecycle` | `bool` | `true` | Записывает типизированные события bridge, session, stream, handshake, relay и close. |
+| `capture_headers` | `bool` | `true` | Сохраняет имена headers и только разрешённые значения без credentials. |
+| `capture_timings` | `bool` | `true` | Сохраняет timing points для request body, готового response, response body и обработки WebSocket messages. |
+| `capture_frames` | `bool` | `true` | Разбирает bounded carrier bodies в тип frame, stream ID, длину, WINDOW и метаданные ошибок, не сохраняя frame payload отдельно. |
+| `body_capture` | `"off"`, `"metadata"`, `"prefix"` или `"full"` | `"metadata"` | Управляет сохранением байтов request и response body. |
+| `body_prefix_bytes` | `usize` | `4096` | Prefix распознанного WEB body, сохраняемый в режиме `prefix`. |
+| `decoy_body_prefix_bytes` | `usize` | `4096` | Максимальный сохраняемый prefix обычного decoy-трафика в режимах `prefix` и `full`. |
+| `default_window_secs` | `u64` | `180` | Стандартное окно наблюдения, отображаемое `/web-status`. |
+| `max_window_secs` | `u64` | `3600` | Максимальное окно наблюдения, принимаемое `/web-status`; при валидации ограничено значением 86400. |
+
+Изменение `enabled` или любого поля capture очищает сохранённые записи и отклоняет commits, начатые в предыдущую policy epoch. Изменение только стандартного или максимального окна наблюдения сохраняет совместимые записи. `full` сохраняет полное тело распознанного carrier только до `web.limits.max_body_bytes`; decoy bodies всегда остаются ограничены настроенным prefix. Prefix, который помещается только в одновременно увеличенную restart-only ёмкость, откладывается вместе с `web.debug` до перезапуска. URI queries никогда не сохраняются, значения credential headers исключаются, копии body очищаются от известных WEB capabilities и bearer tokens, а ключи профилей представлены только domain-separated fingerprint из 16 hex-символов.
 
 # [web.limits]
 
@@ -2502,6 +2523,10 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `max_frames_per_body` | `usize` | `4096` | Максимальное число frames в одном carrier body. |
 | `max_http_connections` | `usize` | `1024` | Принятые WEB HTTP connections на весь процесс. |
 | `max_http_handlers` | `usize` | `512` | Одновременно выполняемые HTTP handlers на весь процесс; HTTPS lanes могут занять long polls не более половины лимита, оставляя остаток для session, uplink и control work. |
+| `websocket_bytes_global` | `usize` | `268435456` | Подбюджет transient WebSocket codec, messages и write staging внутри `pending_bytes_global`. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | Доля WebSocket byte-budget, после которой новый admission может вытеснить owner-first victim. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | Доля WebSocket byte-budget, после которой queue pressure может вытеснить подходящее connection с наиболее старым прогрессом. |
+| `websocket_http_connection_reserve` | `usize` | `64` | Число принятых HTTP connections, недоступных WebSocket upgrades и сохраняющих capacity для обычного HTTP и decoy. |
 | `max_body_readers` | `usize` | `32` | Одновременно собираемые request bodies на весь процесс. |
 | `max_body_bytes_global` | `usize` | `67108864` | Глобальный байтовый резерв для собранных bodies. |
 | `max_sessions_global` | `usize` | `128` | Активные WEB-сессии на весь процесс. |
@@ -2523,7 +2548,9 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `max_static_files` | `usize` | `4096` | Элементы static snapshot всех vhosts. |
 | `max_static_file_bytes` | `usize` | `8388608` | Максимальный размер одного статического файла. |
 | `max_static_bytes` | `usize` | `67108864` | Размер static snapshots всех vhosts. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Заявленный envelope для HTTP heads, bodies, очередей и static snapshots; максимум 4 GiB. |
+| `debug_records_capacity` | `usize` | `65536` | Максимальное число сохранённых WEB debug records. |
+| `debug_bytes_global` | `usize` | `67108864` | Глобальная байтовая граница сохранённых и находящихся в обработке WEB debug данных; минимум 4096. |
+| `memory_envelope_bytes` | `usize` | `805306368` | Заявленный envelope для HTTP heads, bodies, общих queues/WebSocket I/O, static snapshots и bounded debug/status buffers; максимум 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Устойчивая process-wide скорость выдачи bootstrap. |
 | `new_bootstraps_burst` | `u32` | `256` | Process-wide burst выдачи bootstrap. |
 | `new_sessions_per_minute` | `u32` | `600` | Устойчивая process-wide скорость создания сессий. |
@@ -2541,6 +2568,9 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `body_secs` | `u64` | `30` | `✔` | Сбор одного аутентифицированного carrier body. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Выполнение внутреннего MTProxy handshake. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Максимальная длительность пустого downlink long poll. |
+| `websocket_write_secs` | `u64` | `30` | `✔` | Максимальное ожидание одной WebSocket write или flush операции. |
+| `websocket_backpressure_secs` | `u64` | `30` | `✔` | Максимальное ожидание прогресса общего byte-budget или queue перед закрытием затронутого connection. |
+| `websocket_eviction_secs` | `u64` | `1` | `✔` | Grace period для освобождения slot и budget вытесненным WebSocket до отказа admission. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Срок неиспользованного bootstrap и replay-marker закрытого token. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Максимальная неактивность carrier до закрытия сессии. |
 | `http_idle_secs` | `u64` | `75` | `✔` | Idle lifetime WEB HTTP keep-alive connection. |
@@ -2581,9 +2611,9 @@ Hostname нормализуется при валидации и должен п
 
 ## Lifecycle WEB и управление через API
 
-- Config watcher и generation reload применяют `web.enabled`, `web.carrier`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Существующие сессии сохраняют carrier, лимиты и deadlines своего момента создания; новые bridge sessions используют активное поколение.
+- Config watcher и generation reload применяют `web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Существующие сессии сохраняют carrier, лимиты и deadlines своего момента создания; новые bridge sessions используют активное поколение.
 - Состав WEB-listeners и их trust policy в `server.listeners`, а также все значения `web.limits` принадлежат процессу и требуют перезапуска.
-- Отдельного endpoint `/v1/web` нет. `GET /v1/config` не возвращает `[web]`, а `PATCH /v1/config` отклоняет ключ `web` с `400 section_not_editable`.
+- Изменяемого ресурса `/v1/web` нет. `GET /web-status` предоставляет аутентифицированную read-only HTML-диагностику; `GET /v1/config` не возвращает `[web]`, а `PATCH /v1/config` отклоняет ключ `web` с `400 section_not_editable`.
 - Для удалённого применения WEB policy измените соответствующий TOML-файл и вызовите `POST /v1/system/reload`; проверьте `GET /v1/system/reload/{id}` и поле `deferred_process_fields`. Если оно содержит `server.listeners` или `web.limits`, перезапустите Telemt.
 - Существующих access users можно создавать, изменять, ротировать, включать, выключать и удалять через `/v1/users`. Создание пользователя не добавляет WEB-профиль. Отключение пользователя немедленно обновляет admission и завершает его активные сессии.
 - `PATCH /v1/config` может сохранить `server.listeners`, включая поля WEB-listener’а, но изменённый WEB-listener активируется только после перезапуска процесса.

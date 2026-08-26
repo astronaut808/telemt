@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 
 const WEB_CAPABILITY_CONTEXT: &[u8] = b"tdesktop-web-proxy-bridge-v1\n";
+const WEB_DEBUG_FINGERPRINT_CONTEXT: &[u8] = b"telemt-web-debug-key-fingerprint-v1\0";
 const MAX_WEB_STATIC_DEPTH: usize = 64;
 
 /// Builds the immutable WEB routing and decoy snapshot for one generation.
@@ -49,6 +50,7 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
                 client_secret(auth_entry.secret, profile.secret_mode);
             let capability =
                 derive_web_capability(&client_secret[..client_secret_len], vhost.host.as_bytes())?;
+            let key_fingerprint = debug_key_fingerprint(&client_secret[..client_secret_len]);
             if !capabilities.insert(capability) {
                 return Err(ProxyError::Config(format!(
                     "WEB vhost `{}` contains profiles with the same client capability",
@@ -62,6 +64,7 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
                 secret_mode: profile.secret_mode,
                 carrier: config.web.carrier,
                 capability,
+                key_fingerprint,
                 max_sessions: profile
                     .max_sessions
                     .unwrap_or(config.web.limits.max_sessions_global),
@@ -91,6 +94,13 @@ pub(super) fn rebuild(config: &mut ProxyConfig) -> Result<()> {
         profiles: runtime_profiles,
     }));
     Ok(())
+}
+
+fn debug_key_fingerprint(secret: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(WEB_DEBUG_FINGERPRINT_CONTEXT);
+    digest.update(secret);
+    hex::encode(&digest.finalize()[..8])
 }
 
 /// Derives the Telegram Desktop WEB capability for one exact secret and host.

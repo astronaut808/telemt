@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{RwLock, Semaphore, watch};
 
-use crate::config::{ProxyConfig, ServerConfig};
+use crate::config::{ProxyConfig, ServerConfig, web_debug_fits_limits};
 use crate::crypto::SecureRandom;
 use crate::ip_tracker::UserIpTracker;
 use crate::network::probe::{decide_network_capabilities, run_probe};
@@ -414,6 +414,10 @@ pub(crate) fn resolve_reload_config(
             fields.push("web".to_string());
             effective.web = old.web.clone();
         }
+    }
+    if !web_debug_fits_limits(&effective.web.debug, &effective.web.limits) {
+        fields.push("web.debug".to_string());
+        effective.web.debug = old.web.debug.clone();
     }
     let runtime_changed = !configs_equal(old, &effective);
     ResolvedReloadConfig {

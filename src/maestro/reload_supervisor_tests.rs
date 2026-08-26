@@ -34,6 +34,10 @@ async fn fixture(request: ReloadRequest) -> ReloadFixture {
     let (detected_ips_tx, _detected_ips_rx) = watch::channel((None, None));
     let (runtime_watch_tx, runtime_watch_rx) = watch::channel(Some(old_runtime.watch_state()));
     let listener_manager = Arc::new(Mutex::new(ListenerManager::empty(active_runtime.clone())));
+    let web_trace = crate::web::trace::WebTraceStore::new(
+        old_runtime.config().web.debug.clone(),
+        &old_runtime.config().web.limits,
+    );
     let supervisor = Arc::new(ReloadSupervisor {
         active_runtime,
         control: control.clone(),
@@ -44,6 +48,7 @@ async fn fixture(request: ReloadRequest) -> ReloadFixture {
         runtime_log_filter: runtime_log_filter(),
         runtime_watch_tx,
         listener_manager,
+        web_trace,
     });
     let command = ReloadCommand {
         reload_id: accepted.reload_id,
@@ -306,6 +311,10 @@ async fn quiesce_joins_idle_supervisor_and_rejects_later_submissions() {
         runtime_log_filter(),
         runtime_watch_tx,
         listener_manager,
+        crate::web::trace::WebTraceStore::new(
+            runtime.config().web.debug.clone(),
+            &runtime.config().web.limits,
+        ),
     );
 
     tokio::time::timeout(Duration::from_secs(1), handle.quiesce())

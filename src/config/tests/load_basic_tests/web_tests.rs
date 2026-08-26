@@ -47,6 +47,56 @@ fn web_config_builds_canonical_runtime_snapshot() {
     assert_eq!(vhost.profiles[0].max_sessions, 4);
     assert_eq!(vhost.profiles[0].max_streams, 64);
     assert_eq!(vhost.profiles[0].max_streams_per_session, 16);
+    assert_eq!(vhost.profiles[0].key_fingerprint.len(), 16);
+    assert_ne!(vhost.profiles[0].key_fingerprint, "0001020304050607");
+}
+
+#[test]
+fn web_debug_table_uses_debug_name_and_bounded_defaults() {
+    let configured = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.debug]\nenabled = true\nbody_capture = \"prefix\"\nbody_prefix_bytes = 2048\ndefault_window_secs = 180\nmax_window_secs = 900\n\n[[web.vhosts]]",
+    );
+    let config = load_config_from_temp_toml(&configured);
+    assert!(config.web.debug.enabled);
+    assert_eq!(config.web.debug.body_capture, WebDebugBodyCapture::Prefix);
+    assert_eq!(config.web.debug.body_prefix_bytes, 2048);
+    assert_eq!(config.web.debug.default_window_secs, 180);
+    assert_eq!(config.web.debug.max_window_secs, 900);
+
+    let old_name = format!(
+        "[general]\nconfig_strict = true\n{}",
+        WEB_CONFIG.replace(
+            "[[web.vhosts]]",
+            "[web.trace]\nenabled = true\n\n[[web.vhosts]]",
+        )
+    );
+    let error = load_config_error_from_temp_toml(&old_name);
+    assert!(error.contains("web.trace"));
+}
+
+#[test]
+fn web_debug_prefix_and_window_validation_fail_closed() {
+    let oversized_prefix = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.debug]\nenabled = true\nbody_prefix_bytes = 2097153\n\n[[web.vhosts]]",
+    );
+    let error = load_config_error_from_temp_toml(&oversized_prefix);
+    assert!(error.contains("web.debug.body_prefix_bytes"));
+
+    let reversed_window = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.debug]\nenabled = true\ndefault_window_secs = 181\nmax_window_secs = 180\n\n[[web.vhosts]]",
+    );
+    let error = load_config_error_from_temp_toml(&reversed_window);
+    assert!(error.contains("web.debug windows"));
+
+    let undersized_store = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"https-lanes\"\n\n[web.limits]\ndebug_bytes_global = 4095",
+    );
+    let error = load_config_error_from_temp_toml(&undersized_store);
+    assert!(error.contains("debug_bytes_global must be at least 4096"));
 }
 
 #[test]
@@ -102,4 +152,53 @@ fn web_ipv6_decoy_uses_a_valid_http_authority() {
         panic!("expected HTTP decoy");
     };
     assert_eq!(authority, "[::1]:18081");
+}
+
+#[test]
+fn websocket_carriers_build_runtime_profiles_with_bounded_defaults() {
+    for (name, carrier) in [
+        ("websocket", WebCarrier::Websocket),
+        ("websocket-lanes", WebCarrier::WebsocketLanes),
+    ] {
+        let configured = WEB_CONFIG.replace("https-lanes", name);
+        let config = load_config_from_temp_toml(&configured);
+        let profile = &config.web.runtime.unwrap().profiles[0];
+        assert_eq!(profile.carrier, carrier);
+        assert_eq!(config.web.limits.websocket_bytes_global, 256 * 1024 * 1024);
+        assert_eq!(config.web.limits.websocket_admission_watermark_pct, 75);
+        assert_eq!(config.web.limits.websocket_eviction_watermark_pct, 90);
+        assert_eq!(config.web.limits.websocket_http_connection_reserve, 64);
+        assert_eq!(config.web.timeouts.websocket_write_secs, 30);
+        assert_eq!(config.web.timeouts.websocket_backpressure_secs, 30);
+        assert_eq!(config.web.timeouts.websocket_eviction_secs, 1);
+    }
+}
+
+#[test]
+fn websocket_limits_reject_ambiguous_or_nonprogressing_policy() {
+    let reversed_watermarks = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"websocket\"\n\n[web.limits]\nwebsocket_admission_watermark_pct = 90\nwebsocket_eviction_watermark_pct = 75",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&reversed_watermarks).contains("WebSocket watermarks")
+    );
+
+    let no_http_reserve = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"websocket\"\n\n[web.limits]\nwebsocket_http_connection_reserve = 0",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&no_http_reserve)
+            .contains("websocket_http_connection_reserve")
+    );
+
+    let oversized_batch = WEB_CONFIG.replace(
+        "carrier = \"https-lanes\"",
+        "carrier = \"websocket\"\n\n[web.limits]\nmax_body_bytes = 4194304\ncarrier_batch_bytes = 4194304\nmax_body_readers = 16",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&oversized_batch)
+            .contains("carrier_batch_bytes <= 2097152")
+    );
 }

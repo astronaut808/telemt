@@ -171,6 +171,27 @@ fn web_allocation_limits_are_deferred_until_restart() {
 }
 
 #[test]
+fn web_debug_prefix_dependent_on_new_capacity_is_deferred_with_limits() {
+    let mut old = ProxyConfig::default();
+    old.rebuild_runtime_user_auth().unwrap();
+    old.rebuild_runtime_web().unwrap();
+    let mut desired = old.clone();
+    desired.web.limits.max_body_bytes = 4 * 1024 * 1024;
+    desired.web.debug.body_prefix_bytes = 3 * 1024 * 1024;
+
+    let resolved = resolve_reload_config(&old, &desired);
+
+    assert_eq!(
+        resolved.deferred_process_fields,
+        vec!["web.limits".to_string(), "web.debug".to_string()]
+    );
+    assert_eq!(
+        resolved.effective.web.debug.body_prefix_bytes,
+        old.web.debug.body_prefix_bytes
+    );
+}
+
+#[test]
 fn strict_middle_proxy_requires_a_prepared_pool() {
     assert!(strict_middle_proxy_unavailable(true, false, false));
     assert!(!strict_middle_proxy_unavailable(true, false, true));

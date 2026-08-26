@@ -17,7 +17,7 @@ use crate::maestro::generation::test_runtime_generation;
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::WebProcessRuntime;
 
-fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
+pub(super) fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
     let profile = Arc::new(WebRuntimeProfile {
         host: "proxy.example.com".to_string(),
         public_addr: "203.0.113.10:443".parse().unwrap(),
@@ -25,6 +25,7 @@ fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
         secret_mode: WebSecretMode::Plain,
         carrier,
         capability,
+        key_fingerprint: "0000000000000000".to_string(),
         max_sessions: 4,
         max_streams: 16,
         max_streams_per_session: 4,
@@ -71,7 +72,7 @@ fn runtime_config(capability: [u8; 32], carrier: WebCarrier) -> ProxyConfig {
     config
 }
 
-async fn request(
+pub(super) async fn request(
     listener: &TcpListener,
     runtime: &Arc<WebProcessRuntime>,
     request: Vec<u8>,
@@ -97,7 +98,7 @@ async fn request(
     response
 }
 
-fn split_response(response: &[u8]) -> (&[u8], &[u8]) {
+pub(super) fn split_response(response: &[u8]) -> (&[u8], &[u8]) {
     let separator = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -131,8 +132,8 @@ async fn https_carrier_bootstraps_and_closes_one_session() {
     assert!(root_headers.starts_with(b"HTTP/1.1 200"));
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
     assert_eq!(bootstrap.len(), 43);
@@ -184,7 +185,7 @@ async fn https_carrier_bootstraps_and_closes_one_session() {
     assert!(
         next_root_body
             .windows(11)
-            .any(|value| value == b"bootstrap='")
+            .any(|value| value == b"bootstrap=\"")
     );
     assert!(
         next_root_body
@@ -210,6 +211,39 @@ async fn https_carrier_bootstraps_and_closes_one_session() {
 }
 
 #[tokio::test]
+async fn rejected_bridge_bootstrap_falls_back_to_uncacheable_static_index() {
+    let capability = [15u8; 32];
+    let generation = test_runtime_generation(1, runtime_config(capability, WebCarrier::Https));
+    let active_runtime = Arc::new(ArcSwap::from(Arc::clone(&generation)));
+    let runtime = WebProcessRuntime::start(active_runtime);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(capability);
+    let bridge_request = || {
+        format!(
+            "GET /?bridge={encoded} HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    };
+
+    let first_response = request(&listener, &runtime, bridge_request()).await;
+    let (_, first_body) = split_response(&first_response);
+    assert!(first_body.windows(11).any(|value| value == b"bootstrap=\""));
+
+    let fallback_response = request(&listener, &runtime, bridge_request()).await;
+    let (fallback_headers, fallback_body) = split_response(&fallback_response);
+    assert!(fallback_headers.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(
+        response_header(fallback_headers, "cache-control"),
+        "no-store"
+    );
+    assert_eq!(fallback_body, b"<!doctype html><title>decoy</title>");
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}
+
+#[tokio::test]
 async fn bootstrap_survives_client_address_family_change() {
     let capability = [8u8; 32];
     let generation = test_runtime_generation(1, runtime_config(capability, WebCarrier::Https));
@@ -225,8 +259,8 @@ async fn bootstrap_survives_client_address_family_change() {
     let (_, root_body) = split_response(&root_response);
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -261,8 +295,8 @@ async fn unused_bootstrap_survives_equivalent_runtime_generation_swap() {
     let (_, root_body) = split_response(&root_response);
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -301,8 +335,8 @@ async fn unused_bootstrap_is_rejected_after_profile_identity_change() {
     let (_, root_body) = split_response(&root_response);
     let root_body = std::str::from_utf8(root_body).unwrap();
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -343,8 +377,8 @@ async fn https_lanes_is_advertised_and_requires_canonical_lane_headers() {
     let root_body = std::str::from_utf8(root_body).unwrap();
     assert!(root_body.contains("carrier='https-lanes'"));
     let bootstrap = root_body
-        .split_once("bootstrap='")
-        .and_then(|(_, suffix)| suffix.split_once('\''))
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
         .map(|(token, _)| token)
         .unwrap();
 
@@ -427,8 +461,8 @@ async fn windows_restricted_webview_empty_cookie_preserves_the_carrier_flow() {
         assert!(root_headers.starts_with(b"HTTP/1.1 200"));
         let root_body = std::str::from_utf8(root_body).unwrap();
         let bootstrap = root_body
-            .split_once("bootstrap='")
-            .and_then(|(_, suffix)| suffix.split_once('\''))
+            .split_once("bootstrap=\"")
+            .and_then(|(_, suffix)| suffix.split_once('"'))
             .map(|(token, _)| token)
             .unwrap();
 

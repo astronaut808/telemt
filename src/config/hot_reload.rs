@@ -36,7 +36,7 @@ use super::load::{LoadedConfig, ProxyConfig};
 #[allow(unused_imports)]
 use crate::config::{
     CidrRateLimitKey, LogLevel, MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy, MeTelemetryLevel,
-    MeWriterPickMode,
+    MeWriterPickMode, WebDebugConfig, web_debug_fits_limits,
 };
 #[cfg(test)]
 use crate::config::{ListenerConfig, SynLimitMode};

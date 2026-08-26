@@ -25,6 +25,7 @@ Dieses Dokument listet alle Konfigurationsschlüssel auf, die `config.toml` akze
  - [server.api](#serverapi)
  - [server.listeners](#serverlisteners)
  - [web](#web)
+ - [web.debug](#webdebug)
  - [web.limits](#weblimits)
  - [web.timeouts](#webtimeouts)
  - [web.vhosts](#webvhosts)
@@ -2556,12 +2557,32 @@ Der WEB-Modus transportiert MTProxy-Datenverkehr von Telegram Desktop über HTTP
 | Schlüssel | Typ | Default | Hot-Reload |
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
-| `carrier` | `"https"` oder `"https-lanes"` | `"https"` | `✔` |
+| `carrier` | `"https"`, `"https-lanes"`, `"websocket"` oder `"websocket-lanes"` | `"https"` | `✔` |
+| `debug` | Tabelle | deaktiviert, begrenzte Defaults | `✔` |
 | `limits` | Tabelle | begrenzte Defaults | `✘` |
 | `timeouts` | Tabelle | begrenzte Defaults | `✔` |
 | `vhosts` | Tabellen-Array | `[]` | `✔` |
 
-`enabled = true` erfordert mindestens einen durch die Netzwerkrichtlinie zugelassenen WEB-Listener, einen vhost und mindestens ein Profil in jedem vhost. `carrier = "https"` behält den serialisierten HTTPS-Transport bei. Mit `carrier = "https-lanes"` erhalten Stream null und jeder logische Stream eigene Uplink-Sequenzen, Downlink-Cursor, Wiederholungen und Long Polls; dieser Carrier erfordert `max_http_handlers >= 2` und öffentliches HTTP/2 am TLS-Terminator, um anwendungsseitiges Head-of-Line-Blocking zwischen Streams zu entfernen. Ein Reload wendet `carrier` nur auf neu ausgegebene Bridge-Sitzungen an. Das Deaktivieren von WEB beendet nach dem Reload die Ausgabe neuer Bridge- und Session-Zugangsdaten; zum Widerrufen aktiver Sitzungen eines einzelnen Benutzers verwenden Sie die Users-API.
+`enabled = true` erfordert mindestens einen durch die Netzwerkrichtlinie zugelassenen WEB-Listener, einen vhost und mindestens ein Profil in jedem vhost. `https` behält den serialisierten HTTPS-Transport bei. Mit `https-lanes` erhalten Stream null und jeder logische Stream eigene Uplink-Sequenzen, Downlink-Cursor, Wiederholungen und Long Polls; dieser Carrier erfordert `max_http_handlers >= 2` und öffentliches HTTP/2 am TLS-Terminator. `websocket` transportiert alle logischen Streams über eine geordnete RFC-6455-Verbindung, während `websocket-lanes` jedem Stream ungleich null eine eigene Verbindung zuweist und Lane-Fehler isoliert. Beide WebSocket-Carrier verwenden nach der HTTPS-Sitzungserstellung `GET /api/v1/ws` und erfordern, dass der TLS-Terminator die HTTP/1.1-Upgrade-Header unverändert weiterleitet. Ein Reload wendet `carrier` nur auf neu ausgegebene Bridge-Sitzungen an. Das Deaktivieren von WEB beendet nach dem Reload die Ausgabe neuer Bridge- und Session-Zugangsdaten; zum Widerrufen aktiver Sitzungen eines einzelnen Benutzers verwenden Sie die Users-API.
+
+# [web.debug]
+
+Diese hot-reload-fähige Tabelle steuert den prozesseigenen serverseitigen WEB-Debug-Recorder, der am API-Listener als authentifiziertes HTML unter `GET /web-status` bereitgestellt wird. Die Erfassung ist standardmäßig deaktiviert. Gespeicherte und in Verarbeitung befindliche Datensätze bleiben durch die nur nach einem Neustart änderbaren Werte in `[web.limits]` begrenzt.
+
+| Schlüssel | Typ | Default | Beschreibung |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `false` | Aktiviert WEB-HTTP-, WebSocket-Message-, Frame- und Lifecycle-Debugdatensätze. |
+| `capture_lifecycle` | `bool` | `true` | Zeichnet typisierte Bridge-, Sitzungs-, Stream-, Handshake-, Relay- und Close-Ereignisse auf. |
+| `capture_headers` | `bool` | `true` | Speichert Headernamen und nur ausdrücklich zugelassene Werte ohne Zugangsdaten. |
+| `capture_timings` | `bool` | `true` | Speichert Zeitpunkte für Request-Body, fertige Response, Response-Body und WebSocket-Message-Verarbeitung. |
+| `capture_frames` | `bool` | `true` | Zerlegt begrenzte Carrier-Bodys in Frame-Typ, Stream-ID, Länge, WINDOW- und Fehlermetadaten, ohne die Frame-Nutzlast zusätzlich zu speichern. |
+| `body_capture` | `"off"`, `"metadata"`, `"prefix"` oder `"full"` | `"metadata"` | Steuert die Speicherung von Bytes aus Request- und Response-Bodys. |
+| `body_prefix_bytes` | `usize` | `4096` | In `prefix` gespeicherter Präfix für erkannte WEB-Bodys. |
+| `decoy_body_prefix_bytes` | `usize` | `4096` | Maximal gespeicherter Präfix für gewöhnlichen Decoy-Verkehr in `prefix` und `full`. |
+| `default_window_secs` | `u64` | `180` | Standard-Beobachtungsfenster von `/web-status`. |
+| `max_window_secs` | `u64` | `3600` | Größtes von `/web-status` akzeptiertes Beobachtungsfenster; validiert auf höchstens 86400. |
+
+Eine Änderung von `enabled` oder einem Erfassungsfeld löscht gespeicherte Datensätze und verwirft Commits, die unter der vorherigen Policy-Epoche begonnen wurden. Ändert sich nur das standardmäßige oder maximale Beobachtungsfenster, bleiben kompatible Datensätze erhalten. `full` speichert den vollständigen Body eines erkannten Carriers nur bis `web.limits.max_body_bytes`; Decoy-Bodys bleiben immer auf einen Präfix begrenzt. Ein Präfix, der nur mit einer gleichzeitig erhöhten, neustartpflichtigen Kapazität zulässig wäre, wird zusammen mit `web.debug` bis zum Neustart zurückgestellt. URI-Queries werden nie gespeichert, Werte von Credential-Headern werden ausgelassen, Body-Kopien werden von bekannten WEB-Capabilities und Bearer-Tokens bereinigt und Profilschlüssel ausschließlich als domänengetrennter Fingerprint mit 16 Hex-Zeichen dargestellt.
 
 # [web.limits]
 
@@ -2576,6 +2597,10 @@ Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Req
 | `max_frames_per_body` | `usize` | `4096` | Maximale Zahl geparster oder ausgegebener Frames pro Carrier-Body. |
 | `max_http_connections` | `usize` | `1024` | Prozessweit akzeptierte WEB-HTTP-Verbindungen. |
 | `max_http_handlers` | `usize` | `512` | Prozessweit gleichzeitig ausgeführte HTTP-Handler; HTTPS-Lanes dürfen höchstens die Hälfte mit Long Polls belegen, der Rest bleibt für Session-, Uplink- und Steuerarbeit verfügbar. |
+| `websocket_bytes_global` | `usize` | `268435456` | Transientes Teilbudget für WebSocket-Codecs, Messages und Write-Staging innerhalb von `pending_bytes_global`. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket-Byte-Anteil, ab dem neue Admission eine Owner-First-Verbindung ersetzen darf. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | WebSocket-Byte-Anteil, ab dem Queue-Druck die zulässige Verbindung mit dem ältesten Fortschritt verdrängen darf. |
+| `websocket_http_connection_reserve` | `usize` | `64` | Für WebSocket-Upgrades gesperrte HTTP-Verbindungen, die Kapazität für gewöhnliches HTTP und Decoys erhalten. |
 | `max_body_readers` | `usize` | `32` | Prozessweit gleichzeitig gesammelte Request-Bodys. |
 | `max_body_bytes_global` | `usize` | `67108864` | Globales Byte-Budget für gesammelte Bodys. |
 | `max_sessions_global` | `usize` | `128` | Prozessweit aktive WEB-Sitzungen. |
@@ -2597,7 +2622,9 @@ Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Req
 | `max_static_files` | `usize` | `4096` | Einträge statischer Snapshots über alle vhosts. |
 | `max_static_file_bytes` | `usize` | `8388608` | Maximale Größe einer statischen Datei. |
 | `max_static_bytes` | `usize` | `67108864` | Bytes statischer Snapshots über alle vhosts. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Deklarierter Rahmen für HTTP-Heads, Bodys, Queues und statische Snapshots; maximal 4 GiB. |
+| `debug_records_capacity` | `usize` | `65536` | Maximale Zahl gespeicherter WEB-Debugdatensätze. |
+| `debug_bytes_global` | `usize` | `67108864` | Globale Byte-Obergrenze für gespeicherte und in Verarbeitung befindliche WEB-Debugdaten; mindestens 4096. |
+| `memory_envelope_bytes` | `usize` | `805306368` | Deklarierter Rahmen für HTTP-Heads, Bodys, gemeinsame Queues/WebSocket-I/O, statische Snapshots und begrenzte Debug-/Statuspuffer; maximal 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Nachhaltige prozessweite Ausgaberate für Bootstraps. |
 | `new_bootstraps_burst` | `u32` | `256` | Prozessweiter Burst für die Bootstrap-Ausgabe. |
 | `new_sessions_per_minute` | `u32` | `600` | Nachhaltige prozessweite Erstellungsrate für Sitzungen. |
@@ -2615,6 +2642,9 @@ Alle Timeouts werden in Sekunden angegeben und müssen im Bereich `1..=3600` lie
 | `body_secs` | `u64` | `30` | `✔` | Sammeln eines authentifizierten Carrier-Bodys. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Abschluss eines inneren MTProxy-Handshakes. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Maximale Dauer eines leeren Downlink-Long-Polls. |
+| `websocket_write_secs` | `u64` | `30` | `✔` | Maximale Wartezeit für einen WebSocket-Write oder Flush. |
+| `websocket_backpressure_secs` | `u64` | `30` | `✔` | Maximale Wartezeit auf Fortschritt des gemeinsamen Byte-Budgets oder einer Queue, bevor die betroffene Verbindung geschlossen wird. |
+| `websocket_eviction_secs` | `u64` | `1` | `✔` | Karenzzeit, in der ein verdrängter WebSocket Slot und Budget freigeben muss, bevor Admission fehlschlägt. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Lebensdauer ungenutzter Bootstraps und geschlossener Token-Replay-Marker. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Maximale Carrier-Inaktivität bis zum Schließen der Sitzung. |
 | `http_idle_secs` | `u64` | `75` | `✔` | Idle-Lebensdauer einer WEB-HTTP-Keep-Alive-Verbindung. |
@@ -2655,9 +2685,9 @@ Profilgrenzen müssen ungleich null sein und dürfen die zugehörigen globalen G
 
 ## WEB-Lebenszyklus und API-Verwaltung
 
-- Config-Watcher und Generations-Reload wenden `web.enabled`, `web.carrier`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Bestehende Sitzungen behalten Carrier, Grenzen und Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden die aktive Generation.
+- Config-Watcher und Generations-Reload wenden `web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Bestehende Sitzungen behalten Carrier, Grenzen und Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden die aktive Generation.
 - Bestand und Vertrauensrichtlinie der WEB-Listener unter `server.listeners` sowie alle Werte in `web.limits` sind prozesseigen und erfordern einen Neustart.
-- Es gibt keinen eigenen Endpunkt `/v1/web`. `GET /v1/config` lässt `[web]` aus und `PATCH /v1/config` lehnt einen Schlüssel `web` mit `400 section_not_editable` ab.
+- Es gibt keine veränderbare Ressource `/v1/web`. `GET /web-status` stellt authentifizierte, schreibgeschützte HTML-Diagnosen bereit; `GET /v1/config` lässt `[web]` aus und `PATCH /v1/config` lehnt einen Schlüssel `web` mit `400 section_not_editable` ab.
 - Zum entfernten Anwenden einer WEB-Richtlinie ändern Sie die zuständige TOML-Datei und rufen `POST /v1/system/reload` auf. Prüfen Sie anschließend `GET /v1/system/reload/{id}` und dessen `deferred_process_fields`. Starten Sie Telemt neu, wenn das Feld `server.listeners` oder `web.limits` enthält.
 - Vorhandene Access-Benutzer können über `/v1/users` erstellt, geändert, rotiert, aktiviert, deaktiviert und gelöscht werden. Das Erstellen eines Benutzers fügt kein WEB-Profil hinzu. Das Deaktivieren aktualisiert die Admission sofort und beendet die aktiven Sitzungen dieses Benutzers.
 - `PATCH /v1/config` kann `server.listeners` einschließlich der WEB-Listener-Felder speichern; ein geänderter WEB-Listener wird jedoch erst nach einem Prozessneustart aktiv.
