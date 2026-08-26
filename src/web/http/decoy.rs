@@ -17,6 +17,7 @@ use crate::config::{WebRuntimeDecoy, WebRuntimeVhost};
 use crate::web::manager::WebProcessRuntime;
 
 /// Serves the configured ordinary site after optionally removing carrier material.
+/// Transport-sanitized static fallbacks remain uncacheable after query removal.
 pub(super) async fn serve_decoy<B>(
     mut request: Request<B>,
     vhost: Arc<WebRuntimeVhost>,
@@ -27,6 +28,7 @@ where
     B: hyper::body::Body<Data = Bytes> + Send + 'static,
     B::Error: Error + Send + Sync + 'static,
 {
+    super::set_trace_route(&request, crate::web::trace::TraceRoute::Decoy);
     if sanitize_transport {
         sanitize_transport_request(&mut request);
     }
@@ -41,7 +43,15 @@ where
     };
     let request = Request::from_parts(parts, body);
     match &vhost.decoy {
-        WebRuntimeDecoy::StaticDirectory(site) => serve_static(request, site),
+        WebRuntimeDecoy::StaticDirectory(site) => {
+            let mut response = serve_static(request, site);
+            if sanitize_transport {
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            }
+            response
+        }
         WebRuntimeDecoy::HttpUpstream { addr, authority } => {
             proxy_to_upstream(
                 request,
@@ -226,6 +236,7 @@ fn sanitize_transport_request<B>(request: &mut Request<B>) {
         header::CONTENT_TYPE,
         header::UPGRADE,
         HeaderName::from_static("sec-websocket-key"),
+        HeaderName::from_static("sec-websocket-extensions"),
         HeaderName::from_static("sec-websocket-protocol"),
         HeaderName::from_static("sec-websocket-version"),
         HeaderName::from_static("x-down-cursor"),

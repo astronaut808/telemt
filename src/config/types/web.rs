@@ -6,6 +6,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::web_debug::WebDebugConfig;
+
 /// Client-facing secret representation used to derive a WEB capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,7 +18,7 @@ pub enum WebSecretMode {
     Dd,
 }
 
-/// HTTP carrier selected for newly issued WEB bridge sessions.
+/// Carrier selected for newly issued WEB bridge sessions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WebCarrier {
@@ -25,6 +27,10 @@ pub enum WebCarrier {
     Https,
     /// Give every logical stream independent HTTPS sequencing and polling state.
     HttpsLanes,
+    /// Multiplex all logical streams over one ordered WebSocket.
+    Websocket,
+    /// Give every logical stream an independently owned WebSocket lane.
+    WebsocketLanes,
 }
 
 impl WebCarrier {
@@ -33,7 +39,24 @@ impl WebCarrier {
         match self {
             Self::Https => "https",
             Self::HttpsLanes => "https-lanes",
+            Self::Websocket => "websocket",
+            Self::WebsocketLanes => "websocket-lanes",
         }
+    }
+
+    /// Returns whether one carrier owns independent state per logical stream.
+    pub(crate) const fn uses_lanes(self) -> bool {
+        matches!(self, Self::HttpsLanes | Self::WebsocketLanes)
+    }
+
+    /// Returns whether carrier messages use RFC 6455 instead of HTTP bodies.
+    pub(crate) const fn uses_websocket(self) -> bool {
+        matches!(self, Self::Websocket | Self::WebsocketLanes)
+    }
+
+    /// Returns whether all logical streams share one carrier state machine.
+    pub(crate) const fn is_multiplexed(self) -> bool {
+        matches!(self, Self::Https | Self::Websocket)
     }
 }
 
@@ -112,6 +135,18 @@ pub struct WebLimitsConfig {
     /// Process-wide concurrently executing HTTP handler ceiling.
     #[serde(default = "default_web_max_http_handlers")]
     pub max_http_handlers: usize,
+    /// Process-wide transient WebSocket byte sub-budget inside pending bytes.
+    #[serde(default = "default_web_websocket_bytes_global")]
+    pub websocket_bytes_global: usize,
+    /// WebSocket usage percentage above which ordinary admission uses replacement.
+    #[serde(default = "default_web_websocket_admission_watermark_pct")]
+    pub websocket_admission_watermark_pct: u8,
+    /// WebSocket usage percentage that triggers pressure eviction.
+    #[serde(default = "default_web_websocket_eviction_watermark_pct")]
+    pub websocket_eviction_watermark_pct: u8,
+    /// Accepted HTTP connections that WebSocket upgrades must leave available.
+    #[serde(default = "default_web_websocket_http_connection_reserve")]
+    pub websocket_http_connection_reserve: usize,
     /// Process-wide concurrently collected request body ceiling.
     #[serde(default = "default_web_max_body_readers")]
     pub max_body_readers: usize,
@@ -130,7 +165,7 @@ pub struct WebLimitsConfig {
     /// Process-wide live logical-stream ceiling.
     #[serde(default = "default_web_max_streams_global")]
     pub max_streams_global: usize,
-    /// Process-wide concurrent inner MTProxy handshake ceiling.
+    /// Process-wide ceiling for inner MTProxy handshakes that received a first byte.
     #[serde(default = "default_web_max_stream_handshakes")]
     pub max_stream_handshakes: usize,
     /// Closed stream identifiers retained by one session.
@@ -175,6 +210,12 @@ pub struct WebLimitsConfig {
     /// Maximum static snapshot bytes across all virtual hosts.
     #[serde(default = "default_web_max_static_bytes")]
     pub max_static_bytes: usize,
+    /// Maximum retained WEB debug record count.
+    #[serde(default = "default_web_debug_records_capacity")]
+    pub debug_records_capacity: usize,
+    /// Process-wide retained and in-flight WEB debug byte ceiling.
+    #[serde(default = "default_web_debug_bytes_global")]
+    pub debug_bytes_global: usize,
     /// Declared process envelope for HTTP heads, bodies, queues, and static snapshots.
     #[serde(default = "default_web_memory_envelope_bytes")]
     pub memory_envelope_bytes: usize,
@@ -208,6 +249,10 @@ impl Default for WebLimitsConfig {
             max_frames_per_body: default_web_max_frames_per_body(),
             max_http_connections: default_web_max_http_connections(),
             max_http_handlers: default_web_max_http_handlers(),
+            websocket_bytes_global: default_web_websocket_bytes_global(),
+            websocket_admission_watermark_pct: default_web_websocket_admission_watermark_pct(),
+            websocket_eviction_watermark_pct: default_web_websocket_eviction_watermark_pct(),
+            websocket_http_connection_reserve: default_web_websocket_http_connection_reserve(),
             max_body_readers: default_web_max_body_readers(),
             max_body_bytes_global: default_web_max_body_bytes_global(),
             max_sessions_global: default_web_max_sessions_global(),
@@ -229,6 +274,8 @@ impl Default for WebLimitsConfig {
             max_static_files: default_web_max_static_files(),
             max_static_file_bytes: default_web_max_static_file_bytes(),
             max_static_bytes: default_web_max_static_bytes(),
+            debug_records_capacity: default_web_debug_records_capacity(),
+            debug_bytes_global: default_web_debug_bytes_global(),
             memory_envelope_bytes: default_web_memory_envelope_bytes(),
             new_bootstraps_per_minute: default_web_new_bootstraps_per_minute(),
             new_bootstraps_burst: default_web_new_bootstraps_burst(),
@@ -249,12 +296,21 @@ pub struct WebTimeoutsConfig {
     /// Deadline for collecting one authenticated carrier request body.
     #[serde(default = "default_web_body_timeout_secs")]
     pub body_secs: u64,
-    /// Deadline for the inner MTProxy handshake on one logical stream.
+    /// Deadline from the first inner byte through MTProxy authentication.
     #[serde(default = "default_web_stream_handshake_timeout_secs")]
     pub stream_handshake_secs: u64,
     /// Maximum wait for one empty downlink long poll.
     #[serde(default = "default_web_long_poll_timeout_secs")]
     pub long_poll_secs: u64,
+    /// Maximum wait for one WebSocket write to complete.
+    #[serde(default = "default_web_websocket_write_secs")]
+    pub websocket_write_secs: u64,
+    /// Maximum wait for WebSocket queue or byte-budget progress.
+    #[serde(default = "default_web_websocket_backpressure_secs")]
+    pub websocket_backpressure_secs: u64,
+    /// Maximum graceful close wait for an evicted WebSocket.
+    #[serde(default = "default_web_websocket_eviction_secs")]
+    pub websocket_eviction_secs: u64,
     /// Lifetime of an unused bootstrap credential and closed-token replay marker.
     #[serde(default = "default_web_bootstrap_lifetime_secs")]
     pub bootstrap_lifetime_secs: u64,
@@ -279,6 +335,9 @@ impl Default for WebTimeoutsConfig {
             body_secs: default_web_body_timeout_secs(),
             stream_handshake_secs: default_web_stream_handshake_timeout_secs(),
             long_poll_secs: default_web_long_poll_timeout_secs(),
+            websocket_write_secs: default_web_websocket_write_secs(),
+            websocket_backpressure_secs: default_web_websocket_backpressure_secs(),
+            websocket_eviction_secs: default_web_websocket_eviction_secs(),
             bootstrap_lifetime_secs: default_web_bootstrap_lifetime_secs(),
             reconnect_grace_secs: default_web_reconnect_grace_secs(),
             http_idle_secs: default_web_http_idle_secs(),
@@ -300,6 +359,9 @@ pub struct WebConfig {
     /// Hard process and protocol limits.
     #[serde(default)]
     pub limits: WebLimitsConfig,
+    /// Hot-reloadable bounded server-side debug policy.
+    #[serde(default)]
+    pub debug: WebDebugConfig,
     /// WEB lifecycle deadlines.
     #[serde(default)]
     pub timeouts: WebTimeoutsConfig,
@@ -348,6 +410,8 @@ pub(crate) struct WebRuntimeProfile {
     pub(crate) carrier: WebCarrier,
     /// HMAC-derived bridge capability.
     pub(crate) capability: [u8; 32],
+    /// Non-secret domain-separated client-secret fingerprint for debugging.
+    pub(crate) key_fingerprint: String,
     /// Per-profile live session ceiling.
     pub(crate) max_sessions: usize,
     /// Per-profile live logical-stream ceiling.
@@ -403,6 +467,14 @@ macro_rules! u32_default {
     };
 }
 
+macro_rules! u8_default {
+    ($name:ident, $value:expr) => {
+        fn $name() -> u8 {
+            $value
+        }
+    };
+}
+
 macro_rules! u64_default {
     ($name:ident, $value:expr) => {
         fn $name() -> u64 {
@@ -418,6 +490,10 @@ usize_default!(default_web_carrier_batch_bytes, 2 * 1024 * 1024);
 usize_default!(default_web_max_frames_per_body, 4096);
 usize_default!(default_web_max_http_connections, 1024);
 usize_default!(default_web_max_http_handlers, 512);
+usize_default!(default_web_websocket_bytes_global, 256 * 1024 * 1024);
+u8_default!(default_web_websocket_admission_watermark_pct, 75);
+u8_default!(default_web_websocket_eviction_watermark_pct, 90);
+usize_default!(default_web_websocket_http_connection_reserve, 64);
 usize_default!(default_web_max_body_readers, 32);
 usize_default!(default_web_max_body_bytes_global, 64 * 1024 * 1024);
 usize_default!(default_web_max_sessions_global, 128);
@@ -439,6 +515,8 @@ usize_default!(default_web_max_profiles, 32);
 usize_default!(default_web_max_static_files, 4096);
 usize_default!(default_web_max_static_file_bytes, 8 * 1024 * 1024);
 usize_default!(default_web_max_static_bytes, 64 * 1024 * 1024);
+usize_default!(default_web_debug_records_capacity, 65_536);
+usize_default!(default_web_debug_bytes_global, 64 * 1024 * 1024);
 usize_default!(default_web_memory_envelope_bytes, 768 * 1024 * 1024);
 u32_default!(default_web_new_bootstraps_per_minute, 1200);
 u32_default!(default_web_new_bootstraps_burst, 256);
@@ -450,6 +528,9 @@ u64_default!(default_web_header_timeout_secs, 10);
 u64_default!(default_web_body_timeout_secs, 30);
 u64_default!(default_web_stream_handshake_timeout_secs, 10);
 u64_default!(default_web_long_poll_timeout_secs, 25);
+u64_default!(default_web_websocket_write_secs, 30);
+u64_default!(default_web_websocket_backpressure_secs, 30);
+u64_default!(default_web_websocket_eviction_secs, 1);
 u64_default!(default_web_bootstrap_lifetime_secs, 120);
 u64_default!(default_web_reconnect_grace_secs, 120);
 u64_default!(default_web_http_idle_secs, 75);

@@ -84,7 +84,7 @@ mod tests {
     async fn global_downlink_budget_preserves_one_maximum_uplink_batch() {
         let generation = test_runtime_generation(1, ProxyConfig::default());
         let runtime = WebProcessRuntime::start(Arc::new(ArcSwap::from(generation)));
-        let control_items = super::super::state::control_item_reserve(&runtime.limits);
+        let control_items = super::super::budget::control_item_reserve(&runtime.limits);
         let data_bytes = runtime
             .limits
             .pending_bytes_global
@@ -97,20 +97,30 @@ mod tests {
             .limits
             .max_body_bytes
             .saturating_add(runtime.limits.max_frames_per_body * QUEUE_ITEM_COST);
-        let downlink_bytes = data_bytes - uplink_bytes;
+        let websocket_bytes = runtime.limits.carrier_batch_bytes;
+        let downlink_bytes = data_bytes - uplink_bytes - websocket_bytes;
         let downlink_items = data_items - runtime.limits.max_frames_per_body;
 
-        assert!(runtime.try_reserve_pending(downlink_bytes, downlink_items, false, true,));
+        assert!(runtime.try_reserve_pending([0; 32], downlink_bytes, downlink_items, false, true,));
         assert!(runtime.try_reserve_pending(
+            [0; 32],
             uplink_bytes,
             runtime.limits.max_frames_per_body,
             false,
             false,
         ));
-        assert!(!runtime.try_reserve_pending(1, 1, false, true));
+        let websocket = runtime.try_websocket_data_budget([0; 32], websocket_bytes);
+        assert!(websocket.is_some());
+        assert!(!runtime.try_reserve_pending([0; 32], 1, 1, false, true));
 
-        runtime.release_pending(downlink_bytes, downlink_items, false);
-        runtime.release_pending(uplink_bytes, runtime.limits.max_frames_per_body, false);
+        drop(websocket);
+        runtime.release_pending([0; 32], downlink_bytes, downlink_items, false);
+        runtime.release_pending(
+            [0; 32],
+            uplink_bytes,
+            runtime.limits.max_frames_per_body,
+            false,
+        );
         runtime.shutdown().await;
     }
 }

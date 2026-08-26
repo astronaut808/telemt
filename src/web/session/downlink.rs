@@ -5,14 +5,13 @@ use bytes::{BufMut, Bytes, BytesMut};
 use super::{
     DownBatch, PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState, WebSession,
 };
-use crate::config::WebCarrier;
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::ManagerError;
 
 impl WebSession {
     /// Polls pending downlink frames with cursor replay and newest-poll-wins semantics.
     pub(crate) async fn poll_down(&self, cursor: u64) -> Result<PollResult, ManagerError> {
-        if self.carrier() != WebCarrier::Https {
+        if !self.carrier().is_multiplexed() {
             return Err(ManagerError::Protocol);
         }
         let epoch = {
@@ -167,7 +166,13 @@ impl WebSession {
         let Some(manager) = self.manager.upgrade() else {
             return false;
         };
-        if !manager.try_reserve_pending(bytes, items, control, class == PendingClass::Downlink) {
+        if !manager.try_reserve_pending(
+            self.profile_key,
+            bytes,
+            items,
+            control,
+            class == PendingClass::Downlink,
+        ) {
             return false;
         }
         state.pending_bytes += bytes;
@@ -194,7 +199,7 @@ impl WebSession {
             state.pending_control_items = state.pending_control_items.saturating_sub(items);
         }
         if let Some(manager) = self.manager.upgrade() {
-            manager.release_pending(bytes, items, control);
+            manager.release_pending(self.profile_key, bytes, items, control);
         }
     }
 
@@ -208,7 +213,7 @@ impl WebSession {
         if amount == 0 {
             return true;
         }
-        if self.carrier() == WebCarrier::HttpsLanes {
+        if self.carrier().uses_lanes() {
             return self.queue_control_locked(
                 state,
                 FrameType::Window,
@@ -257,7 +262,7 @@ impl WebSession {
         stream_id: u32,
         payload: &[u8],
     ) -> bool {
-        if self.carrier() == WebCarrier::HttpsLanes {
+        if self.carrier().uses_lanes() {
             return self.queue_frame_locked(state, FrameType::Data, stream_id, payload, false);
         }
         let can_coalesce = state.pending_frames.back().is_some_and(|last| {
@@ -290,7 +295,7 @@ impl WebSession {
         payload: &[u8],
         control: bool,
     ) -> bool {
-        if self.carrier() == WebCarrier::HttpsLanes {
+        if self.carrier().uses_lanes() {
             return self.queue_lane_frame_locked(state, frame_type, stream_id, payload, control);
         }
         let cost = frame::HEADER_BYTES + payload.len() + QUEUE_ITEM_COST;
@@ -409,7 +414,9 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use crate::config::{WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig};
+    use crate::config::{
+        WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
+    };
     use crate::web::manager::WebProcessRuntime;
 
     fn session() -> Arc<WebSession> {
@@ -420,6 +427,7 @@ mod tests {
             secret_mode: WebSecretMode::Plain,
             carrier: WebCarrier::Https,
             capability: [0; 32],
+            key_fingerprint: "0000000000000000".to_string(),
             max_sessions: 1,
             max_streams: 1,
             max_streams_per_session: 1,
@@ -428,6 +436,7 @@ mod tests {
             std::sync::Weak::<WebProcessRuntime>::new(),
             [1; 32],
             "192.0.2.10".parse().unwrap(),
+            1,
             profile,
             [2; 32],
             WebLimitsConfig::default(),

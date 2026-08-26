@@ -12,3 +12,5 @@ pub(crate) mod manager;
 pub(crate) mod session;
 /// AsyncRead and AsyncWrite adapter for one logical MTProxy stream.
 pub(crate) mod stream;
+/// Process-owned bounded WEB debugging records and capture lifecycle.
+pub(crate) mod trace;

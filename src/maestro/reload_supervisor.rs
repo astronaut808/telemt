@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::stats::QuotaStore;
+use crate::web::trace::WebTraceStore;
 
 use super::generation::{RuntimeGeneration, RuntimeWatchState};
 use super::listeners::{ListenerManager, PreparedListenerTransition};
@@ -29,6 +30,7 @@ pub(crate) struct ReloadSupervisor {
     runtime_log_filter: RuntimeLogFilter,
     runtime_watch_tx: watch::Sender<Option<RuntimeWatchState>>,
     listener_manager: Arc<Mutex<ListenerManager>>,
+    web_trace: Arc<WebTraceStore>,
 }
 
 /// Process-owned handle that quiesces reloads before shutdown snapshots the runtime.
@@ -105,6 +107,7 @@ impl ReloadSupervisor {
         runtime_log_filter: RuntimeLogFilter,
         runtime_watch_tx: watch::Sender<Option<RuntimeWatchState>>,
         listener_manager: ListenerManager,
+        web_trace: Arc<WebTraceStore>,
     ) -> ReloadSupervisorHandle {
         let listener_manager = Arc::new(Mutex::new(listener_manager));
         let supervisor = Self {
@@ -117,6 +120,7 @@ impl ReloadSupervisor {
             runtime_log_filter,
             runtime_watch_tx,
             listener_manager: listener_manager.clone(),
+            web_trace,
         };
         let control = supervisor.control.clone();
         let shutdown = CancellationToken::new();
@@ -309,6 +313,7 @@ impl ReloadSupervisor {
         };
         old_runtime.stop_accepting_sessions();
         let replaced = self.active_runtime.swap(new_runtime.clone());
+        self.web_trace.apply_policy(&new_runtime.config().web.debug);
         if let Some(pending) = pending_listener_transition {
             self.listener_manager
                 .lock()

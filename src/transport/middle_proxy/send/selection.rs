@@ -16,19 +16,37 @@ impl MePool {
         include_warm: bool,
     ) -> Vec<usize> {
         let preferred_snapshot = self.preferred_endpoints_by_dc.load();
-        let Some(preferred) = preferred_snapshot.get(&routed_dc) else {
-            return Vec::new();
-        };
-        if preferred.is_empty() {
-            return Vec::new();
+        let mut out = Vec::new();
+        if let Some(preferred) = preferred_snapshot
+            .get(&routed_dc)
+            .filter(|preferred| !preferred.is_empty())
+        {
+            for (idx, w) in writers.iter().enumerate() {
+                if !self.writer_eligible_for_selection(w, include_warm) {
+                    continue;
+                }
+                if w.writer_dc == routed_dc && preferred.binary_search(&w.addr).is_ok() {
+                    out.push(idx);
+                }
+            }
+        }
+        if !out.is_empty() || !include_warm {
+            return out;
         }
 
-        let mut out = Vec::new();
+        // A map update publishes desired endpoints before replacement coverage is
+        // guaranteed. Preserve the existing same-DC writer as the final tier so
+        // the data plane remains available while the pool-owned reinit converges.
         for (idx, w) in writers.iter().enumerate() {
-            if !self.writer_eligible_for_selection(w, include_warm) {
-                continue;
-            }
-            if w.writer_dc == routed_dc && preferred.binary_search(&w.addr).is_ok() {
+            let family_enabled = if w.addr.is_ipv4() {
+                self.decision.ipv4_me
+            } else {
+                self.decision.ipv6_me
+            };
+            if family_enabled
+                && w.writer_dc == routed_dc
+                && self.writer_eligible_for_selection(w, true)
+            {
                 out.push(idx);
             }
         }

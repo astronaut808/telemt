@@ -259,7 +259,9 @@ const LISTENER_CONFIG_KEYS: &[&str] = &[
     "web_trusted_proxy_cidrs",
 ];
 
-const WEB_CONFIG_KEYS: &[&str] = &["enabled", "carrier", "limits", "timeouts", "vhosts"];
+const WEB_CONFIG_KEYS: &[&str] = &[
+    "enabled", "carrier", "debug", "limits", "timeouts", "vhosts",
+];
 
 const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "max_header_bytes",
@@ -269,6 +271,10 @@ const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "max_frames_per_body",
     "max_http_connections",
     "max_http_handlers",
+    "websocket_bytes_global",
+    "websocket_admission_watermark_pct",
+    "websocket_eviction_watermark_pct",
+    "websocket_http_connection_reserve",
     "max_body_readers",
     "max_body_bytes_global",
     "max_sessions_global",
@@ -290,6 +296,8 @@ const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "max_static_files",
     "max_static_file_bytes",
     "max_static_bytes",
+    "debug_records_capacity",
+    "debug_bytes_global",
     "memory_envelope_bytes",
     "new_bootstraps_per_minute",
     "new_bootstraps_burst",
@@ -299,11 +307,27 @@ const WEB_LIMITS_CONFIG_KEYS: &[&str] = &[
     "new_streams_burst",
 ];
 
+const WEB_DEBUG_CONFIG_KEYS: &[&str] = &[
+    "enabled",
+    "capture_lifecycle",
+    "capture_headers",
+    "capture_timings",
+    "capture_frames",
+    "body_capture",
+    "body_prefix_bytes",
+    "decoy_body_prefix_bytes",
+    "default_window_secs",
+    "max_window_secs",
+];
+
 const WEB_TIMEOUTS_CONFIG_KEYS: &[&str] = &[
     "header_secs",
     "body_secs",
     "stream_handshake_secs",
     "long_poll_secs",
+    "websocket_write_secs",
+    "websocket_backpressure_secs",
+    "websocket_eviction_secs",
     "bootstrap_lifetime_secs",
     "reconnect_grace_secs",
     "http_idle_secs",
