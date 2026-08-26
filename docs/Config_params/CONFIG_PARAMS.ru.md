@@ -2483,13 +2483,13 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | Ключ | Тип | По умолчанию | Hot-Reload |
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
-| `carrier` | `"https"` или `"https-lanes"` | `"https"` | `✔` |
+| `carrier` | `"https"`, `"https-lanes"`, `"websocket"` или `"websocket-lanes"` | `"https"` | `✔` |
 | `debug` | таблица | выключено, ограниченные defaults | `✔` |
 | `limits` | таблица | ограниченные defaults | `✘` |
 | `timeouts` | таблица | ограниченные defaults | `✔` |
 | `vhosts` | массив таблиц | `[]` | `✔` |
 
-Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `carrier = "https"` сохраняет сериализованный HTTPS transport. При `carrier = "https-lanes"` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; этот carrier требует `max_http_handlers >= 2` и публичного HTTP/2 на TLS-терминаторе, чтобы убрать application-level inter-stream head-of-line blocking. Reload применяет `carrier` только к новым bridge sessions. Отключение WEB после reload прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
+Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `https` сохраняет сериализованный HTTPS transport. В `https-lanes` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; carrier требует `max_http_handlers >= 2` и публичного HTTP/2 на TLS-терминаторе. `websocket` переносит все logical streams через одно упорядоченное RFC 6455 connection, а `websocket-lanes` выделяет отдельное connection каждому ненулевому stream и изолирует сбои lane. Оба WebSocket carrier используют `GET /api/v1/ws` после создания HTTPS-сессии и требуют от TLS-терминатора сохранять HTTP/1.1 Upgrade headers. Reload применяет `carrier` только к новым bridge sessions. Отключение WEB после reload прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
 
 # [web.debug]
 
@@ -2497,10 +2497,10 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 
 | Ключ | Тип | По умолчанию | Описание |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `false` | Включает WEB HTTP, frame и lifecycle debug records. |
+| `enabled` | `bool` | `false` | Включает WEB HTTP, WebSocket-message, frame и lifecycle debug records. |
 | `capture_lifecycle` | `bool` | `true` | Записывает типизированные события bridge, session, stream, handshake, relay и close. |
 | `capture_headers` | `bool` | `true` | Сохраняет имена headers и только разрешённые значения без credentials. |
-| `capture_timings` | `bool` | `true` | Сохраняет Hyper timing points для request body, готового response и response body. |
+| `capture_timings` | `bool` | `true` | Сохраняет timing points для request body, готового response, response body и обработки WebSocket messages. |
 | `capture_frames` | `bool` | `true` | Разбирает bounded carrier bodies в тип frame, stream ID, длину, WINDOW и метаданные ошибок, не сохраняя frame payload отдельно. |
 | `body_capture` | `"off"`, `"metadata"`, `"prefix"` или `"full"` | `"metadata"` | Управляет сохранением байтов request и response body. |
 | `body_prefix_bytes` | `usize` | `4096` | Prefix распознанного WEB body, сохраняемый в режиме `prefix`. |
@@ -2523,6 +2523,10 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `max_frames_per_body` | `usize` | `4096` | Максимальное число frames в одном carrier body. |
 | `max_http_connections` | `usize` | `1024` | Принятые WEB HTTP connections на весь процесс. |
 | `max_http_handlers` | `usize` | `512` | Одновременно выполняемые HTTP handlers на весь процесс; HTTPS lanes могут занять long polls не более половины лимита, оставляя остаток для session, uplink и control work. |
+| `websocket_bytes_global` | `usize` | `268435456` | Подбюджет transient WebSocket codec, messages и write staging внутри `pending_bytes_global`. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | Доля WebSocket byte-budget, после которой новый admission может вытеснить owner-first victim. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | Доля WebSocket byte-budget, после которой queue pressure может вытеснить подходящее connection с наиболее старым прогрессом. |
+| `websocket_http_connection_reserve` | `usize` | `64` | Число принятых HTTP connections, недоступных WebSocket upgrades и сохраняющих capacity для обычного HTTP и decoy. |
 | `max_body_readers` | `usize` | `32` | Одновременно собираемые request bodies на весь процесс. |
 | `max_body_bytes_global` | `usize` | `67108864` | Глобальный байтовый резерв для собранных bodies. |
 | `max_sessions_global` | `usize` | `128` | Активные WEB-сессии на весь процесс. |
@@ -2546,7 +2550,7 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `max_static_bytes` | `usize` | `67108864` | Размер static snapshots всех vhosts. |
 | `debug_records_capacity` | `usize` | `65536` | Максимальное число сохранённых WEB debug records. |
 | `debug_bytes_global` | `usize` | `67108864` | Глобальная байтовая граница сохранённых и находящихся в обработке WEB debug данных; минимум 4096. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Заявленный envelope для HTTP heads, bodies, очередей, static snapshots и bounded debug/status buffers; максимум 4 GiB. |
+| `memory_envelope_bytes` | `usize` | `805306368` | Заявленный envelope для HTTP heads, bodies, общих queues/WebSocket I/O, static snapshots и bounded debug/status buffers; максимум 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Устойчивая process-wide скорость выдачи bootstrap. |
 | `new_bootstraps_burst` | `u32` | `256` | Process-wide burst выдачи bootstrap. |
 | `new_sessions_per_minute` | `u32` | `600` | Устойчивая process-wide скорость создания сессий. |
@@ -2564,6 +2568,9 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `body_secs` | `u64` | `30` | `✔` | Сбор одного аутентифицированного carrier body. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Выполнение внутреннего MTProxy handshake. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Максимальная длительность пустого downlink long poll. |
+| `websocket_write_secs` | `u64` | `30` | `✔` | Максимальное ожидание одной WebSocket write или flush операции. |
+| `websocket_backpressure_secs` | `u64` | `30` | `✔` | Максимальное ожидание прогресса общего byte-budget или queue перед закрытием затронутого connection. |
+| `websocket_eviction_secs` | `u64` | `1` | `✔` | Grace period для освобождения slot и budget вытесненным WebSocket до отказа admission. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Срок неиспользованного bootstrap и replay-marker закрытого token. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Максимальная неактивность carrier до закрытия сессии. |
 | `http_idle_secs` | `u64` | `75` | `✔` | Idle lifetime WEB HTTP keep-alive connection. |

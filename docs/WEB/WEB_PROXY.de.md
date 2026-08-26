@@ -2,7 +2,7 @@
 
 [English](WEB_PROXY.en.md) | [Русский](WEB_PROXY.ru.md) | [Deutsch](WEB_PROXY.de.md)
 
-Der WEB-Modus transportiert gewöhnliche MTProxy-Streams über begrenzte HTTPS-Carrier, die mit dem Proxy-Typ `WEB` von Telegram Desktop kompatibel sind. Telemt terminiert TLS nicht selbst: NGINX oder HAProxy verwaltet das öffentliche Zertifikat und leitet unverschlüsseltes HTTP/1.1 an einen privaten Telemt-Listener weiter.
+Der WEB-Modus transportiert gewöhnliche MTProxy-Streams über begrenzte HTTPS- oder WebSocket-Carrier, die mit dem Proxy-Typ `WEB` von Telegram Desktop kompatibel sind. Telemt terminiert TLS nicht selbst: NGINX oder HAProxy verwaltet das öffentliche Zertifikat und leitet unverschlüsseltes HTTP/1.1 an einen privaten Telemt-Listener weiter.
 
 > [!IMPORTANT]
 >
@@ -12,7 +12,7 @@ Der WEB-Modus transportiert gewöhnliche MTProxy-Streams über begrenzte HTTPS-C
 
 ```text
 Telegram Desktop
-    | HTTPS :443
+    | HTTPS oder WSS :443
     v
 NGINX oder HAProxy (TLS-Terminierung, kanonischer Host und eine X-Forwarded-For-Adresse)
     | unverschlüsseltes HTTP/1.1 in einem privaten Netz
@@ -28,7 +28,7 @@ Leiten Sie den vollständigen öffentlichen vhost an Telemt weiter. Wenn der TLS
 
 - Der öffentliche Endpunkt ist immer `https://HOST:443`.
 - Unterstützt werden 16-Byte-MTProxy-Secrets in den Modi `plain` und `dd`. FakeTLS-Secrets mit `ee` werden im WEB-Modus nicht unterstützt.
-- `web.carrier = "https"` wählt serialisierte HTTPS-Uplinks und Long Polling. `web.carrier = "https-lanes"` wählt unabhängige HTTPS-Sequenzen und Polls pro logischem Stream. WebSocket-Carrier werden nicht angeboten.
+- `web.carrier = "https"` wählt serialisierte HTTPS-Uplinks und Long Polling. `https-lanes` wählt unabhängige HTTPS-Sequenzen und Polls pro logischem Stream. `websocket` wählt einen geordneten WebSocket für alle Streams. `websocket-lanes` wählt einen unabhängig verwalteten WebSocket für jeden logischen Stream ungleich null.
 - Capability-, Bootstrap- und Session-Zugangsdaten sind getrennte Werte mit begrenzter Lebensdauer. Carrier-Zugangsdaten sind geheim und dürfen nicht in Access-Logs erscheinen.
 - Ein Bootstrap ist ein Bearer-Token und nicht an eine Quelladresse gebunden. Client-Adresse und IP-Familie dürfen sich zwischen dem Laden der Bridge und der Sitzungserstellung ändern. Die Ausstellungsadresse bleibt dem Limit ungenutzter Bootstraps zugeordnet; die Adresse des ersten gültigen Erstellungs-Requests wird der Sitzung zugeordnet.
 - Die innere MTProxy-Authentifizierung ist auf den Benutzer und Secret-Modus des vhost-Profils beschränkt. Ein ungültiger innerer Handshake schließt nur seinen logischen Stream und gelangt niemals in den TCP-Masking-Pfad.
@@ -99,6 +99,12 @@ Alle Lane-Queues bleiben innerhalb der vorhandenen Byte-/Item-Budgets pro Sitzun
 
 Die Pfade `/api/v1/up` und `/api/v1/down` ändern sich nicht. Bei `https-lanes` enthält jeder Request an diese Pfade genau einen kanonischen dezimalen `X-Lane-ID`-Header. Die Uplink-Sequenz beginnt pro Lane unabhängig bei `1`, der Downlink-Cursor bei `0`. Lane null akzeptiert nur Session-`PONG`; jeder Frame einer Lane ungleich null muss dieselbe Stream-ID tragen, und eine neue Lane muss mit `OPEN` beginnen. Nachdem eingereihte und nicht bestätigte Downlink-Daten einer geschlossenen Lane vollständig abgearbeitet sind, antwortet Telemt leer mit `X-Lane-Closed: 1`, und die Bridge beendet deren Polling. Wiederholungen bleiben byte-identisch und spielen die ursprüngliche Bestätigung oder den Downlink-Batch erneut aus.
 
+Beide WebSocket-Carrier erstellen und löschen die übergeordnete Sitzung weiterhin über HTTPS und verwenden danach einen strikten Upgrade-Request ohne Body an `GET /api/v1/ws`. `websocket` übermittelt in `Sec-WebSocket-Protocol` exakt `tproxy-v1.<session-token>`; binäre Messages sind geordnete Carrier-Batches, und ein Protokoll-, Deadline- oder Verbindungsfehler schließt die gesamte übergeordnete Sitzung. `websocket-lanes` übermittelt exakt `tproxy-lane-v1.<session-token>.<stream-id>`, wobei die Stream-ID kanonisch dezimal im Bereich `1..=16777215` steht. Die erste binäre Message muss mit `OPEN` beginnen, alle Frames müssen diese Stream-ID verwenden und ein Fehler nach dem Upgrade schließt nur diese Lane. Es gibt keinen Lane-null-WebSocket: HTTPS transportiert `HELLO` und `WELCOME`, während RFC-6455-Ping/Pong die Verbindungsliveness gewährleistet.
+
+WebSocket-Codec-Puffer und laufende Read-/Write-Messages teilen das prozesseigene Budget `pending_bytes_global` mit den Carrier-Queues und sind zusätzlich durch `websocket_bytes_global` begrenzt. Admission reserviert `websocket_http_connection_reserve` angenommene Verbindungen für gewöhnliches HTTP und Decoys. Unter Druck erfolgt die Verdrängung zuerst beim selben Owner und danach nach dem ältesten Fortschritt; Pre-Upgrade- und tote Verbindungen stehen vor aktiven Lanes und multiplexierten Sitzungen. Nach `long_poll_secs` ohne Peer-Aktivität wird auch bei kontinuierlichem Downlink-Verkehr ein Transport-Ping gesendet; fehlende Peer-Aktivität während des doppelten, beim Verbindungsaufbau festgelegten Intervalls macht die Verbindung zum Cleanup-Kandidaten.
+
+Jeder Authentifizierungs-, Shape-, Lane-Reservierungs- oder Kapazitätsfehler vor dem Upgrade folgt dem bereinigten Decoy-Pfad und legt keinen WebSocket-spezifischen Status offen. Das exakte Subprotokoll enthält den Session-Bearer und darf nicht protokolliert werden.
+
 Der WEB-Listener muss `proxy_protocol = false` und `reuse_allow = false` verwenden. `client_mss`, `synlimit`, `announce` und `announce_ip` sind nicht zulässig. `web_trusted_proxy_cidrs` muss nicht leer sein und darf nur die unmittelbar vorgeschalteten NGINX- oder HAProxy-Peers enthalten; `/0`-Netze werden abgelehnt.
 
 Der HTTP-Decoy-Origin muss eine Loopback-, Link-Local- oder private IP-Adresse als Literal verwenden. Telemt bewahrt bei gewöhnlichen Requests Methode, Pfad, Query, Header, gestreamten Body, Response-Status, Header und Body und entfernt Hop-by-Hop-Header. Vor dem Fallback auf den Decoy entfernt Telemt Carrier-Zugangsdaten und Bodys aus fehlerhaften Carrier-Requests.
@@ -119,6 +125,11 @@ Alle WEB-Schlüssel und Defaults sind in der [Konfigurationsreferenz](../Config_
 ## TLS-Terminierung mit NGINX
 
 ```nginx
+map $http_upgrade $telemt_connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
 upstream telemt_web {
     server 127.0.0.1:18080;
     keepalive 64;
@@ -140,11 +151,12 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header Connection "";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $telemt_connection_upgrade;
 
         proxy_connect_timeout 5s;
-        proxy_send_timeout 35s;
-        proxy_read_timeout 35s;
+        proxy_send_timeout 65s;
+        proxy_read_timeout 65s;
         proxy_request_buffering off;
         proxy_buffering off;
         proxy_next_upstream off;
@@ -152,9 +164,9 @@ server {
 }
 ```
 
-`client_max_body_size` muss mindestens `web.limits.max_body_bytes` entsprechen. `proxy_read_timeout` und `proxy_send_timeout` müssen größer als `web.timeouts.long_poll_secs` sein, dessen Default 25 Sekunden beträgt. Überschreiben Sie `X-Forwarded-For`, statt einen Wert anzuhängen. Telemt akzeptiert eine syntaktisch gültige IP-Adresse; fehlt der Header bei einem vertrauenswürdigen TLS-Terminator, verwendet Telemt die Adresse des direkten Peers, doch clientbezogene Limits und Quellrichtlinien sehen dann den Terminator statt des echten Clients. Aktivieren Sie keine Upstream-Wiederholungen: Der Bridge-Transport führt byte-identische Wiederholungen über sein eigenes Sequenzprotokoll aus.
+Platzieren Sie `map` im NGINX-Kontext `http`. `client_max_body_size` muss mindestens `web.limits.max_body_bytes` entsprechen. Read-, Send- und Client-Timeouts müssen sowohl den standardmäßigen 25-Sekunden-Long-Poll als auch das doppelte WebSocket-Liveness-Intervall überschreiten; 65 Sekunden decken die Defaults ab. Überschreiben Sie `X-Forwarded-For`, statt einen Wert anzuhängen. Telemt akzeptiert eine syntaktisch gültige IP-Adresse; fehlt der Header bei einem vertrauenswürdigen TLS-Terminator, verwendet Telemt die Adresse des direkten Peers, doch clientbezogene Limits und Quellrichtlinien sehen dann den Terminator statt des echten Clients. Aktivieren Sie keine Upstream-Wiederholungen: Die Bridge führt byte-identische HTTPS-Wiederholungen aus, ein etablierter WebSocket wird jedoch nie transparent wiederholt.
 
-Öffentliches HTTP/2 ist für `https-lanes` obligatorisch; verwenden Sie die entsprechende HTTP/2-Direktive der installierten NGINX-Version. Der private Hop von NGINX zu Telemt bleibt absichtlich HTTP/1.1. Die Upstream-Verbindungskapazität muss die erwarteten gleichzeitigen Lane-Polls tragen; `keepalive` steuert den Idle-Pool und ist keine Nebenläufigkeitsgrenze.
+Öffentliches HTTP/2 ist für `https-lanes` obligatorisch; verwenden Sie die entsprechende HTTP/2-Direktive der installierten NGINX-Version. WebSocket-Upgrade erfordert HTTP/1.1, daher muss der öffentliche Endpunkt auch HTTP/1.1 zulassen und der private Hop von NGINX zu Telemt bleibt HTTP/1.1. Bewahren Sie `Connection`, `Upgrade` und `Sec-WebSocket-*` wie gezeigt unverändert. Die Upstream-Verbindungskapazität muss die erwarteten gleichzeitigen Lane-Polls oder WebSocket-Lanes tragen; `keepalive` steuert den Idle-Pool und ist keine Nebenläufigkeitsgrenze.
 
 ## TLS-Terminierung mit HAProxy
 
@@ -171,14 +183,14 @@ backend telemt_web
     option http-keep-alive
     retries 0
     timeout connect 5s
-    timeout server 35s
+    timeout server 65s
     http-request set-header Host proxy.example.com
     http-request del-header X-Forwarded-For
     http-request set-header X-Forwarded-For %[src]
     server telemt_web_1 127.0.0.1:18080 check
 ```
 
-Im Frontend oder im Abschnitt `defaults` muss auch `timeout client` oberhalb der Long-Poll-Deadline liegen. Für `https-lanes` muss das öffentliche HAProxy-ALPN `h2` enthalten. Pfad, Raw Query, Body sowie die Carrier-Header `Authorization`, `Content-Type`, `X-Up-Seq`, `X-Down-Cursor` und `X-Lane-ID` dürfen nicht umgeschrieben werden.
+Im Frontend oder im Abschnitt `defaults` muss für das standardmäßige WebSocket-Liveness-Intervall auch `timeout client 65s` oder länger gesetzt sein. Für `https-lanes` muss das öffentliche HAProxy-ALPN `h2`, für WebSocket-Upgrade außerdem `http/1.1` enthalten. Bewahren Sie `Connection`, `Upgrade` und `Sec-WebSocket-*` unverändert; Pfad, Raw Query, Body sowie die Carrier-Header `Authorization`, `Content-Type`, `X-Up-Seq`, `X-Down-Cursor` und `X-Lane-ID` dürfen nicht umgeschrieben werden.
 
 ## Lebenszyklus und Reload-Verhalten
 
@@ -187,7 +199,7 @@ Im Frontend oder im Abschnitt `defaults` muss auch `timeout client` oberhalb der
 | Bestand der WEB-Listener, Bind-Adresse und Vertrauensrichtlinie | Prozesseigen; Telemt neu starten. |
 | Jeder Wert in `[web.limits]` | Prozesseigener Speicher- und Ressourcenvertrag; Telemt neu starten. |
 | `web.enabled`, `web.carrier`, `web.debug`, Timeouts, vhosts, Profile und Decoys | Werden vom Config-Watcher oder durch einen Runtime-Generations-Reload angewendet. |
-| Bestehende HTTP-Verbindungen und WEB-Sitzungen | Behalten Carrier, Grenzen und Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden den aktiven Carrier. Neue logische Streams verwenden die aktive Relay-Generation. |
+| Bestehende HTTP-Verbindungen und WEB-Sitzungen | Behalten Carrier, Grenzen und Session-Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden den aktiven Carrier. WebSocket-Write-, Backpressure- und Eviction-Vorgänge lesen die aktiven hot-reload-fähigen Deadlines. Neue logische Streams verwenden die aktive Relay-Generation. |
 | Beenden des Prozesses | Verwendet den zuletzt geladenen Wert von `web.timeouts.shutdown_secs`. |
 
 Jeder logische Stream behält die Client-IP seiner Sitzung und besitzt während der gesamten Relay-Lebensdauer einen prozessweit eindeutigen, von null verschiedenen synthetischen Quellport. Damit bleibt für Direct- und Middle-End-KDF-Routing ein stabiles, kollisionsfreies Quell-/Ziel-Tupel erhalten.
@@ -236,7 +248,7 @@ default_window_secs = 180
 max_window_secs = 3600
 ```
 
-Öffnen Sie `http://127.0.0.1:9091/web-status` mit derselben Whitelist direkter Peers und demselben exakten `Authorization`-Header wie für die API. Ein abschließender Slash wird akzeptiert. Nur `GET` ist zulässig. Die Seite unterstützt die Filter `window_secs`, kanonische `ip`, numerische `session`, `user_agent` ohne Beachtung der Groß-/Kleinschreibung und `key`. Wiederholen Sie `group_by=ip`, `group_by=session`, `group_by=user_agent` oder `group_by=key`, um gruppierte Zusammenfassungen zu erstellen; `limit` ist auf `1..=1000` beschränkt. Jede Zeile verweist auf eine Ansicht des exakten Datensatzes und lässt sich zu Methode, Pfad, bereinigten Headern, Body-Metadaten oder -Bytes, Zeitpunkten, geparsten Frames und typisierten Lifecycle-Ereignissen aufklappen.
+Öffnen Sie `http://127.0.0.1:9091/web-status` mit derselben Whitelist direkter Peers und demselben exakten `Authorization`-Header wie für die API. Ein abschließender Slash wird akzeptiert. Nur `GET` ist zulässig. Die Seite unterstützt die Filter `window_secs`, kanonische `ip`, numerische `session`, `user_agent` ohne Beachtung der Groß-/Kleinschreibung und `key`. Wiederholen Sie `group_by=ip`, `group_by=session`, `group_by=user_agent` oder `group_by=key`, um gruppierte Zusammenfassungen zu erstellen; `limit` ist auf `1..=1000` beschränkt. HTTP-Zeilen lassen sich vom Request bis zur Response zu Methode, Pfad, bereinigten Headern, Body-Metadaten oder -Bytes, Zeitpunkten, Frames und typisierten Lifecycle-Ereignissen aufklappen. Für WebSocket kommen der bereinigte Handshake `GET` → `101` sowie begrenzte Angaben pro Message zu Richtung, Message-Typ, Payload-/Body-Erfassung, Verarbeitungszeit, Verbindungs-/Lane-ID und geparsten inneren Frames hinzu. Rohe Subprotokolle und Session-Tokens werden nie gespeichert.
 
 Der prozesseigene Ring übersteht den Austausch einer Runtime-Generation. Änderungen der Erfassungs-Policy löschen inkompatible gespeicherte Datensätze; reine Änderungen des Beobachtungsfensters tun dies nicht. Der Ring ist standardmäßig auf 65536 Datensätze und 64 MiB gespeicherte plus in Verarbeitung befindliche Daten begrenzt, die HTML-Response auf 8 MiB und die Gruppierung auf 1024 Gruppen; gleichzeitig dürfen höchstens zwei Response-Bodys Seiten-Permits halten. Ändern Sie `web.limits.debug_records_capacity` oder `web.limits.debug_bytes_global` nur zusammen mit einem Prozessneustart. Ein hot-reload-fähiger Präfix, der nur in eine gleichzeitig erhöhte neustartpflichtige Kapazität passt, wird bis zu diesem Neustart zurückgestellt.
 
@@ -289,8 +301,9 @@ Der vollständige Vertrag für Requests, Revisionen, Fehler und alle Benutzer-En
 3. Prüfen Sie, dass Telemt genau eine syntaktisch gültige `X-Forwarded-For`-Adresse und `Host: proxy.example.com` oder `Host: proxy.example.com:443` erhält.
 4. Importieren Sie den ausgegebenen `tg://webproxy`-Link in den vorgesehenen Telegram-Desktop-Build und stellen Sie eine Proxy-Verbindung her.
 5. Bestätigen Sie für `https-lanes`, dass die öffentliche Verbindung HTTP/2 ausgehandelt hat, und testen Sie mindestens zwei gleichzeitige logische Streams; der private Hop zu Telemt bleibt HTTP/1.1.
-6. Testen Sie einen Reconnect und mindestens einen Long Poll über 25 Sekunden, um sicherzustellen, dass Frontend-Timeouts den Carrier nicht abbrechen.
-7. Prüfen Sie Benutzer- und logische MTProxy-Verbindungslimits anhand der Logical-Stream-Zähler und nicht anhand der Zahl der HTTP-Verbindungen.
+6. Bestätigen Sie für `websocket` eine `101`-Response, binären Relay-Datenverkehr und RFC-6455-Ping/Pong nach 25 Sekunden. Testen Sie für `websocket-lanes` mindestens zwei gleichzeitige Stream-Sockets und prüfen Sie, dass das Schließen oder Beschädigen einer Lane weder Geschwister noch die übergeordnete Sitzung schließt.
+7. Testen Sie einen Reconnect und mindestens einen Long Poll über 25 Sekunden, um sicherzustellen, dass Frontend-Timeouts den Carrier nicht abbrechen.
+8. Prüfen Sie Benutzer- und logische MTProxy-Verbindungslimits anhand der Logical-Stream-Zähler und nicht anhand der Zahl der HTTP-Verbindungen.
 
 ## Fehlerbehebung
 
@@ -299,6 +312,8 @@ Der vollständige Vertrag für Requests, Revisionen, Fehler und alle Benutzer-En
 | WEB-Konfiguration ist auf dem Datenträger gültig, aber das Listener-Verhalten hat sich nicht geändert | Prüfen Sie `deferred_process_fields`; Listener- und `[web.limits]`-Änderungen erfordern einen Neustart. |
 | Carrier-Requests erreichen den Decoy | Prüfen Sie den exakten vhost, den Secret-Modus des Links, das CIDR des direkten Proxys und genau einen syntaktisch gültigen `X-Forwarded-For`-Wert. |
 | Long Polls werden nach einem festen Intervall getrennt | Setzen Sie Client-, Server-, Sende- und Lese-Timeouts von NGINX/HAProxy über `web.timeouts.long_poll_secs`. |
+| WebSocket-Upgrade erreicht statt `101` den Decoy | Bewahren Sie HTTP/1.1 `Connection: Upgrade`, `Upgrade: websocket`, das einzelne exakte `Sec-WebSocket-Protocol` und den kanonischen bodylosen Request `/api/v1/ws`. Prüfen Sie außerdem Carrier-/Session-Kompatibilität und die Prozess-Verbindungsreserve. |
+| Ein `websocket-lanes`-Stream wurde geschlossen, Geschwister bleiben aber verbunden | Dies ist die beabsichtigte Fehlergrenze. Prüfen Sie die Message-/Frame-Zeilen dieser Lane in `/web-status`; fehlerhafte oder lane-fremde Frames, Write-Timeouts und Backend-Close schließen nur die betroffene Lane. |
 | `/web-status` ist leer | Prüfen Sie, dass `[web.debug].enabled = true` gesetzt ist, wenden Sie die Konfiguration an, wählen Sie ein Fenster innerhalb von `max_window_secs` und erzeugen Sie nach der Policy-Änderung neuen WEB-Datenverkehr. |
 | `https-lanes` funktioniert, Streams blockieren sich aber weiterhin | Prüfen Sie die öffentliche HTTP/2-Aushandlung, die unveränderte Weitergabe von `X-Lane-ID` und genügend TLS-Terminator-Upstream-Verbindungen für parallele private HTTP/1.1-Polls. |
 | Telegram Desktop lehnt den Link ab | Lassen Sie den Port weg und verwenden Sie einen gültigen FQDN, extern Port 443 sowie ausschließlich `plain` oder `dd`. |

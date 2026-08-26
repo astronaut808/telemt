@@ -2,7 +2,7 @@
 
 [English](WEB_PROXY.en.md) | [Русский](WEB_PROXY.ru.md) | [Deutsch](WEB_PROXY.de.md)
 
-WEB-режим переносит обычные MTProxy-потоки через bounded HTTPS carriers, совместимые с типом прокси `WEB` в Telegram Desktop. Telemt не терминирует TLS: публичный сертификат обслуживает NGINX или HAProxy, который передаёт обычный HTTP/1.1 на приватный listener Telemt.
+WEB-режим переносит обычные MTProxy-потоки через bounded HTTPS или WebSocket carriers, совместимые с типом прокси `WEB` в Telegram Desktop. Telemt не терминирует TLS: публичный сертификат обслуживает NGINX или HAProxy, который передаёт обычный HTTP/1.1 на приватный listener Telemt.
 
 > [!IMPORTANT]
 >
@@ -12,7 +12,7 @@ WEB-режим переносит обычные MTProxy-потоки через
 
 ```text
 Telegram Desktop
-    | HTTPS :443
+    | HTTPS или WSS :443
     v
 NGINX или HAProxy (TLS termination, канонический Host и один адрес X-Forwarded-For)
     | обычный HTTP/1.1 в приватной сети
@@ -28,7 +28,7 @@ WEB-listener Telemt
 
 - Публичный endpoint всегда имеет вид `https://HOST:443`.
 - Поддерживаются 16-байтовые MTProxy-секреты `plain` и `dd`. FakeTLS-секреты `ee` в WEB-режиме не поддерживаются.
-- `web.carrier = "https"` выбирает сериализованные HTTPS uplink и long polling. `web.carrier = "https-lanes"` выбирает независимые HTTPS sequencing и polling для каждого logical stream. WebSocket carriers не анонсируются.
+- `web.carrier = "https"` выбирает сериализованные HTTPS uplink и long polling. `https-lanes` выбирает независимые HTTPS sequencing и polling для каждого logical stream. `websocket` выбирает один упорядоченный WebSocket для всех streams. `websocket-lanes` выбирает отдельный WebSocket с независимым ownership для каждого ненулевого logical stream.
 - Capability, bootstrap и session credentials — отдельные значения с ограниченным сроком жизни. Carrier credentials считаются секретами и не должны попадать в access logs.
 - Bootstrap является bearer credential, а не token с привязкой к source address. Адрес клиента и его IP-семейство могут измениться между загрузкой bridge и созданием session. Адрес выдачи продолжает учитываться в лимите неиспользованных bootstrap, а владельцем session становится адрес первого корректного запроса создания.
 - Внутренняя MTProxy-аутентификация ограничена пользователем и режимом секрета, выбранными профилем vhost. Некорректный внутренний handshake закрывает только свой logical stream и никогда не попадает в TCP masking path.
@@ -99,6 +99,12 @@ max_streams_per_session = 64
 
 Paths `/api/v1/up` и `/api/v1/down` не меняются. В `https-lanes` каждый запрос к ним содержит один канонический десятичный `X-Lane-ID`. Uplink sequence начинается с `1`, а downlink cursor — с `0` независимо для каждой lane. Lane zero принимает только session `PONG`; все frames ненулевой lane должны иметь тот же stream ID, а новая lane должна начинаться с `OPEN`. После отправки всей queued и unacknowledged downlink data закрытой lane Telemt возвращает пустой ответ с `X-Lane-Closed: 1`, и bridge прекращает её polling. Retry остаются byte-identical и повторяют исходный acknowledgement или downlink batch.
 
+Оба WebSocket carrier по-прежнему создают и удаляют parent session через HTTPS, после чего используют строгий bodyless Upgrade-запрос `GET /api/v1/ws`. `websocket` передаёт в `Sec-WebSocket-Protocol` ровно `tproxy-v1.<session-token>`; binary messages являются упорядоченными carrier batches, а ошибка протокола, deadline или connection закрывает всю parent session. `websocket-lanes` передаёт ровно `tproxy-lane-v1.<session-token>.<stream-id>`, где stream ID записан каноническим десятичным числом из диапазона `1..=16777215`. Первое binary message должно начинаться с `OPEN`, все frames должны содержать этот stream ID, а сбой после Upgrade закрывает только данную lane. Lane-zero WebSocket отсутствует: HTTPS переносит `HELLO` и `WELCOME`, а liveness connection обеспечивает RFC 6455 Ping/Pong.
+
+WebSocket codec buffers и находящиеся в обработке read/write messages делят process-owned `pending_bytes_global` с carrier queues и дополнительно ограничены `websocket_bytes_global`. Admission оставляет `websocket_http_connection_reserve` принятых connections для обычного HTTP и decoy. При pressure вытеснение сначала выбирает того же owner, затем connection с наиболее старым прогрессом; pre-Upgrade и dead connections идут раньше активных lanes и multiplexed sessions. После `long_poll_secs` без peer activity отправляется transport Ping, в том числе при непрерывном downlink traffic, а отсутствие peer activity в течение удвоенного creation-time интервала делает connection кандидатом на cleanup.
+
+Любая ошибка authentication, shape, lane reservation или capacity до Upgrade следует по очищенному decoy path и не раскрывает WebSocket-специфичный status. Точный subprotocol содержит session bearer и не должен попадать в logs.
+
 Для WEB-listener обязательны `proxy_protocol = false` и `reuse_allow = false`. В нём нельзя использовать `client_mss`, `synlimit`, `announce` и `announce_ip`. Массив `web_trusted_proxy_cidrs` должен быть непустым и содержать только непосредственные адреса NGINX или HAProxy; сети `/0` запрещены.
 
 HTTP decoy origin должен быть loopback, link-local или private IP literal. Для обычных запросов Telemt сохраняет method, path, query, headers, streamed body, response status, headers и body, удаляя hop-by-hop headers. Перед отправкой некорректного carrier-запроса в decoy Telemt удаляет из него carrier credentials и body.
@@ -119,6 +125,11 @@ index = "index.html"
 ## Терминация TLS на NGINX
 
 ```nginx
+map $http_upgrade $telemt_connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
 upstream telemt_web {
     server 127.0.0.1:18080;
     keepalive 64;
@@ -140,11 +151,12 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header Connection "";
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $telemt_connection_upgrade;
 
         proxy_connect_timeout 5s;
-        proxy_send_timeout 35s;
-        proxy_read_timeout 35s;
+        proxy_send_timeout 65s;
+        proxy_read_timeout 65s;
         proxy_request_buffering off;
         proxy_buffering off;
         proxy_next_upstream off;
@@ -152,9 +164,9 @@ server {
 }
 ```
 
-`client_max_body_size` должен быть не меньше `web.limits.max_body_bytes`. Значения `proxy_read_timeout` и `proxy_send_timeout` должны превышать `web.timeouts.long_poll_secs`, по умолчанию равный 25 секундам. Перезаписывайте `X-Forwarded-For`, а не дополняйте его. Telemt принимает один корректно разбираемый IP-адрес; если доверенный TLS-терминатор не передал header, Telemt использует адрес непосредственного peer, но per-client limits и source policy тогда видят терминатор вместо реального клиента. Не включайте upstream retries: byte-identical retry выполняет сам bridge по своему sequence protocol.
+Разместите `map` в контексте `http` NGINX. `client_max_body_size` должен быть не меньше `web.limits.max_body_bytes`. Read, send и client timeouts должны превышать как default long poll в 25 секунд, так и удвоенный WebSocket liveness interval; 65 секунд покрывают defaults. Перезаписывайте `X-Forwarded-For`, а не дополняйте его. Telemt принимает один корректно разбираемый IP-адрес; если доверенный TLS-терминатор не передал header, Telemt использует адрес непосредственного peer, но per-client limits и source policy тогда видят терминатор вместо реального клиента. Не включайте upstream retries: bridge выполняет byte-identical HTTPS retries, но установленный WebSocket никогда не replay’ится прозрачно.
 
-Для `https-lanes` обязателен публичный HTTP/2; используйте эквивалентную HTTP/2-директиву, поддерживаемую установленной версией NGINX. Приватный hop NGINX-to-Telemt намеренно остаётся HTTP/1.1. Upstream connection capacity должна выдерживать ожидаемое число одновременных lane polls; `keepalive` управляет idle pool и не является лимитом concurrency.
+Для `https-lanes` обязателен публичный HTTP/2; используйте эквивалентную HTTP/2-директиву, поддерживаемую установленной версией NGINX. WebSocket Upgrade требует HTTP/1.1, поэтому публичный endpoint должен также разрешать HTTP/1.1, а приватный hop NGINX-to-Telemt остаётся HTTP/1.1. Сохраняйте `Connection`, `Upgrade` и `Sec-WebSocket-*` ровно как в примере. Upstream connection capacity должна выдерживать ожидаемое число одновременных lane polls или WebSocket lanes; `keepalive` управляет idle pool и не является лимитом concurrency.
 
 ## Терминация TLS на HAProxy
 
@@ -171,14 +183,14 @@ backend telemt_web
     option http-keep-alive
     retries 0
     timeout connect 5s
-    timeout server 35s
+    timeout server 65s
     http-request set-header Host proxy.example.com
     http-request del-header X-Forwarded-For
     http-request set-header X-Forwarded-For %[src]
     server telemt_web_1 127.0.0.1:18080 check
 ```
 
-Во frontend или секции `defaults` также задайте `timeout client` выше long-poll deadline. Для `https-lanes` публичный ALPN HAProxy должен содержать `h2`. Не переписывайте path, raw query, body и carrier headers `Authorization`, `Content-Type`, `X-Up-Seq`, `X-Down-Cursor`, `X-Lane-ID`.
+Во frontend или секции `defaults` также задайте `timeout client 65s` или больше для default WebSocket liveness interval. Для `https-lanes` публичный ALPN HAProxy должен содержать `h2`, а для WebSocket Upgrade — `http/1.1`. Сохраняйте `Connection`, `Upgrade` и `Sec-WebSocket-*`; не переписывайте path, raw query, body и carrier headers `Authorization`, `Content-Type`, `X-Up-Seq`, `X-Down-Cursor`, `X-Lane-ID`.
 
 ## Lifecycle и reload
 
@@ -187,7 +199,7 @@ backend telemt_web
 | Состав WEB-listeners, bind address и trust policy | Принадлежат процессу; перезапустите Telemt. |
 | Любое значение `[web.limits]` | Process-owned контракт памяти и ресурсов; перезапустите Telemt. |
 | `web.enabled`, `web.carrier`, `web.debug`, timeouts, vhosts, profiles и decoys | Применяются config watcher или runtime generation reload. |
-| Существующие HTTP connections и WEB sessions | Сохраняют carrier, лимиты и deadlines своего момента создания; новые bridge sessions получают активный carrier. Новые logical streams используют активное relay generation. |
+| Существующие HTTP connections и WEB sessions | Сохраняют carrier, лимиты и session deadlines своего момента создания; новые bridge sessions получают активный carrier. WebSocket write, backpressure и eviction operations читают активные hot-reloaded deadlines. Новые logical streams используют активное relay generation. |
 | Завершение процесса | Использует последнее применённое значение `web.timeouts.shutdown_secs`. |
 
 Каждый logical stream сохраняет client IP своей сессии и владеет уникальным в пределах процесса ненулевым synthetic source port до завершения relay. Это сохраняет один стабильный непересекающийся source/destination tuple для Direct и Middle-End KDF routing.
@@ -236,7 +248,7 @@ default_window_secs = 180
 max_window_secs = 3600
 ```
 
-Откройте `http://127.0.0.1:9091/web-status`, используя те же whitelist непосредственных peers и точный header `Authorization`, что и для API. Завершающий slash разрешён. Допускается только `GET`. Страница поддерживает фильтры `window_secs`, канонический `ip`, числовой `session`, регистронезависимый `user_agent` и `key`. Повторяйте `group_by=ip`, `group_by=session`, `group_by=user_agent` или `group_by=key` для построения сгруппированных сводок; `limit` ограничен диапазоном `1..=1000`. Каждая строка ссылается на просмотр точной записи и раскрывает method, path, очищенные headers, метаданные или байты body, timing points, разобранные frames и типизированные lifecycle events.
+Откройте `http://127.0.0.1:9091/web-status`, используя те же whitelist непосредственных peers и точный header `Authorization`, что и для API. Завершающий slash разрешён. Допускается только `GET`. Страница поддерживает фильтры `window_secs`, канонический `ip`, числовой `session`, регистронезависимый `user_agent` и `key`. Повторяйте `group_by=ip`, `group_by=session`, `group_by=user_agent` или `group_by=key` для построения сгруппированных сводок; `limit` ограничен диапазоном `1..=1000`. HTTP rows раскрываются от request до response с method, path, очищенными headers, метаданными или байтами body, timing points, frames и типизированными lifecycle events. Для WebSocket добавляются очищенный handshake `GET` → `101` и bounded per-message direction, message type, payload/body capture, processing time, connection/lane identifiers и разобранные inner frames. Raw subprotocol и session tokens никогда не сохраняются.
 
 Process-owned кольцевой буфер переживает замену runtime generation. Изменения capture policy очищают несовместимые сохранённые записи; изменения только окна наблюдения этого не делают. По умолчанию кольцо ограничено 65536 записями и 64 MiB сохранённых плюс находящихся в обработке данных, HTML-response — 8 MiB, grouping — 1024 группами; одновременно page permits могут удерживать не более двух response bodies. Изменяйте `web.limits.debug_records_capacity` или `web.limits.debug_bytes_global` только с перезапуском процесса. Hot prefix, который помещается только в одновременно увеличенную restart-only ёмкость, откладывается до этого перезапуска.
 
@@ -289,8 +301,9 @@ curl -sS -X POST http://127.0.0.1:9091/v1/users/web-user/rotate-secret \
 3. Убедитесь, что Telemt получает один корректно разбираемый адрес `X-Forwarded-For` и `Host: proxy.example.com` либо `Host: proxy.example.com:443`.
 4. Импортируйте напечатанную ссылку `tg://webproxy` в целевую сборку Telegram Desktop и установите соединение через прокси.
 5. Для `https-lanes` подтвердите согласование HTTP/2 на публичном connection и проверьте как минимум два одновременных logical streams; приватный hop к Telemt остаётся HTTP/1.1.
-6. Проверьте reconnect и как минимум один long poll длительнее 25 секунд, чтобы frontend timeouts не обрывали carrier.
-7. Проверяйте лимиты пользователя и logical MTProxy connections по logical-stream counters, а не по числу HTTP connections.
+6. Для `websocket` подтвердите один response `101`, binary relay traffic и RFC 6455 Ping/Pong после 25 секунд. Для `websocket-lanes` проверьте как минимум два одновременных stream sockets и убедитесь, что закрытие или повреждение одной lane не закрывает sibling или parent session.
+7. Проверьте reconnect и как минимум один long poll длительнее 25 секунд, чтобы frontend timeouts не обрывали carrier.
+8. Проверяйте лимиты пользователя и logical MTProxy connections по logical-stream counters, а не по числу HTTP connections.
 
 ## Диагностика
 
@@ -299,6 +312,8 @@ curl -sS -X POST http://127.0.0.1:9091/v1/users/web-user/rotate-secret \
 | WEB-конфигурация валидна на диске, но поведение listener’а не изменилось | Проверьте `deferred_process_fields`; listener и `[web.limits]` требуют перезапуска. |
 | Carrier-запросы попадают в decoy | Проверьте точный vhost, secret mode ссылки, CIDR непосредственного proxy и единственное корректно разбираемое значение `X-Forwarded-For`. |
 | Long polls разрываются через фиксированный интервал | Поднимите client, server, send и read timeouts NGINX/HAProxy выше `web.timeouts.long_poll_secs`. |
+| WebSocket Upgrade попадает в decoy вместо `101` | Сохраните HTTP/1.1 `Connection: Upgrade`, `Upgrade: websocket`, единственный точный `Sec-WebSocket-Protocol` и канонический bodyless request `/api/v1/ws`. Также проверьте соответствие carrier/session и process connection reserve. |
+| Один stream `websocket-lanes` закрылся, а siblings остались подключены | Это штатная failure boundary. Проверьте message/frame rows этой lane в `/web-status`; malformed, cross-lane, write-timeout и backend-close закрывают только затронутую lane. |
 | `/web-status` пуст | Убедитесь, что `[web.debug].enabled = true`, примените конфигурацию, выберите окно в пределах `max_window_secs` и создайте новый WEB-трафик после изменения policy. |
 | `https-lanes` работает, но streams всё ещё блокируют друг друга | Проверьте согласование публичного HTTP/2, сохранение `X-Lane-ID` и достаточное число upstream connections TLS-терминатора для параллельных приватных HTTP/1.1 polls. |
 | Telegram Desktop отклоняет ссылку | Не указывайте порт, используйте валидный FQDN, внешний порт 443 и только `plain` или `dd`. |

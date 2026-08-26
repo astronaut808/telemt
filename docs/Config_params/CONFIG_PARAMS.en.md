@@ -2557,13 +2557,13 @@ WEB mode carries Telegram Desktop MTProxy traffic through HTTPS terminated by an
 | Key | Type | Default | Hot-Reload |
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
-| `carrier` | `"https"` or `"https-lanes"` | `"https"` | `✔` |
+| `carrier` | `"https"`, `"https-lanes"`, `"websocket"`, or `"websocket-lanes"` | `"https"` | `✔` |
 | `debug` | table | disabled, bounded defaults | `✔` |
 | `limits` | table | bounded defaults | `✘` |
 | `timeouts` | table | bounded defaults | `✔` |
 | `vhosts` | array of tables | `[]` | `✔` |
 
-`enabled = true` requires at least one network-eligible WEB listener, at least one vhost, and at least one profile in every vhost. `carrier = "https"` preserves the serialized HTTPS transport. `carrier = "https-lanes"` gives stream zero and every logical stream independent uplink sequencing, downlink cursors, retries, and long polls; it requires `max_http_handlers >= 2` and public HTTP/2 on the TLS terminator to remove application-level inter-stream head-of-line blocking. A reload applies `carrier` only to newly issued bridge sessions. Disabling WEB stops issuance of new bridge and session credentials after reload; use the users API to revoke one user's active sessions.
+`enabled = true` requires at least one network-eligible WEB listener, at least one vhost, and at least one profile in every vhost. `https` preserves the serialized HTTPS transport. `https-lanes` gives stream zero and every logical stream independent uplink sequencing, downlink cursors, retries, and long polls; it requires `max_http_handlers >= 2` and public HTTP/2 on the TLS terminator. `websocket` carries all logical streams over one ordered RFC 6455 connection, while `websocket-lanes` owns one connection per non-zero logical stream and isolates lane failures. Both WebSocket carriers use `GET /api/v1/ws` after HTTPS session creation and require the TLS terminator to preserve HTTP/1.1 Upgrade headers. A reload applies `carrier` only to newly issued bridge sessions. Disabling WEB stops issuance of new bridge and session credentials after reload; use the users API to revoke one user's active sessions.
 
 # [web.debug]
 
@@ -2571,10 +2571,10 @@ This hot-reloadable table controls the process-owned server-side WEB debug recor
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `false` | Enables WEB HTTP, frame, and lifecycle debug records. |
+| `enabled` | `bool` | `false` | Enables WEB HTTP, WebSocket-message, frame, and lifecycle debug records. |
 | `capture_lifecycle` | `bool` | `true` | Records typed bridge, session, stream, handshake, relay, and close events. |
 | `capture_headers` | `bool` | `true` | Retains header names and only allowlisted non-credential values. |
-| `capture_timings` | `bool` | `true` | Retains request-body, response-ready, and response-body Hyper timing points. |
+| `capture_timings` | `bool` | `true` | Retains request-body, response-ready, response-body, and WebSocket message-processing timing points. |
 | `capture_frames` | `bool` | `true` | Parses bounded carrier bodies into frame type, stream ID, length, WINDOW, and error metadata without retaining frame payload separately. |
 | `body_capture` | `"off"`, `"metadata"`, `"prefix"`, or `"full"` | `"metadata"` | Controls request and response body byte retention. |
 | `body_prefix_bytes` | `usize` | `4096` | Prefix retained for recognized WEB bodies in `prefix` mode. |
@@ -2597,6 +2597,10 @@ These process-wide ceilings make every WEB registry, queue, request body, static
 | `max_frames_per_body` | `usize` | `4096` | Maximum frames parsed or emitted per carrier body. |
 | `max_http_connections` | `usize` | `1024` | Accepted WEB HTTP connections process-wide. |
 | `max_http_handlers` | `usize` | `512` | Concurrent HTTP handlers process-wide; HTTPS lanes may park at most half, preserving the remainder for session, uplink, and control work. |
+| `websocket_bytes_global` | `usize` | `268435456` | Transient WebSocket codec, message, and write-staging sub-budget inside `pending_bytes_global`. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket byte percentage at which new admission may replace an owner-first victim. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | WebSocket byte percentage at which queue pressure may evict the least-recently-progressed eligible connection. |
+| `websocket_http_connection_reserve` | `usize` | `64` | Accepted HTTP connections unavailable to WebSocket upgrades, preserving ordinary HTTP and decoy capacity. |
 | `max_body_readers` | `usize` | `32` | Concurrent collected request bodies process-wide. |
 | `max_body_bytes_global` | `usize` | `67108864` | Global byte reservation for collected bodies. |
 | `max_sessions_global` | `usize` | `128` | Live WEB sessions process-wide. |
@@ -2620,7 +2624,7 @@ These process-wide ceilings make every WEB registry, queue, request body, static
 | `max_static_bytes` | `usize` | `67108864` | Static snapshot bytes across all vhosts. |
 | `debug_records_capacity` | `usize` | `65536` | Maximum retained WEB debug record count. |
 | `debug_bytes_global` | `usize` | `67108864` | Retained plus in-flight WEB debug byte ceiling; minimum 4096. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Declared envelope for HTTP heads, bodies, queues, static snapshots, and bounded debug/status buffers; maximum 4 GiB. |
+| `memory_envelope_bytes` | `usize` | `805306368` | Declared envelope for HTTP heads, bodies, shared queues/WebSocket I/O, static snapshots, and bounded debug/status buffers; maximum 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Sustained process-wide bootstrap issuance rate. |
 | `new_bootstraps_burst` | `u32` | `256` | Process-wide bootstrap issuance burst. |
 | `new_sessions_per_minute` | `u32` | `600` | Sustained process-wide session creation rate. |
@@ -2638,6 +2642,9 @@ Every timeout is measured in seconds and must be within `1..=3600`. The longest 
 | `body_secs` | `u64` | `30` | `✔` | Collect one authenticated carrier body. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Complete one inner MTProxy handshake. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Maximum empty downlink long poll. |
+| `websocket_write_secs` | `u64` | `30` | `✔` | Maximum wait for one WebSocket write or flush. |
+| `websocket_backpressure_secs` | `u64` | `30` | `✔` | Maximum wait for shared byte-budget or queue progress before closing the affected connection. |
+| `websocket_eviction_secs` | `u64` | `1` | `✔` | Grace allowed for a pressure-evicted WebSocket to release its slot and budget before admission fails. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Unused bootstrap and closed-token replay lifetime. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Maximum carrier inactivity before session closure. |
 | `http_idle_secs` | `u64` | `75` | `✔` | WEB HTTP keep-alive idle lifetime. |

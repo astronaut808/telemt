@@ -1535,13 +1535,15 @@ The API provides partial operational control for WEB mode. It does not expose a 
 | Manage access users | Use `/v1/users`. Creating a user does not add it to `web.vhosts.profiles`; profile membership remains file-managed. |
 | Disable one user | `POST /v1/users/{username}/disable` updates admission immediately and cancels the user's active sessions. |
 | Rotate a profiled user's secret | Use `/v1/users/{username}/rotate-secret`; the config watcher rebuilds WEB capabilities from the new access snapshot. The API returns the secret, not a `tg://webproxy` link. |
-| Read WEB-specific runtime diagnostics | Use authenticated `GET /web-status`; filters cover client IP, process session ID, User-Agent, and non-secret key fingerprint, with optional grouping and expandable request-to-response details. |
+| Read WEB-specific runtime diagnostics | Use authenticated `GET /web-status`; filters cover client IP, process session ID, User-Agent, and non-secret key fingerprint, with optional grouping, expandable HTTP request-to-response details, and WebSocket handshake/message/frame rows. |
 
 `web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots are runtime-generation fields. A changed carrier applies only to newly issued bridge sessions; existing sessions retain their creation-time carrier. WEB listener inventory and trust policy, plus all `[web.limits]`, are process-owned. A successful reload can therefore activate the runtime-owned subset while reporting the process-owned subset as deferred.
 
 Before deleting a user referenced by a WEB profile, remove and apply the profile first. User mutations validate the complete resulting configuration, so a dangling WEB profile is rejected rather than persisted.
 
 The API whitelist is evaluated against the direct TCP peer and does not use the WEB listener's `X-Forwarded-For` policy. `/web-status` inherits API enablement, whitelist, gray action, and exact authorization-header checks; it accepts only `GET`, normalizes a trailing slash, sets `no-store` and restrictive browser security headers, caps each page at 8 MiB, and permits at most two concurrent renderers. Keep the API on a separate loopback or private bind, use a narrow whitelist and a non-empty exact `auth_header`, and do not expose it through the public WEB vhost.
+
+`window_secs` defaults to `[web.debug].default_window_secs = 180` and cannot exceed `max_window_secs`. The page can group by any combination of `ip`, `session`, `user_agent`, and `key`. Detail views retain policy-bounded HTTP method, sanitized headers, body, timing, and inner frames from request through response. For `websocket` and `websocket-lanes`, they additionally show the sanitized `GET` to `101` handshake and bounded per-message direction, type, payload/body capture, processing timing, connection/lane identifiers, and parsed inner frames. Raw query credentials, authorization values, WebSocket subprotocols, and session tokens are never retained.
 
 Deployment, TLS-terminator examples, links, and WEB-specific verification are documented in the [WEB proxy guide](../../WEB/WEB_PROXY.en.md).
 
