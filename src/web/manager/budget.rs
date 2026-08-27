@@ -52,10 +52,33 @@ pub(crate) struct WebDataBudgetSnapshot {
     pub(crate) queue_bytes: usize,
     /// Total queue items currently retained.
     pub(crate) queue_items: usize,
+    /// Control bytes included in the queue total.
+    pub(crate) queue_control_bytes: usize,
+    /// Control items included in the queue total.
+    pub(crate) queue_control_items: usize,
     /// Total WebSocket bytes currently retained.
     pub(crate) websocket_bytes: usize,
     /// Largest combined byte usage observed since process start.
     pub(crate) high_water_bytes: usize,
+    /// Distinct profile owners currently charged.
+    pub(crate) owners: usize,
+    /// Whether shutdown closed this allocation authority.
+    pub(crate) closed: bool,
+}
+
+/// Bounded owner-usage view captured before WebSocket registry selection.
+pub(super) struct WebSocketFairnessSnapshot {
+    /// Equal byte share at the admission watermark for captured owners.
+    pub(super) fair_share: usize,
+    /// Captured shared-budget use indexed by profile owner.
+    pub(super) owner_bytes: HashMap<ProfileKey, usize>,
+}
+
+impl WebSocketFairnessSnapshot {
+    /// Returns the captured byte usage for one quota owner.
+    pub(super) fn owner_usage(&self, owner: ProfileKey) -> usize {
+        self.owner_bytes.get(&owner).copied().unwrap_or(0)
+    }
 }
 
 impl WebDataBudget {
@@ -220,16 +243,10 @@ impl WebDataBudget {
         self.pressured.store(true, Ordering::Release);
     }
 
-    pub(super) fn owner_usage(&self, owner: ProfileKey) -> usize {
-        self.state
-            .lock()
-            .owner_bytes
-            .get(&owner)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub(super) fn fair_share(&self, additional_owner: Option<ProfileKey>) -> usize {
+    pub(super) fn fairness_snapshot(
+        &self,
+        additional_owner: Option<ProfileKey>,
+    ) -> WebSocketFairnessSnapshot {
         let state = self.state.lock();
         let mut owners = state.owner_bytes.len();
         if additional_owner.is_some_and(|owner| !state.owner_bytes.contains_key(&owner)) {
@@ -239,7 +256,10 @@ impl WebDataBudget {
             self.limits.websocket_bytes_global,
             self.limits.websocket_admission_watermark_pct,
         );
-        admission / owners.max(1)
+        WebSocketFairnessSnapshot {
+            fair_share: admission / owners.max(1),
+            owner_bytes: state.owner_bytes.clone(),
+        }
     }
 
     pub(super) fn snapshot(&self) -> WebDataBudgetSnapshot {
@@ -247,9 +267,27 @@ impl WebDataBudget {
         WebDataBudgetSnapshot {
             queue_bytes: state.queue_bytes,
             queue_items: state.queue_items,
+            queue_control_bytes: state.queue_control_bytes,
+            queue_control_items: state.queue_control_items,
             websocket_bytes: state.websocket_bytes,
             high_water_bytes: state.high_water_bytes,
+            owners: state.owner_bytes.len(),
+            closed: state.closed,
         }
+    }
+
+    pub(super) fn try_snapshot(&self) -> Option<WebDataBudgetSnapshot> {
+        let state = self.state.try_lock()?;
+        Some(WebDataBudgetSnapshot {
+            queue_bytes: state.queue_bytes,
+            queue_items: state.queue_items,
+            queue_control_bytes: state.queue_control_bytes,
+            queue_control_items: state.queue_control_items,
+            websocket_bytes: state.websocket_bytes,
+            high_water_bytes: state.high_water_bytes,
+            owners: state.owner_bytes.len(),
+            closed: state.closed,
+        })
     }
 
     pub(super) fn close(&self) {

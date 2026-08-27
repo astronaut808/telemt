@@ -254,6 +254,7 @@ pub(super) async fn handle(
     runtime: Arc<WebProcessRuntime>,
     vhost: Arc<WebRuntimeVhost>,
 ) -> HttpResponse {
+    let request_deadline = super::request_deadline(&request);
     let Some(parsed) = parse_upgrade(&request) else {
         return serve_decoy(request, vhost, true, &runtime).await;
     };
@@ -284,7 +285,16 @@ pub(super) async fn handle(
         },
     };
     let timeouts = session.timeouts().clone();
-    let connection = match runtime
+    let admission_lease = match request_deadline.as_ref() {
+        Some(deadline) => {
+            match deadline.lease_for(Duration::from_secs(timeouts.websocket_eviction_secs)) {
+                Some(lease) => Some(lease),
+                None => return serve_decoy(request, vhost, true, &runtime).await,
+            }
+        }
+        None => None,
+    };
+    let admitted = runtime
         .admit_websocket(
             session.profile_key(),
             session.trace_session_id(),
@@ -296,11 +306,17 @@ pub(super) async fn handle(
             Duration::from_secs(timeouts.websocket_eviction_secs),
             session.carrier_cancellation(),
         )
-        .await
-    {
+        .await;
+    drop(admission_lease);
+    let connection = match admitted {
         Ok(connection) => connection,
         Err(_) => return serve_decoy(request, vhost, true, &runtime).await,
     };
+    if let Some(reservation) = lane_reservation.as_mut()
+        && reservation.bind(connection.id()).is_err()
+    {
+        return serve_decoy(request, vhost, true, &runtime).await;
+    }
     if let Some(reservation) = probe_reservation.as_mut()
         && reservation.bind(connection.id()).is_err()
     {
@@ -323,6 +339,20 @@ pub(super) async fn handle(
         trace.bind_identity(session.trace_identity());
         trace.register_redaction(parsed.protocol.as_bytes());
     }
+    let upgrade_deadline = match request_deadline.as_ref() {
+        Some(deadline) => {
+            let Some(until) = tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(timeouts.websocket_upgrade_secs))
+            else {
+                return serve_decoy(request, vhost, true, &runtime).await;
+            };
+            match deadline.upgrade_until(until) {
+                Some(lease) => Some(lease),
+                None => return serve_decoy(request, vhost, true, &runtime).await,
+            }
+        }
+        None => None,
+    };
     let on_upgrade = hyper::upgrade::on(&mut request);
     let protocol = parsed.protocol;
     let accept = parsed.accept;
@@ -331,6 +361,7 @@ pub(super) async fn handle(
     runtime.spawn_auxiliary(async move {
         driver::run_upgraded(
             on_upgrade,
+            upgrade_deadline,
             driver_runtime,
             driver_session,
             connection,

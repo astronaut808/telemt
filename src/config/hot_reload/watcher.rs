@@ -213,20 +213,47 @@ pub fn spawn_config_watcher(
     detected_ip_v4: Option<IpAddr>,
     detected_ip_v6: Option<IpAddr>,
     cancellation: tokio_util::sync::CancellationToken,
-) -> (watch::Receiver<Arc<ProxyConfig>>, watch::Receiver<LogLevel>) {
+    mut activation: Option<watch::Receiver<bool>>,
+) -> (
+    watch::Receiver<Arc<ProxyConfig>>,
+    watch::Receiver<LogLevel>,
+    impl std::future::Future<Output = ()> + Send + 'static,
+) {
     let initial_level = initial.general.log_level.clone();
     let (config_tx, config_rx) = watch::channel(initial);
     let (log_tx, log_rx) = watch::channel(initial_level);
 
     let config_path = normalize_watch_path(&config_path);
-    let initial_loaded = ProxyConfig::load_with_metadata(&config_path).ok();
-    let initial_manifest = initial_loaded
-        .as_ref()
-        .map(|loaded| WatchManifest::from_source_files(&loaded.source_files))
-        .unwrap_or_else(|| WatchManifest::from_source_files(std::slice::from_ref(&config_path)));
-    let initial_snapshot_hash = initial_loaded.as_ref().map(|loaded| loaded.rendered_hash);
-
-    tokio::spawn(async move {
+    let task = async move {
+        if let Some(activation) = activation.as_mut() {
+            loop {
+                if *activation.borrow_and_update() {
+                    break;
+                }
+                tokio::select! {
+                    result = activation.changed() => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                    _ = cancellation.cancelled() => return,
+                }
+            }
+        }
+        let initial_loaded = ProxyConfig::load_with_metadata(&config_path).ok();
+        let initial_manifest = initial_loaded
+            .as_ref()
+            .map(|loaded| WatchManifest::from_source_files(&loaded.source_files))
+            .unwrap_or_else(|| {
+                WatchManifest::from_source_files(std::slice::from_ref(&config_path))
+            });
+        let initial_matches_disk = initial_loaded
+            .as_ref()
+            .is_some_and(|loaded| config_equal(config_tx.borrow().as_ref(), &loaded.config));
+        let initial_snapshot_hash = initial_loaded
+            .as_ref()
+            .filter(|_| initial_matches_disk)
+            .map(|loaded| loaded.rendered_hash);
         let (notify_tx, mut notify_rx) = mpsc::channel::<()>(4);
         let manifest_state = Arc::new(StdRwLock::new(WatchManifest::default()));
         let mut reload_state = ReloadState::new(initial_snapshot_hash);
@@ -304,6 +331,9 @@ pub fn spawn_config_watcher(
         if poll_watcher.is_some() {
             info!("config watcher: poll watcher active (Docker/NFS safe)");
         }
+        if initial_loaded.is_some() && !initial_matches_disk {
+            let _ = notify_tx.try_send(());
+        }
 
         #[cfg(unix)]
         let mut sighup = {
@@ -364,7 +394,7 @@ pub fn spawn_config_watcher(
                 );
             }
         }
-    });
+    };
 
-    (config_rx, log_rx)
+    (config_rx, log_rx, task)
 }

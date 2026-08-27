@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::state::{
@@ -11,16 +12,50 @@ use super::state::{
 };
 use super::{BootstrapResult, ManagerError, TOKEN_BYTES, TokenHash, WebProcessRuntime};
 use crate::config::WebRuntimeProfile;
+use crate::maestro::generation::RuntimeGeneration;
 use crate::web::session::WebSession;
 
 impl WebProcessRuntime {
     /// Issues a one-use bootstrap credential for an active compatible profile.
+    #[cfg(test)]
     pub(crate) fn issue_bootstrap(
         &self,
         profile: Arc<WebRuntimeProfile>,
         client_ip: IpAddr,
     ) -> std::result::Result<BootstrapResult, ManagerError> {
         let generation = self.active_generation();
+        self.issue_bootstrap_inner(&generation, profile, client_ip, None)
+    }
+
+    /// Issues one bootstrap against the generation that selected the bridge profile.
+    #[cfg(test)]
+    pub(crate) fn issue_bootstrap_for_generation(
+        &self,
+        generation: &Arc<RuntimeGeneration>,
+        profile: Arc<WebRuntimeProfile>,
+        client_ip: IpAddr,
+    ) -> std::result::Result<BootstrapResult, ManagerError> {
+        self.issue_bootstrap_inner(generation, profile, client_ip, None)
+    }
+
+    /// Issues one bridge bootstrap with bounded non-secret request metadata.
+    pub(crate) fn issue_bootstrap_for_request(
+        &self,
+        generation: &Arc<RuntimeGeneration>,
+        profile: Arc<WebRuntimeProfile>,
+        client_ip: IpAddr,
+        user_agent: Option<&str>,
+    ) -> std::result::Result<BootstrapResult, ManagerError> {
+        self.issue_bootstrap_inner(generation, profile, client_ip, user_agent)
+    }
+
+    fn issue_bootstrap_inner(
+        &self,
+        generation: &Arc<RuntimeGeneration>,
+        profile: Arc<WebRuntimeProfile>,
+        client_ip: IpAddr,
+        user_agent: Option<&str>,
+    ) -> std::result::Result<BootstrapResult, ManagerError> {
         let config = generation.config();
         let profile = config
             .web
@@ -34,7 +69,9 @@ impl WebProcessRuntime {
         let now = Instant::now();
         let mut state = self.state.lock();
         remove_expired_locked(&mut state, now);
+        state.apply_issuance_policy(generation.id, config.web.enabled);
         if state.closed
+            || !state.issuance_enabled
             || state
                 .bootstraps_per_ip
                 .get(&client_ip)
@@ -57,11 +94,12 @@ impl WebProcessRuntime {
             self.limit_hits.fetch_add(1, Ordering::Relaxed);
             return Err(ManagerError::Limit);
         }
-        let Some((token, hash)) = new_unique_token(&generation, &state) else {
+        let Some((token, hash)) = new_unique_token(generation, &state) else {
             self.limit_hits.fetch_add(1, Ordering::Relaxed);
             return Err(ManagerError::Limit);
         };
         let trace_session_id = self.trace.next_session_id();
+        let (user_agent, user_agent_id) = bounded_user_agent(user_agent);
         state.bootstraps.insert(
             hash,
             Bootstrap {
@@ -69,7 +107,10 @@ impl WebProcessRuntime {
                 issued_at: now,
                 issuance_ip: client_ip,
                 profile,
+                timeouts: config.web.timeouts.clone(),
                 trace_session_id,
+                user_agent,
+                user_agent_id,
                 body_digest: [0; TOKEN_BYTES],
                 session_token: Zeroizing::new(String::new()),
                 session: None,
@@ -110,19 +151,28 @@ impl WebProcessRuntime {
         })
     }
 
-    /// Resolves non-secret bootstrap trace identity without exposing its credential.
+    /// Resolves bootstrap trace identity and its issuance-frozen body timeout.
     pub(crate) fn bootstrap_trace_identity(
         &self,
         hash: TokenHash,
         host: &str,
-    ) -> Option<(u64, Arc<WebRuntimeProfile>)> {
+    ) -> Option<(u64, Arc<WebRuntimeProfile>, Duration)> {
         let now = Instant::now();
         self.state
             .lock()
             .bootstraps
             .get(&hash)
             .filter(|entry| entry.profile.host == host && now <= entry.expires_at)
-            .map(|entry| (entry.trace_session_id, Arc::clone(&entry.profile)))
+            .map(|entry| {
+                (
+                    entry.trace_session_id,
+                    Arc::clone(&entry.profile),
+                    entry.session.as_ref().map_or_else(
+                        || Duration::from_secs(entry.timeouts.body_secs),
+                        |session| Duration::from_secs(session.timeouts().body_secs),
+                    ),
+                )
+            })
     }
 
     /// Resolves an authenticated session token.
@@ -175,4 +225,31 @@ impl WebProcessRuntime {
         }
         closed.then_some(()).ok_or(ManagerError::Authentication)
     }
+}
+
+fn bounded_user_agent(value: Option<&str>) -> (Option<Arc<str>>, Option<[u8; 16]>) {
+    const DISPLAY_BYTES: usize = 256;
+    const HASH_CONTEXT: &[u8] = b"telemt-web-user-agent-v1\0";
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+    let mut digest = Sha256::new();
+    digest.update(HASH_CONTEXT);
+    digest.update(value.as_bytes());
+    let digest = digest.finalize();
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    let mut display = String::with_capacity(value.len().min(DISPLAY_BYTES));
+    for character in value.chars() {
+        let character = if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        };
+        if display.len().saturating_add(character.len_utf8()) > DISPLAY_BYTES {
+            break;
+        }
+        display.push(character);
+    }
+    (Some(Arc::from(display)), Some(id))
 }

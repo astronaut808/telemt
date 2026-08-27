@@ -166,6 +166,8 @@ impl WebSession {
         result
     }
 
+    // Batch application keeps every transactional accumulator explicit.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_batch_locked(
         self: &Arc<Self>,
         state: &mut SessionState,

@@ -46,7 +46,6 @@ async fn renderer_filters_groups_and_sets_control_plane_security_headers() {
     let response = render(
         Some("ip=192.0.2.40&session=42&key=0123456789abcdef&group_by=ip&group_by=key"),
         &store,
-        &policy,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -69,16 +68,34 @@ async fn render_permits_remain_owned_by_inflight_response_bodies() {
     let limits = crate::config::WebLimitsConfig::default();
     let store = WebTraceStore::new(policy.clone(), &limits);
 
-    let first = render(None, &store, &policy).await;
-    let second = render(None, &store, &policy).await;
-    let busy = render(None, &store, &policy).await;
+    let first = render(None, &store).await;
+    let second = render(None, &store).await;
+    let busy = render(None, &store).await;
     assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     drop(first);
-    let admitted = render(None, &store, &policy).await;
+    let admitted = render(None, &store).await;
     assert_eq!(admitted.status(), StatusCode::OK);
     drop(second);
     drop(admitted);
+}
+
+#[tokio::test]
+async fn stale_renderer_cannot_restore_an_old_debug_policy() {
+    let stale_policy = WebDebugConfig::default();
+    let active_policy = WebDebugConfig {
+        enabled: true,
+        capture_headers: false,
+        ..Default::default()
+    };
+    let limits = crate::config::WebLimitsConfig::default();
+    let store = WebTraceStore::new(stale_policy.clone(), &limits);
+    store.apply_policy(2, &active_policy);
+
+    let response = render(None, &store).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(store.status().policy.as_ref(), &active_policy);
 }
 
 #[test]

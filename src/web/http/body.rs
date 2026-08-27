@@ -114,9 +114,11 @@ pub(super) enum CollectBodyError {
 pub(super) async fn collect_body(
     request: Request<RequestBody>,
     runtime: &WebProcessRuntime,
+    body_timeout: Duration,
     limit: usize,
     allow_empty: bool,
 ) -> Result<CollectedBody, CollectBodyError> {
+    let request_deadline = super::request_deadline(&request);
     let exceeds_limit = request.body().size_hint().lower() > limit as u64
         || request
             .body()
@@ -133,8 +135,14 @@ pub(super) async fn collect_body(
     let Some((reader_budget, body_budget)) = runtime.try_body_budget(limit) else {
         return Err(CollectBodyError::Limit);
     };
-    let body_timeout =
-        Duration::from_secs(runtime.active_generation().config().web.timeouts.body_secs);
+    let _deadline_lease = match request_deadline {
+        Some(deadline) => Some(
+            deadline
+                .lease_for(body_timeout)
+                .ok_or(CollectBodyError::Limit)?,
+        ),
+        None => None,
+    };
     let body = match tokio::time::timeout(body_timeout, Limited::new(body, limit).collect()).await {
         Ok(Ok(body)) => body.to_bytes(),
         _ => {

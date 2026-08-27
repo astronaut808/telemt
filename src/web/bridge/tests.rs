@@ -10,6 +10,10 @@ fn render_page(bootstrap: &str, candidate_count: usize) -> BridgePage {
         true,
         candidate_count,
         [3, 5, 8, 12],
+        25,
+        10,
+        90,
+        0,
         &SecureRandom::new(),
     )
 }
@@ -44,6 +48,30 @@ fn rendered_page_preserves_the_ios_bootstrap_literal() {
 }
 
 #[test]
+fn rendered_page_embeds_the_configured_bridge_timing_policy() {
+    let page = render(
+        "proxy.example.com",
+        "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG",
+        2 * 1024 * 1024,
+        32 * 1024 * 1024,
+        16 * 1024,
+        true,
+        4,
+        [3, 5, 8, 12],
+        17,
+        7,
+        41,
+        4,
+        &SecureRandom::new(),
+    );
+
+    assert!(page.body.contains("const longPollMs=17*1000"));
+    assert!(page.body.contains("bridgeRequestMs=7*1000"));
+    assert!(page.body.contains("bridgeRetryMs=41*1000"));
+    assert!(page.body.contains("const probeCoalesceMs=4"));
+}
+
+#[test]
 fn effective_deadline_formula_uses_the_final_checkpoint() {
     let page = render_page("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 3);
     assert!(
@@ -67,6 +95,10 @@ fn disabled_negotiation_does_not_arm_a_carrier_deadline() {
         false,
         1,
         [3, 5, 8, 12],
+        25,
+        10,
+        90,
+        0,
         &SecureRandom::new(),
     );
     assert!(page.body.contains(
@@ -98,6 +130,10 @@ fn retry_and_attempt_state_are_frozen_before_fetch() {
 #[test]
 fn ambiguous_commit_is_resolved_before_carrier_advance() {
     let page = render_page("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 4);
+    assert!(
+        page.body
+            .contains("if(snapshot.selected){advanceConfirmed(reason,epoch);return}")
+    );
     assert!(page.body.contains("resolveAttempt(reason,epoch,snapshot)"));
     assert!(page.body.contains(
         "sessionEcho(response,snapshot.attempt,['provisional','committed','healthy'],true)"

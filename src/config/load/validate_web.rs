@@ -381,6 +381,11 @@ fn validate_vhosts(config: &mut ProxyConfig) -> Result<()> {
         validate_decoy(vhost_idx, &vhost.decoy)?;
         let mut profiles = HashSet::with_capacity(vhost.profiles.len());
         for (profile_idx, profile) in vhost.profiles.iter().enumerate() {
+            if profile.user.is_empty() || profile.user.len() > 64 {
+                return config_error(&format!(
+                    "web.vhosts[{vhost_idx}].profiles[{profile_idx}].user must contain 1..64 bytes"
+                ));
+            }
             if !config.access.users.contains_key(&profile.user) {
                 return config_error(&format!(
                     "web.vhosts[{vhost_idx}].profiles[{profile_idx}].user references unknown access user `{}`",

@@ -77,6 +77,11 @@ impl CarrierCapabilities {
         Self(0b1111)
     }
 
+    /// Returns the current server-authoritative native iOS capability ceiling.
+    pub(crate) const fn ios() -> Self {
+        Self(1 << WebCarrier::Https.index())
+    }
+
     /// Builds a set from a validated bit representation.
     pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
         if bits != 0 && bits & !0b1111 == 0 {
@@ -89,6 +94,11 @@ impl CarrierCapabilities {
     /// Returns whether the bridge can run one carrier.
     pub(crate) const fn contains(self, carrier: WebCarrier) -> bool {
         self.0 & (1 << carrier.index()) != 0
+    }
+
+    /// Intersects declared capabilities with an authoritative server ceiling.
+    pub(crate) const fn intersection(self, ceiling: Self) -> Option<Self> {
+        Self::from_bits(self.0 & ceiling.0)
     }
 }
 

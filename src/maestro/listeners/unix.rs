@@ -148,11 +148,42 @@ impl UnixAcceptHandle {
     }
 
     pub(super) async fn stop(&mut self) -> Result<(), String> {
-        self.cancellation.cancel();
+        self.request_stop();
         if let Some(task) = self.task.take() {
             task.await
                 .map_err(|error_value| format!("Unix listener task failed: {error_value}"))?;
         }
         Ok(())
+    }
+
+    /// Cancels Unix admission before process-owned listener waits begin.
+    pub(super) fn request_stop(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Joins the Unix acceptor by the process listener deadline.
+    pub(super) async fn stop_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        self.request_stop();
+        let Some(mut task) = self.task.take() else {
+            return Ok(());
+        };
+        if task.is_finished() {
+            return task
+                .await
+                .map_err(|error_value| format!("Unix listener task failed: {error_value}"));
+        }
+        match tokio::time::timeout_at(deadline, &mut task).await {
+            Ok(result) => {
+                result.map_err(|error_value| format!("Unix listener task failed: {error_value}"))
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err("Unix listener shutdown timed out".to_string())
+            }
+        }
     }
 }

@@ -184,6 +184,7 @@ async fn proxy_to_upstream(
     header_timeout: Duration,
     runtime: &WebProcessRuntime,
 ) -> HttpResponse {
+    let request_deadline = super::request_deadline(&request);
     remove_hop_by_hop(request.headers_mut());
     if let Ok(host) = HeaderValue::from_str(authority) {
         request.headers_mut().insert(header::HOST, host);
@@ -197,10 +198,15 @@ async fn proxy_to_upstream(
         return bad_gateway();
     };
     *request.uri_mut() = uri;
+    let _deadline_lease = match lease_deadline(request_deadline.as_ref(), header_timeout) {
+        Ok(lease) => lease,
+        Err(()) => return bad_gateway(),
+    };
     let stream = match tokio::time::timeout(header_timeout, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         _ => return bad_gateway(),
     };
+    drop(_deadline_lease);
     let max_header_bytes = runtime
         .active_generation()
         .config()
@@ -209,24 +215,44 @@ async fn proxy_to_upstream(
         .max_header_bytes;
     let mut builder = hyper::client::conn::http1::Builder::new();
     builder.max_buf_size(max_header_bytes);
+    let _deadline_lease = match lease_deadline(request_deadline.as_ref(), header_timeout) {
+        Ok(lease) => lease,
+        Err(()) => return bad_gateway(),
+    };
     let (mut sender, connection) =
         match tokio::time::timeout(header_timeout, builder.handshake(TokioIo::new(stream))).await {
             Ok(Ok(parts)) => parts,
             _ => return bad_gateway(),
         };
+    drop(_deadline_lease);
     runtime.spawn_auxiliary(async move {
         let _ = connection.await;
     });
+    let _deadline_lease = match lease_deadline(request_deadline.as_ref(), header_timeout) {
+        Ok(lease) => lease,
+        Err(()) => return bad_gateway(),
+    };
     let mut response =
         match tokio::time::timeout(header_timeout, sender.send_request(request)).await {
             Ok(Ok(response)) => response,
             _ => return bad_gateway(),
         };
+    drop(_deadline_lease);
     remove_hop_by_hop(response.headers_mut());
     response.map(|body| {
         body.map_err(|error| -> BoxError { Box::new(error) })
             .boxed_unsync()
     })
+}
+
+fn lease_deadline(
+    deadline: Option<&super::activity::RequestDeadlineHandle>,
+    timeout: Duration,
+) -> Result<Option<super::activity::RequestDeadlineLease>, ()> {
+    match deadline {
+        Some(deadline) => deadline.lease_for(timeout).map(Some).ok_or(()),
+        None => Ok(None),
+    }
 }
 
 fn sanitize_transport_request<B>(request: &mut Request<B>) {

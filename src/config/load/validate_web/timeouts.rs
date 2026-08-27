@@ -33,6 +33,18 @@ pub(super) fn validate(timeouts: &WebTimeoutsConfig) -> Result<()> {
     if !(2..=86_400).contains(&timeouts.carrier_learning_secs) {
         return config_error("web.timeouts.carrier_learning_secs must be within [2, 86400]");
     }
+    if !(1..=60).contains(&timeouts.bridge_request_secs) {
+        return config_error("web.timeouts.bridge_request_secs must be within [1, 60]");
+    }
+    if !(1..=300).contains(&timeouts.bridge_retry_secs) {
+        return config_error("web.timeouts.bridge_retry_secs must be within [1, 300]");
+    }
+    if timeouts.bridge_request_secs > timeouts.bridge_retry_secs {
+        return config_error("web.timeouts.bridge_request_secs must not exceed bridge_retry_secs");
+    }
+    if timeouts.carrier_probe_coalesce_ms > 10 {
+        return config_error("web.timeouts.carrier_probe_coalesce_ms must be within [0, 10]");
+    }
     if timeouts.stream_first_byte_secs > 300 {
         return config_error("web.timeouts.stream_first_byte_secs must be within [1, 300]");
     }

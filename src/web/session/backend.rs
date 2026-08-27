@@ -42,26 +42,13 @@ impl WebSession {
             drop(completion);
             return false;
         }
-        let Ok(connection_permit) = generation.max_connections.clone().try_acquire_owned() else {
-            manager.record_stream_rejected();
-            self.trace_lifecycle(
-                crate::web::trace::TraceLifecycleEvent::StreamRejected,
-                Some(stream.id),
-                Some("connection_limit"),
-            );
-            completion
-                .retain_rejected
-                .store(retain_reservation_on_reject, Ordering::Release);
-            drop(completion);
-            return false;
-        };
+        let connection_permits = Arc::clone(&generation.max_connections);
         let deps = generation.client_runtime_deps();
         let replay_checker = Arc::clone(&generation.replay_checker);
         let session = Arc::clone(self);
         let cancel = self.cancel.clone();
         let retain_rejected = Arc::clone(&completion.retain_rejected);
         let future = async move {
-            let _connection_permit = connection_permit;
             let _completion = completion;
             session.trace_lifecycle(
                 crate::web::trace::TraceLifecycleEvent::StreamAdmitted,
@@ -77,6 +64,7 @@ impl WebSession {
                     logical_stream,
                     deps,
                     replay_checker,
+                    connection_permits,
                     peer_port,
                 ) => {}
             }
@@ -219,6 +207,7 @@ async fn run_stream(
     stream: WebLogicalStream,
     deps: crate::proxy::authenticated::ClientRuntimeDeps,
     replay_checker: Arc<crate::stats::ReplayChecker>,
+    connection_permits: Arc<tokio::sync::Semaphore>,
     peer_port: u16,
 ) {
     use tokio::io::AsyncReadExt;
@@ -265,6 +254,15 @@ async fn run_stream(
         None,
     );
     let Some(manager) = session.manager.upgrade() else {
+        return;
+    };
+    let Ok(_connection_permit) = connection_permits.try_acquire_owned() else {
+        manager.record_stream_rejected();
+        session.trace_lifecycle(
+            crate::web::trace::TraceLifecycleEvent::StreamRejected,
+            Some(stream_identity.id),
+            Some("connection_limit_after_first_byte"),
+        );
         return;
     };
     let Some(handshake_permit) = manager.try_stream_handshake() else {

@@ -10,7 +10,9 @@ mod store;
 mod types;
 
 pub(crate) use exchange::HttpTraceExchange;
-pub(crate) use store::{StoredTraceRecord, WebTraceStore, epoch_millis as store_epoch_millis};
+pub(crate) use store::{
+    StoredTraceRecord, TraceClearOutcome, WebTraceStore, epoch_millis as store_epoch_millis,
+};
 pub(crate) use types::{
     TraceBodySnapshot, TraceBodyState, TraceDirection, TraceFrame, TraceHeader, TraceIdentity,
     TraceLifecycleEvent, TraceLifecycleRecord, TraceRecord, TraceRecordKind, TraceRoute,

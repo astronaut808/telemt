@@ -284,7 +284,7 @@ impl ListenerSlot {
     }
 
     pub(super) async fn stop(&mut self) -> Result<(), String> {
-        self.cancellation.cancel();
+        self.request_stop();
         if let Some(task) = self.task.take() {
             task.await.map_err(|error_value| {
                 format!("listener {} task failed: {error_value}", self.spec.addr)
@@ -303,6 +303,61 @@ impl ListenerSlot {
             .await
             .map_err(|_| format!("listener {} connection shutdown timed out", self.spec.addr))?;
         Ok(())
+    }
+
+    /// Cancels admission synchronously before the shared shutdown deadline starts draining.
+    pub(super) fn request_stop(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Joins this acceptor and its WEB connections by one process shutdown deadline.
+    pub(super) async fn stop_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        self.request_stop();
+        let mut errors = Vec::new();
+        if let Some(mut task) = self.task.take() {
+            let joined = if task.is_finished() {
+                Some(task.await)
+            } else {
+                match tokio::time::timeout_at(deadline, &mut task).await {
+                    Ok(result) => Some(result),
+                    Err(_) => {
+                        task.abort();
+                        let _ = task.await;
+                        None
+                    }
+                }
+            };
+            match joined {
+                Some(Ok(())) => {}
+                Some(Err(error_value)) => errors.push(format!(
+                    "listener {} task failed: {error_value}",
+                    self.spec.addr
+                )),
+                None => errors.push(format!(
+                    "listener {} accept shutdown timed out",
+                    self.spec.addr
+                )),
+            }
+        }
+        self.connections.close();
+        if !self.connections.is_empty()
+            && tokio::time::timeout_at(deadline, self.connections.wait())
+                .await
+                .is_err()
+        {
+            errors.push(format!(
+                "listener {} connection shutdown timed out",
+                self.spec.addr
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub(super) fn restart(&mut self, active_runtime: Arc<ArcSwap<RuntimeGeneration>>) {

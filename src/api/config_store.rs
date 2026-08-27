@@ -262,12 +262,12 @@ pub(super) async fn load_config_from_disk(config_path: &Path) -> Result<ProxyCon
         .map_err(|e| ApiFailure::internal(format!("failed to load config: {}", e)))
 }
 
-pub(super) async fn load_config_for_reload(config_path: &Path) -> Result<ProxyConfig, ApiFailure> {
-    let config_path = config_path.to_path_buf();
-    tokio::task::spawn_blocking(move || ProxyConfig::load(config_path))
-        .await
-        .map_err(|error| ApiFailure::internal(format!("failed to join config loader: {}", error)))?
-        .map_err(|error| ApiFailure::bad_request(format!("invalid runtime config: {}", error)))
+pub(super) async fn load_config_for_reload(
+    config_path: &Path,
+) -> Result<(ProxyConfig, String), ApiFailure> {
+    let loaded = load_config_snapshot(config_path, true).await?;
+    let revision = compute_snapshot_revision(&loaded);
+    Ok((loaded.config, revision))
 }
 
 #[allow(dead_code)]
@@ -307,6 +307,7 @@ pub(super) const EDITABLE_SECTIONS: &[&str] = &[
     "censorship",
     "upstreams",
     "dc_overrides",
+    "web",
 ];
 
 /// Nested fields under `[server]` that may be read/patched via the config API.
