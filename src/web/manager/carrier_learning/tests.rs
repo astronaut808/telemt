@@ -220,3 +220,52 @@ fn fifo_metadata_stays_within_the_entry_capacity() {
         assert!(learning.insertion_order.len() <= 3);
     }
 }
+
+#[tokio::test]
+async fn explicit_reset_preserves_policy_and_rejects_old_epoch_outcomes() {
+    let generation = crate::maestro::generation::test_runtime_generation(
+        1,
+        crate::config::ProxyConfig::default(),
+    );
+    let runtime = crate::web::manager::WebProcessRuntime::start(std::sync::Arc::new(
+        arc_swap::ArcSwap::from(generation.clone()),
+    ));
+    let now = Instant::now();
+    let old_epoch = {
+        let mut learning = runtime.learning.lock();
+        let epoch = learning
+            .apply_policy(
+                now,
+                true,
+                WebCarrierNegotiationAggressiveness::Aggressive,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        learning.record_chain(now, epoch, context(7), &[], WebCarrier::Websocket);
+        epoch
+    };
+
+    let outcome = runtime.reset_carrier_learning().unwrap();
+    {
+        let mut learning = runtime.learning.lock();
+        learning.record_chain(
+            Instant::now(),
+            old_epoch,
+            context(7),
+            &[],
+            WebCarrier::Https,
+        );
+        let status = learning.status(Instant::now());
+        assert!(status.enabled);
+        assert_eq!(
+            status.aggressiveness,
+            WebCarrierNegotiationAggressiveness::Aggressive
+        );
+        assert_eq!(status.entries, 0);
+        assert_eq!(status.epoch, Some(outcome.epoch));
+    }
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+}

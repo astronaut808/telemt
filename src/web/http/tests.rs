@@ -15,12 +15,21 @@ use crate::config::{
 };
 use crate::maestro::generation::test_runtime_generation;
 use crate::web::frame::{self, FrameType};
-use crate::web::manager::WebProcessRuntime;
+use crate::web::manager::{
+    CloseOperationSelector, ControlError, SessionDetail, SessionFilter, SessionListRequest,
+    SessionRefError, WebProcessRuntime,
+};
 
 #[path = "legacy_tests.rs"]
 mod legacy_tests;
 #[path = "negotiation_tests.rs"]
 mod negotiation_tests;
+// Reload-stability tests for session-owned timeout policy.
+#[path = "session_policy_tests.rs"]
+mod session_policy_tests;
+// Runtime control integration stays separate from carrier protocol scenarios.
+#[path = "control_tests.rs"]
+mod control_tests;
 
 const TEST_CARRIER_DEADLINES_SECS: [u64; 4] = [3, 5, 8, 12];
 
@@ -387,6 +396,26 @@ async fn unused_bootstrap_survives_equivalent_runtime_generation_swap() {
     runtime.shutdown().await;
     generation.stop_sessions().await;
     generation.stop_background_tasks().await;
+    replacement.stop_sessions().await;
+    replacement.stop_background_tasks().await;
+}
+
+#[tokio::test]
+async fn bridge_bootstrap_uses_the_generation_that_selected_its_profile() {
+    let initial = test_runtime_generation(1, runtime_config([21; 32], WebCarrier::Https));
+    let active_runtime = Arc::new(ArcSwap::from(Arc::clone(&initial)));
+    let runtime = WebProcessRuntime::start(Arc::clone(&active_runtime));
+    let profile = initial.config().web.runtime.as_ref().unwrap().profiles[0].clone();
+    let replacement = test_runtime_generation(2, runtime_config([22; 32], WebCarrier::HttpsLanes));
+    active_runtime.store(Arc::clone(&replacement));
+
+    let result =
+        runtime.issue_bootstrap_for_generation(&initial, profile, "192.0.2.10".parse().unwrap());
+
+    assert!(result.is_ok());
+    runtime.shutdown().await;
+    initial.stop_sessions().await;
+    initial.stop_background_tasks().await;
     replacement.stop_sessions().await;
     replacement.stop_background_tasks().await;
 }

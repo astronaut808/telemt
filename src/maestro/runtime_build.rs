@@ -28,9 +28,14 @@ use super::listeners::listener_rebind_supported;
 use super::runtime_tasks::RuntimeLogFilter;
 use super::{me_startup, runtime_tasks, tls_bootstrap};
 
+/// Fully prepared candidate runtime and its activation-gated config watcher.
 pub(crate) struct PreparedRuntime {
+    /// Candidate generation ready for publication.
     pub(crate) generation: Arc<RuntimeGeneration>,
+    /// Detected public addresses associated with the candidate.
     pub(crate) detected_ips: (Option<IpAddr>, Option<IpAddr>),
+    /// Gate opened only after the candidate becomes the active generation.
+    pub(crate) config_watcher_activation: watch::Sender<bool>,
 }
 
 pub(crate) async fn prepare_runtime(
@@ -171,6 +176,7 @@ pub(crate) async fn prepare_runtime(
         config.server.max_connections as usize
     };
     let max_connections = Arc::new(Semaphore::new(max_connections_limit));
+    let (config_watcher_activation, config_watcher_activation_rx) = watch::channel(false);
     let watches = runtime_tasks::spawn_runtime_tasks(
         &config,
         config_path,
@@ -190,6 +196,7 @@ pub(crate) async fn prepare_runtime(
         proxy_shared.clone(),
         me_ready_tx.clone(),
         task_scope.clone(),
+        Some(config_watcher_activation_rx),
     )
     .await;
     let config_rx = watches.config_rx;
@@ -295,6 +302,7 @@ pub(crate) async fn prepare_runtime(
 
     Ok(PreparedRuntime {
         generation,
+        config_watcher_activation,
         detected_ips: (
             probe.detected_ipv4.map(IpAddr::V4),
             probe.detected_ipv6.map(IpAddr::V6),

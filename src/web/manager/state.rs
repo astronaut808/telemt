@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::{CarrierRequest, ProfileKey, TOKEN_BYTES, TokenHash};
-use crate::config::{WebCarrier, WebRuntimeConfig, WebRuntimeProfile};
+use crate::config::{WebCarrier, WebRuntimeConfig, WebRuntimeProfile, WebTimeoutsConfig};
 use crate::maestro::generation::RuntimeGeneration;
 use crate::web::session::WebSession;
 
@@ -41,8 +41,14 @@ pub(super) struct Bootstrap {
     pub(super) issuance_ip: IpAddr,
     /// Immutable profile selected during capability validation.
     pub(super) profile: Arc<WebRuntimeProfile>,
+    /// Request and session deadlines frozen with the generated bridge.
+    pub(super) timeouts: WebTimeoutsConfig,
     /// Process-unique non-secret identifier shared by bootstrap and session traces.
     pub(super) trace_session_id: u64,
+    /// Bounded display form of the issuing User-Agent.
+    pub(super) user_agent: Option<Arc<str>>,
+    /// Opaque non-secret identifier used for exact User-Agent filtering.
+    pub(super) user_agent_id: Option<[u8; 16]>,
     /// Digest of the accepted HELLO body for idempotent retry matching.
     pub(super) body_digest: TokenHash,
     /// Zeroizing copy returned only for an exact session-creation retry.
@@ -87,6 +93,28 @@ pub(super) struct ClosedToken {
     pub(super) host: String,
 }
 
+/// Current logical-session owner stored without exposing bearer credentials.
+pub(super) struct LiveSessionIndex {
+    /// Current bearer hash used only for internal pointer revalidation.
+    pub(super) session_hash: TokenHash,
+    /// Bootstrap chain that owns carrier replacement and close intent.
+    pub(super) bootstrap_hash: TokenHash,
+    /// Current carrier incarnation in the logical trace session.
+    pub(super) attempt: u8,
+    /// Bounded display form of the issuing User-Agent.
+    pub(super) user_agent: Option<Arc<str>>,
+    /// Opaque non-secret identifier used for exact User-Agent filtering.
+    pub(super) user_agent_id: Option<[u8; 16]>,
+}
+
+/// Bounded logical-session tombstone used for exact detail semantics.
+pub(super) struct ClosedSession {
+    /// Tombstone expiry deadline.
+    pub(super) expires_at: Instant,
+    /// Last carrier incarnation closed for this logical session.
+    pub(super) attempt: u8,
+}
+
 /// Token-bucket state for one process-wide creation class.
 #[derive(Default)]
 pub(super) struct RateState {
@@ -114,7 +142,6 @@ pub(super) struct StreamAdmissionState {
 }
 
 /// Process-wide WEB registries and quota accounting protected by one short lock.
-#[derive(Default)]
 pub(super) struct ManagerState {
     /// Bootstrap credentials indexed by their SHA-256 token hash.
     pub(super) bootstraps: HashMap<TokenHash, Bootstrap>,
@@ -122,6 +149,12 @@ pub(super) struct ManagerState {
     pub(super) bootstraps_per_ip: HashMap<IpAddr, usize>,
     /// Live sessions indexed by bearer-token hash.
     pub(super) sessions: HashMap<TokenHash, Arc<WebSession>>,
+    /// Stable ordered logical-session lookup independent from bearer hashes.
+    pub(super) session_index: BTreeMap<u64, LiveSessionIndex>,
+    /// Recently closed logical sessions retained for exact detail responses.
+    pub(super) closed_sessions: HashMap<u64, ClosedSession>,
+    /// Insertion order for bounded logical-session tombstones.
+    pub(super) closed_session_order: VecDeque<u64>,
     /// Recently closed token hashes retained for idempotent DELETE semantics.
     pub(super) closed_tokens: HashMap<TokenHash, ClosedToken>,
     /// Live session counts by forwarded client address.
@@ -132,8 +165,46 @@ pub(super) struct ManagerState {
     pub(super) bootstrap_rate: RateState,
     /// Session creation rate limiter.
     pub(super) session_rate: RateState,
+    /// Generation-fenced issuance gate mirrored from the effective WEB policy.
+    pub(super) issuance_enabled: bool,
+    /// Generation that last authored `issuance_enabled`.
+    pub(super) issuance_generation: u64,
     /// Process shutdown admission latch.
     pub(super) closed: bool,
+}
+
+impl ManagerState {
+    pub(super) fn new(issuance_generation: u64, issuance_enabled: bool) -> Self {
+        Self {
+            bootstraps: HashMap::new(),
+            bootstraps_per_ip: HashMap::new(),
+            sessions: HashMap::new(),
+            session_index: BTreeMap::new(),
+            closed_sessions: HashMap::new(),
+            closed_session_order: VecDeque::new(),
+            closed_tokens: HashMap::new(),
+            sessions_per_ip: HashMap::new(),
+            sessions_per_profile: HashMap::new(),
+            bootstrap_rate: RateState::default(),
+            session_rate: RateState::default(),
+            issuance_enabled,
+            issuance_generation,
+            closed: false,
+        }
+    }
+
+    pub(super) fn apply_issuance_policy(&mut self, generation: u64, enabled: bool) {
+        if generation >= self.issuance_generation {
+            self.issuance_generation = generation;
+            self.issuance_enabled = enabled;
+        }
+    }
+}
+
+impl Default for ManagerState {
+    fn default() -> Self {
+        Self::new(0, false)
+    }
 }
 
 /// Generates one collision-checked credential and its stable hash key.
@@ -241,6 +312,16 @@ pub(super) fn remove_expired_locked(state: &mut ManagerState, now: Instant) {
     state
         .closed_tokens
         .retain(|_, closed| now <= closed.expires_at);
+    while state
+        .closed_session_order
+        .front()
+        .and_then(|trace_session_id| state.closed_sessions.get(trace_session_id))
+        .is_some_and(|closed| now > closed.expires_at)
+    {
+        if let Some(trace_session_id) = state.closed_session_order.pop_front() {
+            state.closed_sessions.remove(&trace_session_id);
+        }
+    }
 }
 
 /// Removes one bootstrap and releases its per-address issuance quota when unused.
@@ -278,6 +359,35 @@ pub(super) fn remember_closed_token_locked(
             break;
         };
         state.closed_tokens.remove(&oldest);
+    }
+}
+
+/// Retains one bounded logical-session marker without storing its bearer identity.
+pub(super) fn remember_closed_session_locked(
+    state: &mut ManagerState,
+    trace_session_id: u64,
+    attempt: u8,
+    lifetime: Duration,
+    capacity: usize,
+) {
+    if state
+        .closed_sessions
+        .insert(
+            trace_session_id,
+            ClosedSession {
+                expires_at: Instant::now() + lifetime,
+                attempt,
+            },
+        )
+        .is_none()
+    {
+        state.closed_session_order.push_back(trace_session_id);
+    }
+    while state.closed_sessions.len() > capacity {
+        let Some(oldest) = state.closed_session_order.pop_front() else {
+            break;
+        };
+        state.closed_sessions.remove(&oldest);
     }
 }
 

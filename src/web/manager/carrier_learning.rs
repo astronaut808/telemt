@@ -163,6 +163,34 @@ pub(super) struct CarrierLearning {
     policy_started_at: Instant,
 }
 
+/// Bounded control-plane summary of carrier-learning state.
+#[derive(Clone, Copy)]
+pub(crate) struct CarrierLearningStatus {
+    /// Whether outcome learning is active in the effective policy.
+    pub(crate) enabled: bool,
+    /// Effective evidence thresholds.
+    pub(crate) aggressiveness: WebCarrierNegotiationAggressiveness,
+    /// Current evidence epoch, or none after counter exhaustion.
+    pub(crate) epoch: Option<u64>,
+    /// Retained evidence entries.
+    pub(crate) entries: usize,
+    /// Restart-owned evidence ceiling.
+    pub(crate) capacity: usize,
+    /// Effective evidence lifetime.
+    pub(crate) lifetime_secs: u64,
+    /// Monotonic age of the current policy epoch.
+    pub(crate) age_ms: u64,
+}
+
+/// Result of one epoch-fenced learning reset.
+#[derive(Clone, Copy)]
+pub(crate) struct CarrierLearningResetOutcome {
+    /// Evidence entries detached by the reset.
+    pub(crate) entries_cleared: usize,
+    /// New epoch fencing pre-reset outcomes.
+    pub(crate) epoch: u64,
+}
+
 impl CarrierLearning {
     /// Creates an empty store under the restart-owned capacity ceiling.
     pub(super) fn new(capacity: usize) -> Self {
@@ -174,6 +202,23 @@ impl CarrierLearning {
             epoch: Some(0),
             policy: None,
             policy_started_at: Instant::now(),
+        }
+    }
+
+    fn status(&self, now: Instant) -> CarrierLearningStatus {
+        let policy = self.policy.unwrap_or(LearningPolicy {
+            enabled: false,
+            aggressiveness: WebCarrierNegotiationAggressiveness::Conservative,
+            lifetime: Duration::ZERO,
+        });
+        CarrierLearningStatus {
+            enabled: policy.enabled,
+            aggressiveness: policy.aggressiveness,
+            epoch: self.epoch,
+            entries: self.entries.len(),
+            capacity: self.capacity,
+            lifetime_secs: policy.lifetime.as_secs(),
+            age_ms: millis(now.saturating_duration_since(self.policy_started_at)),
         }
     }
 
@@ -422,6 +467,51 @@ impl CarrierLearning {
         self.insertion_sequence = sequence.checked_add(1)?;
         Some(sequence)
     }
+}
+
+impl super::WebProcessRuntime {
+    /// Captures learning state without waiting for a contended evidence lock.
+    pub(crate) fn try_carrier_learning_status(&self) -> Option<CarrierLearningStatus> {
+        self.learning
+            .try_lock()
+            .map(|learning| learning.status(Instant::now()))
+    }
+
+    /// Clears all evidence under a new epoch without changing the active policy.
+    pub(crate) fn reset_carrier_learning(
+        &self,
+    ) -> Result<CarrierLearningResetOutcome, super::ManagerError> {
+        let control = self
+            .control_mutation_guard()
+            .map_err(|_| super::ManagerError::Closed)?;
+        let (outcome, retired_entries, retired_order) = {
+            let mut learning = self.learning.lock();
+            let epoch = learning
+                .epoch
+                .and_then(|epoch| epoch.checked_add(1))
+                .ok_or(super::ManagerError::Closed)?;
+            learning.epoch = Some(epoch);
+            learning.insertion_sequence = 1;
+            learning.policy_started_at = Instant::now();
+            let retired_entries = std::mem::take(&mut learning.entries);
+            let retired_order = std::mem::take(&mut learning.insertion_order);
+            (
+                CarrierLearningResetOutcome {
+                    entries_cleared: retired_entries.len(),
+                    epoch,
+                },
+                retired_entries,
+                retired_order,
+            )
+        };
+        drop(control);
+        drop((retired_entries, retired_order));
+        Ok(outcome)
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn supported(configured: &[WebCarrier], request: super::CarrierRequest) -> Vec<WebCarrier> {

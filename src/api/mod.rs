@@ -30,6 +30,7 @@ use crate::startup::StartupTracker;
 use crate::stats::Stats;
 use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
+use crate::web::control::WebRuntimePublication;
 use crate::web::trace::WebTraceStore;
 
 mod config_edit;
@@ -48,6 +49,8 @@ mod runtime_stats;
 mod runtime_watch;
 mod runtime_zero;
 mod users;
+// WEB runtime status and bounded controls remain separate from general API DTOs.
+mod web_runtime;
 mod web_status;
 
 use config_store::{
@@ -125,6 +128,7 @@ pub(super) struct ApiShared {
     pub(super) reload_control: ReloadControl,
     pub(super) active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     pub(super) web_trace: Arc<WebTraceStore>,
+    pub(super) web_runtime_rx: watch::Receiver<WebRuntimePublication>,
 }
 
 impl ApiShared {
@@ -159,6 +163,7 @@ impl ApiShared {
             reload_control: self.reload_control.clone(),
             active_runtime: self.active_runtime.clone(),
             web_trace: self.web_trace.clone(),
+            web_runtime_rx: self.web_runtime_rx.clone(),
         }
     }
 }
@@ -196,9 +201,15 @@ async fn submit_reload_from_disk(
     request: ReloadRequest,
 ) -> Result<(ReloadAccepted, String), ApiFailure> {
     let _guard = mutation_lock.lock().await;
-    ensure_expected_revision(config_path, expected_revision).await?;
-    let revision = current_revision(config_path).await?;
-    let config = Arc::new(load_config_for_reload(config_path).await?);
+    let (config, revision) = load_config_for_reload(config_path).await?;
+    if expected_revision.is_some_and(|expected| expected != revision) {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "revision_conflict",
+            "Config revision mismatch",
+        ));
+    }
+    let config = Arc::new(config);
     let accepted = reload_control
         .submit(config, revision.clone(), request)
         .await
@@ -218,6 +229,9 @@ async fn submit_reload_from_disk(
 }
 
 fn allowed_methods_for_path(path: &str) -> Option<&'static str> {
+    if let Some(allow) = web_runtime::allowed_methods(path) {
+        return Some(allow);
+    }
     match path {
         "/v1/health"
         | "/v1/health/ready"
@@ -285,6 +299,7 @@ pub async fn serve(
     mut active_runtime_rx: watch::Receiver<Option<Arc<ArcSwap<RuntimeGeneration>>>>,
     mut runtime_watch_rx: watch::Receiver<Option<RuntimeWatchState>>,
     web_trace: Arc<WebTraceStore>,
+    web_runtime_rx: watch::Receiver<WebRuntimePublication>,
 ) {
     let active_runtime = loop {
         if let Some(active_runtime) = active_runtime_rx.borrow().clone() {
@@ -351,6 +366,7 @@ pub async fn serve(
         reload_control,
         active_runtime,
         web_trace,
+        web_runtime_rx,
     });
 
     spawn_runtime_watchers(
@@ -498,9 +514,30 @@ async fn handle(
     let body_limit = api_cfg.request_body_limit_bytes;
 
     let result: Result<Response<Full<Bytes>>, ApiFailure> = async {
+        if web_runtime::is_route(normalized_path) {
+            let web_mutation = method == Method::POST;
+            let result = web_runtime::handle(
+                method,
+                normalized_path,
+                query.as_deref(),
+                req,
+                shared.as_ref(),
+                cfg.as_ref(),
+                request_id,
+                body_limit,
+            )
+            .await;
+            if web_mutation && let Err(error) = &result {
+                shared.runtime_events.record(
+                    "api.web.control.failed",
+                    format!("path={} code={}", normalized_path, error.code),
+                );
+            }
+            return result;
+        }
         match (method.as_str(), normalized_path) {
             ("GET", "/web-status") => {
-                Ok(web_status::render(query.as_deref(), &shared.web_trace, &cfg.web.debug).await)
+                Ok(web_status::render(query.as_deref(), &shared.web_trace).await)
             }
             ("GET", "/v1/health") => {
                 let revision = current_revision(&shared.config_path).await?;

@@ -178,7 +178,7 @@ async fn metadata_free_native_client_uses_fallback_when_candidates_are_enabled()
 }
 
 #[tokio::test]
-async fn explicit_native_capabilities_participate_in_automatic_selection() {
+async fn explicit_native_capabilities_are_limited_to_https() {
     let capability = [56; 32];
     let generation = test_runtime_generation(
         1,
@@ -202,12 +202,9 @@ async fn explicit_native_capabilities_participate_in_automatic_selection() {
     .await;
     let (headers, _) = split_response(&response);
     assert!(headers.starts_with(b"HTTP/1.1 200"));
-    assert_eq!(
-        response_header(headers, "x-carrier-mode"),
-        "websocket-lanes"
-    );
+    assert_eq!(response_header(headers, "x-carrier-mode"), "https");
     assert_eq!(response_header(headers, "x-carrier-attempt"), "1");
-    assert_eq!(response_header(headers, "x-carrier-candidate-count"), "2");
+    assert_eq!(response_header(headers, "x-carrier-candidate-count"), "1");
 
     runtime.shutdown().await;
     generation.stop_sessions().await;

@@ -24,6 +24,9 @@ mod backend;
 mod downlink;
 // Response ownership keeps detached batches charged until the last body clone drops.
 mod resident;
+// Read-only control-plane snapshots stay isolated from carrier operations.
+mod status;
+pub(crate) use status::WebSessionStatus;
 // Lane carrier state isolates request sequencing and downlink replay per logical stream.
 mod lanes;
 // Lane batch staging transfers queue ownership without escaping process budgets.
@@ -60,6 +63,22 @@ struct InboundChunk {
 pub(crate) struct StreamIdentity {
     pub(crate) id: u32,
     pub(crate) instance: u64,
+}
+
+/// Exact server-local identity of one carrier-lane incarnation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CarrierLaneIdentity {
+    /// Numeric lane identifier carried on the wire.
+    pub(crate) lane_id: u32,
+    /// Monotonic server-local incarnation of that numeric lane.
+    pub(crate) instance: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WebSocketLaneClaim {
+    lane: CarrierLaneIdentity,
+    peer_port: u16,
+    connection_id: Option<u64>,
 }
 
 struct StreamState {
@@ -144,7 +163,7 @@ struct SessionState {
     carrier_lanes: HashMap<u32, CarrierLane>,
     lane_open_waits: usize,
     next_lane_instance: u64,
-    websocket_lane_reservations: HashMap<u32, u16>,
+    websocket_lane_reservations: HashMap<u32, WebSocketLaneClaim>,
     pending_bytes: usize,
     pending_items: usize,
     pending_control_bytes: usize,
@@ -189,6 +208,7 @@ pub(crate) struct WebSession {
     carrier_class: CarrierClientClass,
     learning_context: Option<CarrierLearningContext>,
     automatic_carrier: bool,
+    created_at: Instant,
     limits: WebLimitsConfig,
     timeouts: WebTimeoutsConfig,
     state: Mutex<SessionState>,
@@ -252,6 +272,7 @@ impl WebSession {
             carrier_class,
             learning_context,
             automatic_carrier,
+            created_at: Instant::now(),
             limits,
             timeouts,
             state: Mutex::new(SessionState {
@@ -326,6 +347,11 @@ impl WebSession {
     /// Returns the process-unique non-secret trace identifier.
     pub(crate) fn trace_session_id(&self) -> u64 {
         self.trace_session_id
+    }
+
+    /// Returns the immutable carrier-attempt incarnation number.
+    pub(crate) fn carrier_attempt(&self) -> u8 {
+        self.carrier_attempt
     }
 
     /// Creates a child cancellation boundary for one owned carrier task.
@@ -506,11 +532,14 @@ fn remember_closed(state: &mut SessionState, stream_id: u32, limit: usize) -> Op
     evicted
 }
 
-fn insert_carrier_lane(state: &mut SessionState, lane_id: u32) -> Option<u64> {
+fn insert_carrier_lane(state: &mut SessionState, lane_id: u32) -> Option<CarrierLaneIdentity> {
+    if state.carrier_lanes.contains_key(&lane_id) {
+        return None;
+    }
     let instance = state.next_lane_instance;
     state.next_lane_instance = instance.checked_add(1)?;
     state
         .carrier_lanes
         .insert(lane_id, CarrierLane::new(instance));
-    Some(instance)
+    Some(CarrierLaneIdentity { lane_id, instance })
 }

@@ -88,6 +88,64 @@ async fn read_managed_config_strips_access() {
 }
 
 #[tokio::test]
+async fn read_managed_config_exposes_web_without_runtime_or_access_secrets() {
+    let (path, _directory) = temp_config(concat!(
+        "[web]\nenabled = false\ncarrier = \"https\"\n",
+        "[web.debug]\nenabled = true\ndefault_window_secs = 180\n",
+        "[access.users]\nbob = \"00000000000000000000000000000000\"\n",
+    ));
+
+    let (value, _revision) = read_managed_config(&path).await.unwrap();
+    let table = value.as_table().unwrap();
+
+    assert!(table.contains_key("web"));
+    assert!(table["web"].get("debug").is_some());
+    assert!(table["web"].get("runtime").is_none());
+    assert!(!table.contains_key("access"));
+}
+
+#[tokio::test]
+async fn patch_web_debug_is_hot_and_limits_are_process_deferred() {
+    let (path, _directory) = temp_config("[web]\nenabled = false\n");
+    let debug_patch: Json = serde_json::json!({
+        "web": {"debug": {"enabled": true, "capture_headers": false}}
+    });
+    let debug = apply_patch_to_path(&path, &debug_patch, None)
+        .await
+        .unwrap();
+    assert!(!debug.process_restart_required);
+    assert!(debug.changed.iter().any(|section| section == "web"));
+
+    let limits_patch: Json = serde_json::json!({
+        "web": {"limits": {"max_http_connections": 2049}}
+    });
+    let limits = apply_patch_to_path(&path, &limits_patch, None)
+        .await
+        .unwrap();
+    assert!(limits.process_restart_required);
+    assert!(
+        limits
+            .deferred_process_fields
+            .iter()
+            .any(|field| field == "web.limits")
+    );
+}
+
+#[tokio::test]
+async fn invalid_web_patch_does_not_modify_the_source() {
+    let (path, _directory) = temp_config("[web]\nenabled = false\n");
+    let original = tokio::fs::read_to_string(&path).await.unwrap();
+    let patch: Json = serde_json::json!({
+        "web": {"debug": {"default_window_secs": 181, "max_window_secs": 180}}
+    });
+
+    let error = apply_patch_to_path(&path, &patch, None).await.unwrap_err();
+
+    assert_eq!(error.status, hyper::StatusCode::BAD_REQUEST);
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), original);
+}
+
+#[tokio::test]
 async fn read_managed_config_returns_only_editable_sections() {
     // Full server (api/port) and network must not leak. Listeners-only server
     // is returned via the nested allowlist (covered in a dedicated test).

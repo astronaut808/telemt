@@ -28,7 +28,9 @@ Route the complete public vhost to Telemt. Splitting only recognized carrier pat
 
 - The public endpoint is always `https://HOST:443`.
 - `plain` and `dd` 16-byte MTProxy secrets are supported. `ee` FakeTLS secrets are not supported by WEB mode.
-- `web.carrier = "https"` selects serialized HTTPS uplink and long polling. `https-lanes` selects independent HTTPS sequencing and polling per logical stream. `websocket` selects one ordered WebSocket for all streams. `websocket-lanes` selects one independently owned WebSocket per non-zero logical stream.
+- `web.carrier` selects the sole carrier when auto-negotiation is disabled and the final fallback when it is enabled. `https` uses serialized HTTPS uplink and long polling. `https-lanes` uses independent HTTPS sequencing and polling per logical stream. `websocket` uses one ordered WebSocket for all streams. `websocket-lanes` uses one independently owned WebSocket per non-zero logical stream.
+- Missing `web.carriers` or `web.carriers = false` disables auto-negotiation and learning. A non-empty array enables startup-only sequential negotiation; it never migrates an already committed session.
+- Native clients without canonical carrier-negotiation headers use the configured fixed `carrier`, even when `carriers` enables negotiation for capable clients. Current Telegram iOS supports only `https`, so an operator serving metadata-free iOS clients must set `web.carrier = "https"`; it does not support `https-lanes`. User-Agent values, including CFNetwork or Darwin, never infer capabilities. When a native iOS request does send explicit negotiation metadata, Telemt intersects it with the server-authoritative `{https}` ceiling and rejects an empty result; other explicit clients use their advertised capability set.
 - Capability, bootstrap, and session credentials are separate bounded-lifetime values. Carrier credentials must be treated as secrets and must not appear in access logs.
 - A bootstrap is a bearer credential, not a source-address-bound token. The client address and IP family may change between bridge loading and session creation. The issuing address retains unused-bootstrap accounting, while the address on the first valid creation request owns the session.
 - Inner MTProxy authentication is restricted to the user and secret mode selected by the vhost profile. Invalid inner handshakes close only their logical stream and never enter the TCP masking path.
@@ -91,17 +93,52 @@ max_streams = 512
 max_streams_per_session = 64
 ```
 
+## Server-side carrier negotiation
+
+Auto-negotiation is optional and disabled unless `carriers` is an explicit non-empty array. The configured `carrier` remains the final fallback and is appended exactly once, even when it also appears in the array:
+
+```toml
+[web]
+enabled = true
+carrier = "https"
+carriers = ["websocket-lanes", "websocket", "https-lanes"]
+carrier_learning = true
+carrier_negotiation_aggressiveness = "conservative"
+
+[web.timeouts]
+carrier_negotiation_deadlines_secs = [3, 5, 8, 12]
+carrier_health_secs = 30
+carrier_learning_secs = 600
+bridge_request_secs = 10
+bridge_retry_secs = 90
+carrier_probe_coalesce_ms = 0
+```
+
+The generated bridge sends canonical `X-Carrier-Capabilities`, `X-Carrier-Attempt`, and, after the first attempt, `X-Carrier-Failure` headers on `/session`. Every successful automatic response returns `X-Carrier-Mode`, `X-Carrier-Attempt`, `X-Carrier-Candidate-Count`, `X-Carrier-Deadline`, and `X-Carrier-State`. The bridge starts its local cumulative clock immediately before the first `/session` request; the server freezes its separate absolute chain deadline when it accepts the first automatic attempt. Both use the configured offsets, and neither resets across replacement attempts. For one through four effective candidates, the attempt checkpoints are respectively `[d3]`, `[d0, d3]`, `[d0, d1, d3]`, and `[d0, d1, d2, d3]`; the final candidate always owns `d3`. A successor remains admissible until its own checkpoint. The states are `provisional`, `committed`, and `healthy`.
+
+Attempts are strictly sequential. Accepted `OPEN` or `DATA` progress commits the chosen carrier immediately and permanently closes the replacement boundary. A `409` for an authenticated committed chain echoes the committed metadata and is terminal; it is not permission to advance. Exact `/session` replay is used only while that response is ambiguous. Once an authenticated response has selected a provisional carrier, a transport failure requests the next attempt directly; if the previous probe actually committed, the server answers with the terminal `409` instead of permitting an unsafe replacement. The server's final absolute deadline also bounds a successor response that the client never received. Post-commit dynamic switching is deliberately unsupported: reconnect with a new session instead.
+
+Each bridge HTTP operation has an absolute `bridge_retry_secs` budget and at most nine attempts. `bridge_request_secs` covers both the Fetch response head and complete response body; a downlink attempt additionally receives the configured long-poll interval. Network failures and `408`, `429`, `502`, `503`, or `504` responses use bounded exponential backoff, while `Retry-After` cannot extend the absolute budget. `carrier_probe_coalesce_ms = 0` sends the first ordered `OPEN` probe immediately. A value up to 10 ms may include matching `DATA` that arrives in that window; multiplexed carriers preserve the complete preceding frame order, while lane carriers claim only the selected lane. No HTTP downlink starts before the probe acknowledgement. Multiplexed WebSocket Upgrade may begin as soon as `/session` selects it and then absorbs queued probe data; a lane WebSocket waits until its stream ID is known.
+
+Automatic WebSockets use `tproxy-auto-v1.<session-token>` or `tproxy-auto-lane-v1.<session-token>.<stream-id>`. The first accepted binary message containing real `OPEN` or `DATA` progress commits the carrier; the server then writes an empty binary commit acknowledgement to that exact connection. Ping/Pong does not commit a carrier and does not count as learning evidence.
+
+A committed attempt becomes healthy only after transport-specific bidirectional evidence remains valid for `carrier_health_secs`. HTTPS requires accepted `DATA`, an acknowledged non-empty post-commit downlink batch, and authenticated activity at or after the health deadline. WebSocket requires the exact commit acknowledgement to be written, subsequent accepted `OPEN` or `DATA` from the same owner, and that owner to remain live through the interval. Closing earlier is neutral and records no learning result.
+
+Learning is process-local, in-memory, positive-only, and bounded by `max_carrier_learning_entries`. It ranks only client-supported configured candidates, keeps the configured fallback last, and uses configured order for equal scores. User-Agent and profile evidence have primary weight; an eligible IP is only a tie-breaker. IP evidence requires exactly one explicit, globally routable `X-Forwarded-For` address; private, loopback, link-local, carrier-grade NAT, documentation, multicast, and IPv4-mapped equivalents are excluded. Client-reported failure categories and request latency are diagnostics, not negative or ranking evidence. `conservative` requires 3 User-Agent outcomes or 8 profile outcomes across 4 cohorts and disables IP evidence; `balanced` uses 2, 6 across 3, and 3 eligible-IP outcomes; `aggressive` uses 1, 4 across 2, and 1 eligible-IP outcome. Disabling learning or changing its policy on reload clears incompatible evidence without changing in-flight sessions.
+
 `https` remains the default and preserves the original serialized behavior. `https-lanes` assigns lane zero to session control and one lane to every non-zero logical stream. Each lane has its own uplink sequence, retry digest, downlink cursor, unacknowledged replay batch, queue, and newest-poll-wins lifecycle. A slow stream therefore does not block another stream at the WEB protocol layer.
 
 This removes application-level serialization between WEB streams. Public HTTP/2 still runs over one or more TCP connections, so packet loss can cause transport-level head-of-line blocking; `https-lanes` is not an HTTP/3 or QUIC carrier.
 
-All lane queues remain inside the existing per-session and process-wide byte/item budgets. The bridge also limits each lane to 8 MiB and 1024 queued items. Telemt permits lane long polls to occupy at most half of `web.limits.max_http_handlers`, preserving handler capacity for session creation, uplink, DELETE, and other control work. `https-lanes` requires `max_http_handlers >= 2`.
+All lane queues and resident response bodies remain inside the existing per-session and process-wide byte/item budgets. Telemt additionally limits each lane to `pending_bytes_per_lane` and `pending_items_per_lane`; the generated bridge caps its corresponding queues at 8 MiB and 1024 items. Telemt permits lane long polls to occupy at most half of `web.limits.max_http_handlers`, preserving handler capacity for session creation, uplink, DELETE, and other control work. `https` requires `max_http_handlers >= 2`, and `https-lanes` requires `max_http_handlers >= 4`.
 
-The `/api/v1/up` and `/api/v1/down` paths do not change. In `https-lanes`, every request on those paths carries one canonical decimal `X-Lane-ID`. Uplink sequence starts at `1` and downlink cursor at `0` independently for each lane. Lane zero accepts only session `PONG`; every frame in a non-zero lane must have the same stream ID, and a new lane must begin with `OPEN`. After a closed lane's queued and unacknowledged downlink data is drained, Telemt returns an empty response with `X-Lane-Closed: 1`, and the bridge stops polling it. Retries remain byte-identical and replay the original acknowledgement or downlink batch.
+The `/api/v1/up` and `/api/v1/down` paths do not change. In `https-lanes`, every request on those paths carries one canonical decimal `X-Lane-ID`. Uplink sequence starts at `1` and downlink cursor at `0` independently for each lane. Lane zero accepts only session `PONG`; every frame in a non-zero lane must have the same stream ID, and a new lane must begin with `OPEN`. A canonical cursor-zero downlink that reaches Telemt just before its lane `OPEN` waits up to `lane_open_wait_secs` without creating lane state; per-session and process auxiliary permits bound these waits. Expiry returns an empty `204`, while a missing lane with an advanced cursor remains a protocol failure routed through the decoy. After a closed lane's queued and unacknowledged downlink data is drained, Telemt returns an empty response with `X-Lane-Closed: 1`, and the bridge stops polling it. Retries remain byte-identical and replay the original acknowledgement or downlink batch.
 
 Both WebSocket carriers still create and delete the parent session over HTTPS. They then use a strict bodyless `GET /api/v1/ws` Upgrade request. `websocket` offers exactly `tproxy-v1.<session-token>` in `Sec-WebSocket-Protocol`; binary messages are ordered carrier batches, and a protocol, deadline, or connection failure closes the complete parent session. `websocket-lanes` offers exactly `tproxy-lane-v1.<session-token>.<stream-id>`, where the stream ID is canonical decimal in `1..=16777215`. Its first binary message must begin with `OPEN`, every frame must use that stream ID, and failure after upgrade closes only that lane. There is no lane-zero WebSocket: HTTPS carries `HELLO` and `WELCOME`, while RFC 6455 Ping/Pong supplies connection liveness.
 
-WebSocket codec buffers and in-flight read/write messages share the process-owned `pending_bytes_global` budget with carrier queues and are additionally bounded by `websocket_bytes_global`. Admission leaves `websocket_http_connection_reserve` accepted connections for ordinary HTTP and decoys. Under pressure, replacement is owner-first, then least-recently-progressed with pre-Upgrade and dead connections ahead of live lanes and multiplexed sessions. A transport Ping is sent after `long_poll_secs` without peer activity, including during continuous downlink traffic; missing peer activity for twice that creation-time interval makes a connection eligible for cleanup.
+Before HTTP `101`, a WebSocket-lane reservation binds to the exact process connection and lane incarnation; an accepted `OPEN` transfers ownership to the exact stream incarnation before its backend task can run. A late poll, close, or reservation drop from an older socket cannot acknowledge, close, or release a replacement that reused the same numeric lane ID.
+
+WebSocket codec buffers and in-flight read/write messages share the process-owned `pending_bytes_global` budget with carrier queues and are additionally bounded by `websocket_bytes_global`. Admission leaves `websocket_http_connection_reserve` accepted connections for ordinary HTTP and decoys. Admission replacement selects dead active connections globally first, then uses same-session, same-profile-owner, and same-client-IP locality. An unrelated healthy victim is eligible only when the requester is below its fair byte share and the victim owner is above it. Within one locality, claimed or upgraded connections precede active lanes, active lanes precede active multiplexed sessions, and least-recent progress, creation order, and connection ID provide deterministic tie breaking. Memory-pressure cleanup uses the same dead-first and lifecycle ordering, preferring over-share owners without stalling when every owner is at or below its share. `max_websocket_evictions_in_flight` bounds concurrent exact eviction claims. Upgrade, first-message, write, backpressure, and eviction deadlines are frozen from the parent session. A transport Ping is sent after `long_poll_secs` without peer activity, including during continuous downlink traffic; missing peer activity for twice that creation-time interval makes an active connection eligible for cleanup.
 
 Every pre-Upgrade authentication, shape, lane-reservation, or capacity failure follows the sanitized decoy path instead of exposing a WebSocket-specific status. The exact subprotocol contains the session bearer and must not be logged.
 
@@ -198,22 +235,29 @@ The frontend or `defaults` section must also set `timeout client 65s` or longer 
 | --- | --- |
 | WEB listener inventory, bind address, and trust policy | Process-owned; restart Telemt. |
 | Any `[web.limits]` value | Process-owned memory/resource contract; restart Telemt. |
-| `web.enabled`, `web.carrier`, `web.debug`, timeouts, vhosts, profiles, and decoys | Applied by the config watcher or a runtime generation reload. |
-| Existing HTTP connections and WEB sessions | Keep their acquisition-time carrier, limits, and session deadlines; newly issued bridge sessions use the active carrier. WebSocket write, backpressure, and eviction operations read the active hot-reloaded deadlines. New logical streams use the active relay generation. |
-| Process shutdown | Uses the latest reloaded `web.timeouts.shutdown_secs`. |
+| `web.enabled`, carrier/negotiation policy, `web.debug`, timeouts, vhosts, profiles, and decoys | Applied by the config watcher or a runtime generation reload. |
+| Existing HTTP connections and WEB sessions | Keep their acquisition-time HTTP idle limit, carrier candidates, limits, body timeout, closed-token replay lifetime, and absolute session/negotiation deadlines; each issued bridge embeds its request, retry, and probe-coalescing values. WebSocket upgrade, open, write, backpressure, and eviction operations use the parent session's frozen deadlines. Newly issued bridges use the active policy, while new logical streams use the active relay generation. |
+| Process shutdown | Captures the latest reloaded `web.timeouts.shutdown_secs` once and shares that single absolute deadline across listener acceptors and connections plus WEB sessions and auxiliary tasks. The waits do not receive sequential per-component budgets. |
 
 Each logical stream keeps its session's creation-time client IP and owns a process-unique, non-zero synthetic source port for the complete relay lifetime. This preserves one stable, non-colliding source/destination tuple for Direct and Middle-End KDF routing.
 
+HTTP idle accounting protects only explicitly bounded request-body, long-poll, decoy connect/response-head, and pending-Upgrade phases. The operation's own deadline remains exact; if its lease is still present at that instant, the connection watchdog allows at most one connection-idle interval for the scheduled task to publish its timeout/result before forcing closure. Between exchanges, and after a response head is ready, progress resets the idle clock while a stalled response body remains idle-bounded. Completion of an older phase cannot release the deadline protection owned by a newer phase.
+
+An `OPEN` reserves the bounded logical-stream and tuple ownership but does not consume the relay generation's `max_connections` permit. Telemt acquires that permit only after the first inner byte arrives; the frozen first-byte deadline and stream limits bound silent opens, and capacity exhaustion then closes only the affected stream.
+
 ## API management
 
-API management is available, but it is intentionally partial. There is no mutable `/v1/web` resource; the API listener exposes the read-only HTML debug view at `/web-status`.
+WEB configuration, runtime status, and bounded runtime controls share the authenticated API listener. `/web-status` remains a read-only HTML diagnostic view; state-changing operations exist only under `/v1/runtime/web`.
 
 | Operation | API support |
 | --- | --- |
-| Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | No. `GET /v1/config` omits `[web]`; `PATCH /v1/config` returns `400 section_not_editable` for `web`. |
+| Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | Yes, through `GET` or `PATCH /v1/config`. The derived `web.runtime` snapshot is never returned or writable. Nested tables merge field-by-field; arrays replace the previous array wholesale. Every `[web.limits]` change is accepted as desired configuration but reported as deferred until process restart. |
 | Persist `server.listeners` | Yes, through `PATCH /v1/config`, but a changed WEB listener remains deferred until process restart. |
 | Apply an externally edited WEB configuration | Yes, through `POST /v1/system/reload`, then inspect the operation status. |
 | Inspect bounded server-side WEB request and lifecycle details | Yes, through authenticated `GET /web-status`. |
+| Inspect lifecycle, capacity planes, learning/debug state, and live sessions | Yes, through `GET /v1/runtime/web/status` and `/v1/runtime/web/sessions`. |
+| Close selected live WEB sessions | Yes, through the asynchronous `POST /v1/runtime/web/sessions/close` operation. |
+| Clear debug records or reset carrier learning | Yes, through the corresponding runtime POST endpoints. |
 | Manage `[access.users]` | Yes, through `/v1/users`. User creation does not create a WEB profile. |
 | Revoke one user | Yes. `/v1/users/{username}/disable` updates admission immediately and cancels that user's active sessions. |
 
@@ -229,6 +273,20 @@ read_only = false
 ```
 
 The API whitelist checks the direct TCP peer and does not trust `X-Forwarded-For`. Changes to `[server.api]` itself require a process restart.
+
+### Runtime status and control
+
+`GET /v1/runtime/web/status` always returns the published lifecycle (`starting`, `no_web_listener`, `running`, `draining`, `drained`, or `deadline_exceeded`), its epoch and age, effective listener addresses, and availability. When the process-owned WEB runtime is alive, `runtime` adds its random 128-bit `runtime_instance`, active generation, immutable limits, plane-local capacity counters, carrier-learning/debug epochs, and totals. Status collection uses non-blocking plane reads: a contended plane is omitted and named in `partial`; the endpoint never waits for, cleans up, or mutates the data plane.
+
+`GET /v1/runtime/web/sessions` returns at most 50 sessions by default and at most 200 when `limit` is supplied. Its ordered scan is capped at 1000 candidates. `cursor` and `session_ref` use the opaque canonical form `ws1.<runtime-instance>.<lowercase-hex-id>`; exact `session_ref` is mutually exclusive with `cursor` and `limit`. Filters are `ip`, `host`, `user`, `user_agent_id`, `key_id`, `carrier`, and `state`; duplicate or unknown query fields are rejected. The detail route is `GET /v1/runtime/web/sessions/{session_ref}`. A retained closed-session tombstone returns `410`; a contended exact snapshot returns `503 web_snapshot_busy`. Responses expose bounded non-secret metadata and never expose bootstrap/session bearers, capabilities, secret hashes, or synthetic/KDF ports.
+
+Every runtime POST requires `Content-Type: application/json` exactly, rejects unknown JSON fields, obeys API authentication, whitelist, and `read_only`, and carries the current `runtime_instance` as an ABA fence. Available controls are:
+
+- `POST /v1/runtime/web/sessions/close` with one selector: `{"kind":"refs","session_refs":[...]}`, `{"kind":"filter",...}`, or `{"kind":"all"}`. Exact refs are limited to 200, a filter must be non-empty, only one close operation may run, and `all` is rejected while effective issuance remains enabled. The `202` response returns `operation_id`; poll `GET /v1/runtime/web/operations/{operation_id}`. The operation scans only sessions at or below its submission high-water mark in chunks of 128.
+- `POST /v1/runtime/web/debug/clear` with `{"runtime_instance":"..."}`. The response reports cleared records, bytes still leased by already rendered snapshots, and the new epoch. In-flight writers from the old epoch cannot repopulate the ring.
+- `POST /v1/runtime/web/carrier-learning/reset` with the same body shape. It clears retained process-local evidence and advances the learning epoch; already frozen attempt chains and live sessions are unchanged.
+
+For a deterministic close-all, patch `{"web":{"enabled":false}}` with runtime reload enabled, wait until `runtime.manager.issuance_enabled` is `false`, submit the `all` selector using that same `runtime_instance`, and poll the operation to a terminal state. Disabling WEB stops new bootstrap/session issuance but never implicitly closes existing sessions.
 
 ### Server-side WEB debug view
 
@@ -248,7 +306,7 @@ default_window_secs = 180
 max_window_secs = 3600
 ```
 
-Open `http://127.0.0.1:9091/web-status` with the same direct-peer whitelist and exact `Authorization` header used by the API. A trailing slash is accepted. Only `GET` is allowed. The page supports `window_secs`, canonical `ip`, numeric `session`, case-insensitive `user_agent`, and `key` filters. Repeat `group_by=ip`, `group_by=session`, `group_by=user_agent`, or `group_by=key` to build grouped summaries; `limit` is restricted to `1..=1000`. HTTP rows expand from request through response with method, path, sanitized headers, body metadata or bytes, timing points, parsed frames, and typed lifecycle events. WebSocket operation adds the sanitized `GET` to `101` handshake plus bounded per-message direction, message type, payload/body capture, processing time, connection/lane identifiers, and parsed inner frames. Raw subprotocols and session tokens are never retained.
+Open `http://127.0.0.1:9091/web-status` with the same direct-peer whitelist and exact `Authorization` header used by the API. A trailing slash is accepted. Only `GET` is allowed. The page supports `window_secs`, canonical `ip`, numeric `session`, case-insensitive `user_agent`, and `key` filters. Repeat `group_by=ip`, `group_by=session`, `group_by=user_agent`, or `group_by=key` to build grouped summaries; `limit` is restricted to `1..=1000`. HTTP rows expand from request through response with method, path, sanitized headers, body metadata or bytes, timing points, parsed frames, and typed lifecycle events, including carrier attempt, commit, healthy, and reported-failure transitions. WebSocket operation adds the sanitized `GET` to `101` handshake plus bounded per-message direction, message type, payload/body capture, processing time, connection/lane identifiers, and parsed inner frames. Raw subprotocols and session tokens are never retained.
 
 The process-owned ring survives runtime generation replacement. Capture-policy changes clear incompatible retained records; window-only changes do not. The ring defaults to 65536 records and 64 MiB retained plus in-flight bytes, the HTML response is capped at 8 MiB, grouping is capped at 1024 groups, and no more than two response bodies retain page permits concurrently. Change `web.limits.debug_records_capacity` or `web.limits.debug_bytes_global` only with a process restart. A hot prefix that fits only a simultaneously increased restart-only capacity is deferred until that restart.
 
@@ -267,7 +325,7 @@ curl -sS http://127.0.0.1:9091/v1/system/reload/RELOAD_ID \
   -H "Authorization: ${TELEMT_API_AUTH}"
 ```
 
-A terminal `succeeded` status confirms runtime activation. A changed `web.carrier` is used by newly issued bridge sessions; existing sessions are not migrated. If `deferred_process_fields` contains `server.listeners` or `web.limits`, the file is valid and persisted but those settings still require a Telemt restart.
+A terminal `succeeded` status confirms runtime activation. Changed carrier, candidate, deadline, or learning policy is used by newly issued bridge sessions; existing sessions and in-flight attempt chains are not migrated. If `deferred_process_fields` contains `server.listeners` or `web.limits`, the file is valid and persisted but those settings still require a Telemt restart.
 
 Access-user operations use the existing endpoints, for example:
 
@@ -291,7 +349,7 @@ See the complete [Control API contract](../Architecture/API/API.md) for request 
 - Disable request-target and authorization logging at the TLS terminator, or use a verified redacted format. Raw queries contain bridge capabilities and `Authorization` contains bootstrap or session bearer credentials.
 - Keep one stable public address per vhost. If DNS returns several ingress addresses, each deployment must use the address matching its external path.
 - Bootstrap and session registries are process-local. A multi-process or multi-host upstream pool requires affinity for the complete vhost: bridge GET, session creation, uplink, downlink, and DELETE. A single Telemt process needs no extra affinity.
-- An unused bootstrap survives a configuration reload only when the exact profile identity remains active: host, `public_addr`, user, secret mode, carrier, and capability. Existing created sessions retain their immutable carrier and profile identity and remain lifecycle-bounded.
+- An unused bootstrap survives a configuration reload only when the exact profile identity remains active: host, `public_addr`, user, secret mode, carrier candidates, negotiation deadlines, and capability. Existing created sessions retain their immutable carrier and profile identity and remain lifecycle-bounded.
 - The decoy is part of the anti-probing contract. Verify its ordinary 404 behavior and response timing through the public TLS endpoint before distributing links.
 
 ## Initial verification
@@ -304,6 +362,7 @@ See the complete [Control API contract](../Architecture/API/API.md) for request 
 6. For `websocket`, confirm one `101` response, binary relay traffic, and RFC 6455 Ping/Pong beyond 25 seconds. For `websocket-lanes`, exercise at least two simultaneous stream sockets and verify that closing or corrupting one lane does not close its sibling or parent session.
 7. Exercise reconnect and at least one long poll beyond 25 seconds to prove the frontend timeouts do not truncate the carrier.
 8. Verify user and logical MTProxy connection limits using logical-stream counters, not the number of HTTP connections.
+9. When auto-negotiation is enabled, verify the configured sequence, exact-attempt replay after an intentionally lost response, terminal behavior after commit, and `carrier_committed`/`carrier_healthy` lifecycle rows in `/web-status`. Verify that a metadata-free native client uses the fixed `carrier` without automatic response headers and that explicit capabilities remain unchanged.
 
 ## Troubleshooting
 
@@ -311,6 +370,8 @@ See the complete [Control API contract](../Architecture/API/API.md) for request 
 | --- | --- |
 | WEB configuration is valid on disk but listener behavior did not change | Inspect reload `deferred_process_fields`; listener and `[web.limits]` changes require restart. |
 | Carrier requests reach the decoy | Verify exact vhost, link secret mode, direct proxy CIDR, and one parseable `X-Forwarded-For` value. |
+| A racing `https-lanes` downlink reaches the decoy with `404` | Confirm it starts at `X-Down-Cursor: 0`, preserve `X-Lane-ID`, and set `lane_open_wait_secs` above the observed down-before-`OPEN` skew. Advanced cursors for missing lanes intentionally fail closed. |
+| Auto-negotiation advances after traffic was already accepted | This is not valid behavior. Inspect the authenticated `X-Carrier-State` replay and the carrier commit lifecycle row; a committed or healthy response is terminal and requires a new session. |
 | Long polls disconnect near a fixed interval | Raise NGINX/HAProxy client, server, send, and read timeouts above `web.timeouts.long_poll_secs`. |
 | WebSocket Upgrade reaches the decoy instead of returning `101` | Preserve HTTP/1.1 `Connection: Upgrade`, `Upgrade: websocket`, the single exact `Sec-WebSocket-Protocol`, and the canonical bodyless `/api/v1/ws` request. Also check carrier/session compatibility and the process connection reserve. |
 | One `websocket-lanes` stream closes while siblings stay connected | This is the intended failure boundary. Inspect that lane's message/frame rows in `/web-status`; malformed, cross-lane, write-timeout, and backend-close paths terminate only the affected lane. |

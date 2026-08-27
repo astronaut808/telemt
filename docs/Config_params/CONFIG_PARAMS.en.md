@@ -2558,12 +2558,19 @@ WEB mode carries Telegram Desktop MTProxy traffic through HTTPS terminated by an
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
 | `carrier` | `"https"`, `"https-lanes"`, `"websocket"`, or `"websocket-lanes"` | `"https"` | `✔` |
+| `carriers` | `false` or a non-empty array of unique carriers | `false` | `✔` |
+| `carrier_learning` | `bool` | `true` | `✔` |
+| `carrier_negotiation_aggressiveness` | `"conservative"`, `"balanced"`, or `"aggressive"` | `"conservative"` | `✔` |
 | `debug` | table | disabled, bounded defaults | `✔` |
 | `limits` | table | bounded defaults | `✘` |
 | `timeouts` | table | bounded defaults | `✔` |
 | `vhosts` | array of tables | `[]` | `✔` |
 
-`enabled = true` requires at least one network-eligible WEB listener, at least one vhost, and at least one profile in every vhost. `https` preserves the serialized HTTPS transport. `https-lanes` gives stream zero and every logical stream independent uplink sequencing, downlink cursors, retries, and long polls; it requires `max_http_handlers >= 2` and public HTTP/2 on the TLS terminator. `websocket` carries all logical streams over one ordered RFC 6455 connection, while `websocket-lanes` owns one connection per non-zero logical stream and isolates lane failures. Both WebSocket carriers use `GET /api/v1/ws` after HTTPS session creation and require the TLS terminator to preserve HTTP/1.1 Upgrade headers. A reload applies `carrier` only to newly issued bridge sessions. Disabling WEB stops issuance of new bridge and session credentials after reload; use the users API to revoke one user's active sessions.
+`enabled = true` requires at least one network-eligible WEB listener, at least one vhost, and at least one profile in every vhost. `https` preserves the serialized HTTPS transport and requires `max_http_handlers >= 2`. `https-lanes` gives stream zero and every logical stream independent uplink sequencing, downlink cursors, retries, and long polls; it requires `max_http_handlers >= 4` and public HTTP/2 on the TLS terminator. `websocket` carries all logical streams over one ordered RFC 6455 connection, while `websocket-lanes` owns one connection per non-zero logical stream and isolates lane failures. Both WebSocket carriers use `GET /api/v1/ws` after HTTPS session creation and require the TLS terminator to preserve HTTP/1.1 Upgrade headers.
+
+When `carriers` is missing or `false`, auto-negotiation and learning are disabled and `carrier` is the only mode. A non-empty `carriers` array enables startup-only negotiation in its configured order; `carrier` is appended exactly once as the final fallback. Empty arrays, duplicates, and `true` are rejected. The client advances candidates only before carrier commit and must create a new session to change carrier after commit. A metadata-free native client, including Telegram iOS, always uses the configured fixed `carrier`, even when negotiation is enabled. Current iOS supports only `https`, so such deployments must configure `carrier = "https"`. CFNetwork and Darwin User-Agent classification does not infer carrier support. Explicit native iOS capabilities are intersected with `{https}`; other explicit client capabilities participate as reported.
+
+`carrier_learning` applies only while negotiation is enabled. Learning is process-local, in-memory, bounded, and positive-only: only a carrier that reaches the server-defined healthy state contributes evidence. `conservative` requires the broadest evidence and disables IP ranking, `balanced` admits moderate User-Agent/profile evidence plus eligible public-IP tie breaking, and `aggressive` reacts to the first bounded samples. Reported client failures remain diagnostic and never create negative evidence. Reload applies the policy to new negotiation chains and invalidates incompatible retained evidence. Disabling WEB stops issuance of new bridge and session credentials after reload; use the users API to revoke one user's active sessions.
 
 # [web.debug]
 
@@ -2584,6 +2591,8 @@ This hot-reloadable table controls the process-owned server-side WEB debug recor
 
 Changing `enabled` or any capture field clears retained records and rejects commits started under the previous policy epoch. Changing only the default or maximum observation window preserves compatible retained records. `full` retains a complete recognized carrier body only up to `web.limits.max_body_bytes`; decoy bodies always remain prefix-bounded. A prefix that depends on a simultaneously increased restart-only capacity is deferred with `web.debug` until restart. URI queries are never retained, credential header values are omitted, body copies are scrubbed for known WEB capabilities and bearer tokens, and profile keys are represented only by a domain-separated 16-hex fingerprint.
 
+Authenticated JSON control may clear the ring explicitly with `POST /v1/runtime/web/debug/clear`; the required process `runtime_instance` fences stale controllers, the returned epoch fences in-flight writers, and `leased_bytes` reports memory still owned by already rendered snapshots.
+
 # [web.limits]
 
 These process-wide ceilings make every WEB registry, queue, request body, static snapshot, and admission path bounded. All values are validated together. Per-owner limits cannot exceed global limits, queue reserves must preserve control-frame progress, body reservations must fit their global budget, and all declared byte ceilings must fit `memory_envelope_bytes`. Changing any value in this table requires a process restart.
@@ -2597,10 +2606,15 @@ These process-wide ceilings make every WEB registry, queue, request body, static
 | `max_frames_per_body` | `usize` | `4096` | Maximum frames parsed or emitted per carrier body. |
 | `max_http_connections` | `usize` | `1024` | Accepted WEB HTTP connections process-wide. |
 | `max_http_handlers` | `usize` | `512` | Concurrent HTTP handlers process-wide; HTTPS lanes may park at most half, preserving the remainder for session, uplink, and control work. |
+| `max_lane_open_waits_per_session` | `usize` | `16` | Canonical cursor-zero downlink polls allowed to wait for a racing lane `OPEN` in one session. |
+| `pending_bytes_per_lane` | `usize` | `8388608` | Queued and resident `DATA` bytes allowed for one independent HTTPS or WebSocket lane. |
+| `pending_items_per_lane` | `usize` | `1024` | Queued and resident `DATA` items allowed for one independent HTTPS or WebSocket lane. |
 | `websocket_bytes_global` | `usize` | `268435456` | Transient WebSocket codec, message, and write-staging sub-budget inside `pending_bytes_global`. |
-| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket byte percentage at which new admission may replace an owner-first victim. |
-| `websocket_eviction_watermark_pct` | `u8` | `90` | WebSocket byte percentage at which queue pressure may evict the least-recently-progressed eligible connection. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket byte watermark for new base admission and the fair-share calculation used by deterministic replacement. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | WebSocket data-allocation watermark at which shared queue pressure may request deterministic cleanup. |
 | `websocket_http_connection_reserve` | `usize` | `64` | Accepted HTTP connections unavailable to WebSocket upgrades, preserving ordinary HTTP and decoy capacity. |
+| `max_websocket_evictions_in_flight` | `usize` | `8` | Process-wide ceiling for concurrent exact WebSocket eviction claims during admission and pressure cleanup. |
+| `max_carrier_learning_entries` | `usize` | `4096` | Process-wide ceiling for bounded carrier-learning evidence entries. |
 | `max_body_readers` | `usize` | `32` | Concurrent collected request bodies process-wide. |
 | `max_body_bytes_global` | `usize` | `67108864` | Global byte reservation for collected bodies. |
 | `max_sessions_global` | `usize` | `128` | Live WEB sessions process-wide. |
@@ -2624,7 +2638,7 @@ These process-wide ceilings make every WEB registry, queue, request body, static
 | `max_static_bytes` | `usize` | `67108864` | Static snapshot bytes across all vhosts. |
 | `debug_records_capacity` | `usize` | `65536` | Maximum retained WEB debug record count. |
 | `debug_bytes_global` | `usize` | `67108864` | Retained plus in-flight WEB debug byte ceiling; minimum 4096. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Declared envelope for HTTP heads, bodies, shared queues/WebSocket I/O, static snapshots, and bounded debug/status buffers; maximum 4 GiB. |
+| `memory_envelope_bytes` | `usize` | `1342177280` | Declared envelope for HTTP heads, bodies, shared queues/WebSocket I/O, lane state, carrier learning, static snapshots, and bounded debug/status buffers; maximum 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Sustained process-wide bootstrap issuance rate. |
 | `new_bootstraps_burst` | `u32` | `256` | Process-wide bootstrap issuance burst. |
 | `new_sessions_per_minute` | `u32` | `600` | Sustained process-wide session creation rate. |
@@ -2634,21 +2648,31 @@ These process-wide ceilings make every WEB registry, queue, request body, static
 
 # [web.timeouts]
 
-Every timeout is measured in seconds and must be within `1..=3600`. The longest request deadline must be lower than `http_idle_secs`.
+Unless a row states otherwise, timeouts are measured in seconds and must be within `1..=3600`. Configured server-side HTTP phase deadlines must be lower than `http_idle_secs`; protected phases retain their own deadlines, so the idle timer is not an aggregate request deadline. The bridge retry window is client-side and follows its own bound.
 
 | Key | Type | Default | Hot-Reload | Description |
 | --- | --- | --- | --- | --- |
 | `header_secs` | `u64` | `10` | `✔` | Receive one complete HTTP request head. |
 | `body_secs` | `u64` | `30` | `✔` | Collect one authenticated carrier body. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Complete one inner MTProxy handshake. |
+| `stream_first_byte_secs` | `u64` | `30` | `✔` | Receive the first inner MTProxy byte after `OPEN`; validated within `1..=300`. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Maximum empty downlink long poll. |
+| `bridge_request_secs` | `u64` | `10` | `✔` | Bridge-side deadline for one HTTP attempt through complete response-body consumption; `/down` additionally allows `long_poll_secs`. Validated within `1..=60`. |
+| `bridge_retry_secs` | `u64` | `90` | `✔` | Absolute bridge retry window including attempts and backoff; validated within `1..=300` and no lower than `bridge_request_secs`. |
+| `carrier_probe_coalesce_ms` | `u64` | `0` | `✔` | Optional bridge wait after `OPEN` for matching `DATA`; milliseconds within `0..=10`, where `0` preserves immediate probing. |
+| `lane_open_wait_secs` | `u64` | `2` | `✔` | Wait for a canonical cursor-zero downlink that races its lane `OPEN`; no greater than `long_poll_secs`. |
+| `carrier_health_secs` | `u64` | `30` | `✔` | Post-commit observation interval required before a carrier can contribute learning evidence. |
+| `websocket_upgrade_secs` | `u64` | `5` | `✔` | Maximum wait for an accepted HTTP Upgrade to become a WebSocket; validated within `1..=60`. |
+| `websocket_open_secs` | `u64` | `15` | `✔` | Absolute deadline for the first carrier binary message after Upgrade; validated within `1..=300`. |
 | `websocket_write_secs` | `u64` | `30` | `✔` | Maximum wait for one WebSocket write or flush. |
 | `websocket_backpressure_secs` | `u64` | `30` | `✔` | Maximum wait for shared byte-budget or queue progress before closing the affected connection. |
 | `websocket_eviction_secs` | `u64` | `1` | `✔` | Grace allowed for a pressure-evicted WebSocket to release its slot and budget before admission fails. |
+| `carrier_negotiation_deadlines_secs` | `[u64; 4]` | `[3, 5, 8, 12]` | `✔` | Strictly increasing cumulative offsets used by the bridge before its first `/session` request and by the server when accepting the first automatic attempt. Checkpoints for one through four candidates are `[d3]`, `[d0, d3]`, `[d0, d1, d3]`, and `[d0, d1, d2, d3]`; the final candidate always uses `d3`. |
+| `carrier_learning_secs` | `u64` | `600` | `✔` | Fixed two-window process-local evidence lifetime; validated within `2..=86400`. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Unused bootstrap and closed-token replay lifetime. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Maximum carrier inactivity before session closure. |
-| `http_idle_secs` | `u64` | `75` | `✔` | WEB HTTP keep-alive idle lifetime. |
-| `shutdown_secs` | `u64` | `15` | `✔` | Graceful WEB shutdown deadline. |
+| `http_idle_secs` | `u64` | `75` | `✔` | Idle limit between HTTP exchanges and while an emitted response body makes no progress. Explicitly bounded request-body, long-poll, decoy, and pending-Upgrade phases keep their own deadlines instead of being truncated by this timer. The value is frozen when the connection is accepted. |
+| `shutdown_secs` | `u64` | `15` | `✔` | One absolute process-shutdown budget shared by all listener acceptors and connections plus WEB session and auxiliary-task drains. The active value is captured once when shutdown starts. |
 | `decoy_header_secs` | `u64` | `30` | `✔` | Connect and response-head deadline for an HTTP decoy. |
 
 # [[web.vhosts]]
@@ -2675,7 +2699,7 @@ Exactly one decoy mode is required:
 
 | Key | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `user` | `String` | yes | — | Existing key from `[access.users]`. |
+| `user` | `String` | yes | — | Existing 1–64-byte key from `[access.users]`; the bound keeps runtime status and filters bounded. |
 | `secret_mode` | `"plain"` or `"dd"` | yes | — | Exact Telegram Desktop secret representation. `ee` is not supported. |
 | `max_sessions` | `usize` | no | `web.limits.max_sessions_global` | Live sessions for this profile. |
 | `max_streams` | `usize` | no | `web.limits.max_streams_global` | Live logical streams for this profile. |
@@ -2685,10 +2709,11 @@ Profile limits must be non-zero and no greater than their corresponding global l
 
 ## WEB lifecycle and API management
 
-- The config watcher and generation reload apply `web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots without a process restart. Existing sessions keep their acquisition-time carrier, limits, and deadlines; newly issued bridge sessions use the active generation.
+- The config watcher and generation reload apply `web.enabled`, carrier and negotiation policy, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots without a process restart. One immutable expanded source snapshot is validated and activated; a candidate generation's watcher starts only after that generation becomes active. Existing sessions and in-flight negotiation chains keep their issuance-time carrier candidates, limits, timeouts, and absolute deadlines; newly issued bridge sessions use one pinned active generation.
 - WEB listener inventory and trust policy under `server.listeners`, and every `web.limits` value, are process-owned and restart-required.
-- There is no mutable `/v1/web` resource. `GET /web-status` provides authenticated read-only HTML diagnostics; `GET /v1/config` omits `[web]`, and `PATCH /v1/config` rejects a `web` key with `400 section_not_editable`.
-- To manage WEB policy remotely, update the owned TOML file and call `POST /v1/system/reload`; inspect `GET /v1/system/reload/{id}` and its `deferred_process_fields`. Restart Telemt when it contains `server.listeners` or `web.limits`.
+- `GET /v1/config` returns the complete authored `[web]` tree except the derived `web.runtime` snapshot. `PATCH /v1/config` accepts a sparse `web` object, deep-merges tables, replaces arrays wholesale, validates the complete candidate, and reports `web.limits` in `deferred_process_fields` until restart.
+- `GET /v1/runtime/web/status`, `/sessions`, `/sessions/{session_ref}`, and `/operations/{operation_id}` expose bounded non-secret runtime state. POST controls close selected sessions, clear debug data, or reset carrier learning and require the current random `runtime_instance`.
+- `web.enabled = false` stops new bootstrap/session issuance after activation but does not close live sessions. For close-all, wait until status reports `manager.issuance_enabled = false`, submit the asynchronous `all` selector, and poll its operation.
 - Existing access users can be created, changed, rotated, enabled, disabled, and deleted through `/v1/users`. Creating a user does not add a WEB profile. Disabling a user immediately updates admission and cancels that user's active sessions.
 - `PATCH /v1/config` can persist `server.listeners`, including WEB listener fields, but a changed WEB listener does not become active until process restart.
 

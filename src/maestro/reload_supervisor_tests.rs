@@ -21,6 +21,15 @@ fn runtime_log_filter() -> RuntimeLogFilter {
     RuntimeLogFilter::new(handle)
 }
 
+fn prepared_runtime(generation: Arc<RuntimeGeneration>) -> PreparedRuntime {
+    let (config_watcher_activation, _activation_rx) = watch::channel(false);
+    PreparedRuntime {
+        generation,
+        detected_ips: (None, None),
+        config_watcher_activation,
+    }
+}
+
 async fn fixture(request: ReloadRequest) -> ReloadFixture {
     let old_runtime = test_runtime_generation(1, ProxyConfig::default());
     let new_config = Arc::new(ProxyConfig::default());
@@ -120,10 +129,7 @@ async fn revision_rollback_keeps_old_generation_and_cleans_candidate() {
         .activate_prepared(
             fixture.command,
             fixture.old_runtime.clone(),
-            PreparedRuntime {
-                generation: fixture.new_runtime,
-                detected_ips: (None, None),
-            },
+            prepared_runtime(fixture.new_runtime),
             RevisionGateAction::Rollback("revision changed".to_string()),
             |_| -> Result<(), String> { panic!("DNS activation must not run on rollback") },
         )
@@ -161,10 +167,7 @@ async fn dns_failure_policy_controls_rollback_or_keep_new() {
             .activate_prepared(
                 fixture.command,
                 fixture.old_runtime.clone(),
-                PreparedRuntime {
-                    generation: fixture.new_runtime.clone(),
-                    detected_ips: (None, None),
-                },
+                prepared_runtime(fixture.new_runtime.clone()),
                 RevisionGateAction::Proceed,
                 |_| Err("invalid DNS entry".to_string()),
             )
@@ -215,10 +218,7 @@ async fn drain_publishes_new_generation_before_old_sessions_finish() {
             .activate_prepared(
                 fixture.command,
                 old_runtime,
-                PreparedRuntime {
-                    generation: new_runtime,
-                    detected_ips: (None, None),
-                },
+                prepared_runtime(new_runtime),
                 RevisionGateAction::Proceed,
                 |_| Ok(()),
             )
@@ -271,10 +271,7 @@ async fn drain_timeout_cancels_old_sessions_and_records_one_warning() {
             .activate_prepared(
                 fixture.command,
                 old_runtime,
-                PreparedRuntime {
-                    generation: new_runtime,
-                    detected_ips: (None, None),
-                },
+                prepared_runtime(new_runtime),
                 RevisionGateAction::Proceed,
                 |_| Ok(()),
             )

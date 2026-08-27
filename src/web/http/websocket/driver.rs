@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::ConnectionIo;
+use crate::web::http::activity::UpgradeDeadlineLease;
 use crate::web::manager::{WebProcessRuntime, WebSocketBudgetLease, WebSocketConnection};
 use crate::web::session::{WebSession, WebSocketLaneReservation, WebSocketProbeReservation};
 use crate::web::trace::{TraceDirection, TraceWebSocketContext};
@@ -22,8 +23,11 @@ mod lane;
 use io::{flush, process_multiplex, read_message, record_message, reserve_data, send};
 use lane::run_lane;
 
+// Upgrade ownership remains explicit across cancellation and reservation boundaries.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_upgraded(
     on_upgrade: hyper::upgrade::OnUpgrade,
+    upgrade_deadline: Option<UpgradeDeadlineLease>,
     runtime: Arc<WebProcessRuntime>,
     session: Arc<WebSession>,
     connection: WebSocketConnection,
@@ -34,13 +38,15 @@ pub(super) async fn run_upgraded(
 ) {
     let cancellation = connection.cancellation();
     let timeouts = session.timeouts().clone();
+    let deadline = upgrade_deadline.as_ref().map_or_else(
+        || tokio::time::Instant::now() + Duration::from_secs(timeouts.websocket_upgrade_secs),
+        UpgradeDeadlineLease::deadline,
+    );
     let upgraded = tokio::select! {
         _ = cancellation.cancelled() => return,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeouts.websocket_upgrade_secs),
-            on_upgrade,
-        ) => result,
+        result = tokio::time::timeout_at(deadline, on_upgrade) => result,
     };
+    drop(upgrade_deadline);
     let Ok(Ok(upgraded)) = upgraded else {
         return;
     };
@@ -95,8 +101,7 @@ pub(super) async fn run_upgraded(
         _ = tokio::time::timeout(eviction, socket.close(None)) => {}
     }
     if let Some(reservation) = lane_reservation {
-        session.close_websocket_lane(reservation.lane_id());
-        drop(reservation);
+        session.close_websocket_lane(reservation);
     } else if !acknowledge_commit || session.is_carrier_committed() {
         session.close();
     }
@@ -192,10 +197,12 @@ async fn run_multiplex(
                             session.close();
                             return Err(());
                         }
-                    } else if acknowledge_commit && sequence > 1 && progressed {
-                        if !session.websocket_peer_after_commit_ack(connection.id()) {
-                            return Err(());
-                        }
+                    } else if acknowledge_commit
+                        && sequence > 1
+                        && progressed
+                        && !session.websocket_peer_after_commit_ack(connection.id())
+                    {
+                        return Err(());
                     }
                     if !active && progressed {
                         if !connection.mark_active() {

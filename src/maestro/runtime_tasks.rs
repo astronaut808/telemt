@@ -107,6 +107,7 @@ pub(crate) async fn spawn_runtime_tasks(
     shared_state: Arc<ProxySharedState>,
     me_ready_tx: watch::Sender<u64>,
     task_scope: RuntimeTaskScope,
+    config_watcher_activation: Option<watch::Receiver<bool>>,
 ) -> RuntimeWatches {
     let um_clone = upstream_manager.clone();
     let dc_overrides_for_health = config.dc_overrides.clone();
@@ -151,14 +152,15 @@ pub(crate) async fn spawn_runtime_tasks(
             Some("spawn config hot-reload watcher".to_string()),
         )
         .await;
-    let (config_rx, log_level_rx): (watch::Receiver<Arc<ProxyConfig>>, watch::Receiver<LogLevel>) =
-        spawn_config_watcher(
-            config_path.to_path_buf(),
-            config.clone(),
-            detected_ip_v4,
-            detected_ip_v6,
-            task_scope.cancellation_token(),
-        );
+    let (config_rx, log_level_rx, config_watcher_task) = spawn_config_watcher(
+        config_path.to_path_buf(),
+        config.clone(),
+        detected_ip_v4,
+        detected_ip_v6,
+        task_scope.cancellation_token(),
+        config_watcher_activation,
+    );
+    task_scope.spawn(config_watcher_task);
     startup_tracker
         .complete_component(
             COMPONENT_CONFIG_WATCHER_START,

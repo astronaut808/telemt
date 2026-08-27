@@ -247,6 +247,7 @@ pub(super) async fn prepare_runtime(
         shared_state.clone(),
         me_ready_tx.clone(),
         runtime_task_scope.clone(),
+        None,
     )
     .await;
     let config_rx = runtime_watches.config_rx;

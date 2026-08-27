@@ -2,6 +2,8 @@
 
 /// Browser bridge generation for the serialized HTTPS carrier.
 pub(crate) mod bridge;
+/// Process lifecycle publication shared with the control plane.
+pub(crate) mod control;
 /// Shared binary frame codec and protocol constants.
 pub(crate) mod frame;
 /// Plain HTTP ingress and decoy routing behind external TLS termination.

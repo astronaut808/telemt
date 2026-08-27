@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::{Request, StatusCode};
@@ -46,7 +47,15 @@ pub(super) async fn handle_down(
         request,
         body,
         _body_budget,
-    } = match collect_body(request, &runtime, 1, true).await {
+    } = match collect_body(
+        request,
+        &runtime,
+        Duration::from_secs(session.timeouts().body_secs),
+        1,
+        true,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {
@@ -67,10 +76,26 @@ pub(super) async fn handle_down(
     } else {
         None
     };
+    let poll_timeout = match lane_id {
+        Some(_) => Duration::from_secs(session.timeouts().lane_open_wait_secs)
+            .checked_add(Duration::from_secs(session.timeouts().long_poll_secs)),
+        None => Some(Duration::from_secs(session.timeouts().long_poll_secs)),
+    };
+    let Some(poll_timeout) = poll_timeout else {
+        return service_unavailable();
+    };
+    let _deadline_lease = match super::request_deadline(&request) {
+        Some(deadline) => match deadline.lease_for(poll_timeout) {
+            Some(lease) => Some(lease),
+            None => return service_unavailable(),
+        },
+        None => None,
+    };
     let result = match lane_id {
         Some(lane_id) => session.poll_down_lane(lane_id, cursor).await,
         None => session.poll_down(cursor).await,
     };
+    drop(_deadline_lease);
     match result {
         Ok(result) if result.body.is_empty() => {
             let mut response = carrier_empty(StatusCode::NO_CONTENT);

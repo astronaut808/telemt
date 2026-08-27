@@ -9,6 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ManagerError, ProfileKey, WebProcessRuntime, WebSocketBudgetLease};
 
+// Deterministic victim ordering remains isolated from registry mutation.
+mod policy;
+
 /// One process-owned WebSocket carrier class used for eviction priority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WebSocketKind {
@@ -25,6 +28,7 @@ struct WebSocketClaimKey {
 }
 
 #[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebSocketPhase {
     Claimed,
     Upgraded,
@@ -55,6 +59,26 @@ pub(super) struct WebSocketRegistry {
     claims: HashMap<WebSocketClaimKey, u64>,
     evictions_in_flight: usize,
     closed: bool,
+}
+
+/// Point-in-time WebSocket registry counters.
+#[derive(Clone, Copy)]
+pub(super) struct WebSocketRegistryStatus {
+    pub(super) entries: usize,
+    pub(super) claims: usize,
+    pub(super) evictions_in_flight: usize,
+    pub(super) closed: bool,
+}
+
+impl WebSocketRegistry {
+    pub(super) fn status(&self) -> WebSocketRegistryStatus {
+        WebSocketRegistryStatus {
+            entries: self.entries.len(),
+            claims: self.claims.len(),
+            evictions_in_flight: self.evictions_in_flight,
+            closed: self.closed,
+        }
+    }
 }
 
 /// Exact process-owned admission retained through the upgraded socket lifetime.
@@ -239,6 +263,8 @@ enum TryAdmitError {
     Closed,
 }
 
+// Admission inputs stay explicit so quota and cancellation ownership cannot drift.
+#[allow(clippy::too_many_arguments)]
 fn try_admit(
     runtime: &Arc<WebProcessRuntime>,
     owner: ProfileKey,
@@ -353,8 +379,7 @@ fn select_victim(
     excluded_id: Option<u64>,
     claim: bool,
 ) -> Option<Arc<WebSocketEntry>> {
-    let fair_share = runtime.data_budget.fair_share(Some(owner));
-    let requester_usage = runtime.data_budget.owner_usage(owner);
+    let fairness = runtime.data_budget.fairness_snapshot(Some(owner));
     let now = runtime.websocket_tick();
     let mut registry = runtime.websockets.lock();
     if claim && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight {
@@ -366,31 +391,8 @@ fn select_victim(
         .filter(|entry| Some(entry.id) != excluded_id)
         .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .filter_map(|entry| {
-            let owner_rank = if entry.session_id == session_id {
-                0
-            } else if entry.owner == owner {
-                1
-            } else if entry.client_ip == client_ip {
-                2
-            } else {
-                if requester_usage >= fair_share
-                    || runtime.data_budget.owner_usage(entry.owner) <= fair_share
-                {
-                    return None;
-                }
-                3
-            };
-            let priority = entry_priority(entry, now);
-            Some((
-                (
-                    owner_rank,
-                    priority,
-                    entry.last_progress_tick.load(Ordering::Acquire),
-                    entry.created_tick,
-                    entry.id,
-                ),
-                Arc::clone(entry),
-            ))
+            policy::admission_key(entry, now, owner, session_id, client_ip, &fairness)
+                .map(|key| (key, Arc::clone(entry)))
         })
         .min_by_key(|(key, _)| *key)
         .map(|(_, entry)| entry)?;
@@ -405,6 +407,7 @@ fn select_pressure_victim(
     now: u64,
     claim: bool,
 ) -> Option<Arc<WebSocketEntry>> {
+    let fairness = runtime.data_budget.fairness_snapshot(None);
     let mut registry = runtime.websockets.lock();
     if claim && registry.evictions_in_flight >= runtime.limits.max_websocket_evictions_in_flight {
         return None;
@@ -415,12 +418,7 @@ fn select_pressure_victim(
         .filter(|entry| !entry.closing.load(Ordering::Acquire))
         .map(|entry| {
             (
-                (
-                    entry_priority(entry, now),
-                    entry.last_progress_tick.load(Ordering::Acquire),
-                    entry.created_tick,
-                    entry.id,
-                ),
+                policy::pressure_key(entry, now, &fairness),
                 Arc::clone(entry),
             )
         })
@@ -438,18 +436,23 @@ fn claim_stale_victims(runtime: &WebProcessRuntime, now: u64) -> Vec<Arc<WebSock
         .limits
         .max_websocket_evictions_in_flight
         .saturating_sub(registry.evictions_in_flight);
-    let candidates = registry
+    let mut candidates = registry
         .entries
         .values()
         .filter(|entry| !entry.closing.load(Ordering::Acquire))
-        .filter(|entry| {
-            now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire)) >= dead_after(entry)
-        })
-        .take(available)
+        .filter(|entry| policy::victim_class(entry, now) == policy::VictimClass::Dead)
         .cloned()
         .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|entry| {
+        (
+            entry.last_peer_tick.load(Ordering::Acquire),
+            entry.created_tick,
+            entry.id,
+        )
+    });
     candidates
         .into_iter()
+        .take(available)
         .filter(|entry| claim_entry(&mut registry, entry, runtime))
         .collect()
 }
@@ -472,18 +475,6 @@ fn claim_entry(
         .store(WebSocketPhase::Closing as u8, Ordering::Release);
     registry.evictions_in_flight += 1;
     true
-}
-
-fn entry_priority(entry: &WebSocketEntry, now: u64) -> u8 {
-    if entry.phase.load(Ordering::Acquire) < WebSocketPhase::Active as u8
-        || now.saturating_sub(entry.last_peer_tick.load(Ordering::Acquire)) >= dead_after(entry)
-    {
-        0
-    } else if matches!(entry.kind, WebSocketKind::Lane(_)) {
-        1
-    } else {
-        2
-    }
 }
 
 fn dead_after(entry: &WebSocketEntry) -> u64 {

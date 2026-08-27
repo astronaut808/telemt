@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -13,11 +13,11 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use ipnetwork::IpNetwork;
-use parking_lot::Mutex;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{WebClientIpSource, WebRuntimeVhost};
+use crate::maestro::generation::RuntimeGeneration;
 use crate::web::bridge;
 use crate::web::manager::{ManagerError, WebProcessRuntime};
 
@@ -45,7 +45,7 @@ mod websocket;
 mod trace_tests;
 
 use crate::web::trace::{HttpTraceExchange, TraceDirection, TraceLifecycleEvent, TraceRoute};
-use activity::{ActivityBody, RequestActivity};
+use activity::{ActivityBody, ConnectionActivity, RequestActivity, RequestDeadlineHandle};
 use body::{CollectBodyError, CollectedBody, RequestBody, collect_body};
 use decoy::serve_decoy;
 use down::handle_down;
@@ -80,15 +80,22 @@ pub(crate) async fn serve_connection(
     let max_header_bytes = config.web.limits.max_header_bytes;
     let header_timeout = Duration::from_secs(config.web.timeouts.header_secs);
     let idle_timeout = Duration::from_secs(config.web.timeouts.http_idle_secs);
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
-    let service_last_activity = Arc::clone(&last_activity);
+    let connection_activity = ConnectionActivity::new();
+    let service_activity = connection_activity.clone();
     let service = service_fn(move |mut request| {
         let runtime = Arc::clone(&runtime);
         let trusted_proxy_cidrs = Arc::clone(&trusted_proxy_cidrs);
-        let last_activity = Arc::clone(&service_last_activity);
+        let connection_activity = service_activity.clone();
         let client_ip_source = client_ip_source;
         async move {
-            let activity = RequestActivity::begin(last_activity);
+            let Some(activity) = RequestActivity::begin(connection_activity) else {
+                let mut response = service_unavailable();
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                return Ok::<_, Infallible>(response);
+            };
+            request.extensions_mut().insert(activity.deadline_handle());
             let trace = runtime.trace().begin_http(&request, peer.ip());
             if let Some(trace) = &trace {
                 request.extensions_mut().insert(Arc::clone(trace));
@@ -133,9 +140,7 @@ pub(crate) async fn serve_connection(
             _ = cancellation.cancelled() => break,
             _ = &mut connection => break,
             _ = idle_check.tick() => {
-                if Instant::now().saturating_duration_since(*last_activity.lock())
-                    >= idle_timeout
-                {
+                if connection_activity.should_close(tokio::time::Instant::now(), idle_timeout) {
                     break;
                 }
             }
@@ -197,6 +202,7 @@ async fn handle_request(
             client_ip_source,
             trusted_proxy_cidrs,
             runtime,
+            generation,
             vhost,
         )
         .await;
@@ -210,6 +216,7 @@ async fn handle_root(
     client_ip_source: WebClientIpSource,
     trusted_proxy_cidrs: &[IpNetwork],
     runtime: Arc<WebProcessRuntime>,
+    generation: Arc<RuntimeGeneration>,
     vhost: Arc<WebRuntimeVhost>,
 ) -> HttpResponse {
     let (candidate, canonical) = bridge_candidate(request.uri().query());
@@ -225,7 +232,16 @@ async fn handle_root(
         trace.set_route(TraceRoute::Bridge);
         trace.set_effective_ip(client_ip);
     }
-    let bootstrap = match runtime.issue_bootstrap(Arc::clone(&profile), client_ip) {
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let bootstrap = match runtime.issue_bootstrap_for_request(
+        &generation,
+        Arc::clone(&profile),
+        client_ip,
+        user_agent,
+    ) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             runtime.trace().record_profile_lifecycle(
@@ -244,16 +260,20 @@ async fn handle_root(
         trace.bind_profile(&profile, bootstrap.trace_session_id);
         trace.register_redaction(bootstrap.token.as_bytes());
     }
-    let generation = runtime.active_generation();
+    let config = generation.config();
     let page = bridge::render(
         &vhost.host,
         &bootstrap.token,
-        generation.config().web.limits.carrier_batch_bytes,
-        generation.config().web.limits.pending_bytes_per_session,
-        generation.config().web.limits.pending_items_per_session,
+        config.web.limits.carrier_batch_bytes,
+        config.web.limits.pending_bytes_per_session,
+        config.web.limits.pending_items_per_session,
         profile.carrier_negotiation_enabled,
         profile.carriers.len(),
         profile.carrier_negotiation_deadlines_secs,
+        config.web.timeouts.long_poll_secs,
+        config.web.timeouts.bridge_request_secs,
+        config.web.timeouts.bridge_retry_secs,
+        config.web.timeouts.carrier_probe_coalesce_ms,
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));
@@ -348,7 +368,15 @@ async fn handle_up(
         request,
         body,
         _body_budget,
-    } = match collect_body(request, &runtime, limit, false).await {
+    } = match collect_body(
+        request,
+        &runtime,
+        Duration::from_secs(session.timeouts().body_secs),
+        limit,
+        false,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {
@@ -389,6 +417,10 @@ fn strip_query<B>(request: &mut Request<B>) {
 
 fn request_trace<B>(request: &Request<B>) -> Option<&Arc<HttpTraceExchange>> {
     request.extensions().get::<Arc<HttpTraceExchange>>()
+}
+
+fn request_deadline<B>(request: &Request<B>) -> Option<RequestDeadlineHandle> {
+    request.extensions().get::<RequestDeadlineHandle>().cloned()
 }
 
 fn set_trace_route<B>(request: &Request<B>, route: TraceRoute) {
