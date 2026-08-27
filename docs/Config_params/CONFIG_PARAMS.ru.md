@@ -2517,6 +2517,8 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 
 Изменение `enabled` или любого поля capture очищает сохранённые записи и отклоняет commits, начатые в предыдущую policy epoch. Изменение только стандартного или максимального окна наблюдения сохраняет совместимые записи. `full` сохраняет полное тело распознанного carrier только до `web.limits.max_body_bytes`; decoy bodies всегда остаются ограничены настроенным prefix. Prefix, который помещается только в одновременно увеличенную restart-only ёмкость, откладывается вместе с `web.debug` до перезапуска. URI queries никогда не сохраняются, значения credential headers исключаются, копии body очищаются от известных WEB capabilities и bearer tokens, а ключи профилей представлены только domain-separated fingerprint из 16 hex-символов.
 
+Аутентифицированное JSON-управление может явно очистить ring через `POST /v1/runtime/web/debug/clear`: обязательный process `runtime_instance` защищает от устаревшего controller, возвращаемый epoch отсекает in-flight writers, а `leased_bytes` показывает память, всё ещё удерживаемую уже отрисовываемыми snapshots.
+
 # [web.limits]
 
 Эти process-wide границы ограничивают все WEB-реестры, очереди, тела запросов, статические snapshots и admission-пути. Значения проверяются совместно: per-owner лимиты не могут превышать глобальные, резервы очередей должны сохранять прогресс control frames, body-резервы должны помещаться в общий бюджет, а все заявленные байтовые границы — в `memory_envelope_bytes`. Изменение любого значения этой таблицы требует перезапуска процесса.
@@ -2623,7 +2625,7 @@ Hostname нормализуется при валидации и должен п
 
 | Ключ | Тип | Обязательный | По умолчанию | Описание |
 | --- | --- | --- | --- | --- |
-| `user` | `String` | да | — | Существующий ключ из `[access.users]`. |
+| `user` | `String` | да | — | Существующий ключ длиной 1–64 байта из `[access.users]`; ограничение сохраняет bounded runtime-status и фильтры. |
 | `secret_mode` | `"plain"` или `"dd"` | да | — | Точное представление секрета для Telegram Desktop. `ee` не поддерживается. |
 | `max_sessions` | `usize` | нет | `web.limits.max_sessions_global` | Активные сессии этого профиля. |
 | `max_streams` | `usize` | нет | `web.limits.max_streams_global` | Активные logical streams этого профиля. |
@@ -2633,10 +2635,11 @@ Hostname нормализуется при валидации и должен п
 
 ## Lifecycle WEB и управление через API
 
-- Config watcher и generation reload применяют `web.enabled`, policy carrier/negotiation, `web.debug`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Существующие сессии и начатые negotiation chains сохраняют полученные при создании candidates, лимиты и абсолютные deadlines; новые bridge sessions используют активное поколение.
+- Config watcher и generation reload применяют `web.enabled`, policy carrier/negotiation, `web.debug`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Валидируется и активируется один immutable expanded source snapshot; watcher candidate generation запускается только после активации этого поколения. Существующие сессии и начатые negotiation chains сохраняют issuance-time carrier candidates, limits, timeouts и абсолютные deadlines; новые bridge sessions используют одно зафиксированное активное поколение.
 - Состав WEB-listeners и их trust policy в `server.listeners`, а также все значения `web.limits` принадлежат процессу и требуют перезапуска.
-- Изменяемого ресурса `/v1/web` нет. `GET /web-status` предоставляет аутентифицированную read-only HTML-диагностику; `GET /v1/config` не возвращает `[web]`, а `PATCH /v1/config` отклоняет ключ `web` с `400 section_not_editable`.
-- Для удалённого применения WEB policy измените соответствующий TOML-файл и вызовите `POST /v1/system/reload`; проверьте `GET /v1/system/reload/{id}` и поле `deferred_process_fields`. Если оно содержит `server.listeners` или `web.limits`, перезапустите Telemt.
+- `GET /v1/config` возвращает полное авторское дерево `[web]`, кроме производного snapshot `web.runtime`. `PATCH /v1/config` принимает sparse object `web`, глубоко сливает tables, целиком заменяет arrays, валидирует полный candidate и указывает `web.limits` в `deferred_process_fields` до перезапуска.
+- `GET /v1/runtime/web/status`, `/sessions`, `/sessions/{session_ref}` и `/operations/{operation_id}` предоставляют bounded несекретное runtime-состояние. POST controls закрывают выбранные сессии, очищают debug или сбрасывают carrier learning и требуют текущий случайный `runtime_instance`.
+- `web.enabled = false` после активации прекращает новую выдачу bootstrap/session credentials, но не закрывает активные сессии. Для close-all дождитесь `manager.issuance_enabled = false`, отправьте асинхронный selector `all` и опрашивайте его operation.
 - Существующих access users можно создавать, изменять, ротировать, включать, выключать и удалять через `/v1/users`. Создание пользователя не добавляет WEB-профиль. Отключение пользователя немедленно обновляет admission и завершает его активные сессии.
 - `PATCH /v1/config` может сохранить `server.listeners`, включая поля WEB-listener’а, но изменённый WEB-listener активируется только после перезапуска процесса.
 

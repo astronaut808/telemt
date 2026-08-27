@@ -241,20 +241,23 @@ Im Frontend oder im Abschnitt `defaults` muss für das standardmäßige WebSocke
 
 Jeder logische Stream behält die Client-IP seiner Sitzung und besitzt während der gesamten Relay-Lebensdauer einen prozessweit eindeutigen, von null verschiedenen synthetischen Quellport. Damit bleibt für Direct- und Middle-End-KDF-Routing ein stabiles, kollisionsfreies Quell-/Ziel-Tupel erhalten.
 
-Die HTTP-Idle-Erfassung schützt nur explizit begrenzte Request-Body-, Long-Poll-, Decoy-Verbindungs-/Response-Head- und ausstehende Upgrade-Phasen bis zu deren exakten Deadlines. Zwischen Austauschvorgängen und nach Bereitstellung eines Response-Heads setzt Fortschritt den Idle-Timer zurück, während ein blockierter Response-Body weiterhin durch den Idle-Timeout begrenzt bleibt. Der Abschluss einer älteren Phase kann den Deadline-Schutz einer neueren Phase nicht freigeben.
+Die HTTP-Idle-Erfassung schützt nur explizit begrenzte Request-Body-, Long-Poll-, Decoy-Verbindungs-/Response-Head- und ausstehende Upgrade-Phasen. Die eigene Deadline der Operation bleibt exakt; besteht ihre Lease in diesem Moment noch, gewährt der Verbindungs-Watchdog dem eingeplanten Task höchstens ein Connection-Idle-Intervall zur Veröffentlichung seines Timeouts/Ergebnisses, bevor er die Verbindung erzwingend schließt. Zwischen Austauschvorgängen und nach Bereitstellung eines Response-Heads setzt Fortschritt den Idle-Timer zurück, während ein blockierter Response-Body weiterhin durch den Idle-Timeout begrenzt bleibt. Der Abschluss einer älteren Phase kann den Deadline-Schutz einer neueren Phase nicht freigeben.
 
 Ein `OPEN` reserviert die begrenzte Eigentümerschaft für logischen Stream und Tupel, verbraucht jedoch noch kein `max_connections`-Permit der Relay-Generation. Telemt erwirbt dieses Permit erst nach dem ersten inneren Byte; die unveränderliche First-Byte-Deadline und Stream-Grenzen begrenzen stille Opens, und erschöpfte Kapazität schließt anschließend nur den betroffenen Stream.
 
 ## Verwaltung über die API
 
-API-Verwaltung ist verfügbar, aber absichtlich eingeschränkt. Es gibt keine veränderbare Ressource `/v1/web`; der API-Listener stellt die schreibgeschützte HTML-Debug-Ansicht unter `/web-status` bereit.
+WEB-Konfiguration, Runtime-Status und begrenzte Runtime-Steuerung verwenden denselben authentifizierten API-Listener. `/web-status` bleibt eine schreibgeschützte HTML-Diagnose; zustandsverändernde Operationen existieren ausschließlich unter `/v1/runtime/web`.
 
 | Operation | API-Unterstützung |
 | --- | --- |
-| `[web]`, vhosts, Profile, Decoys, Timeouts oder Limits lesen oder ändern | Nein. `GET /v1/config` lässt `[web]` aus; `PATCH /v1/config` antwortet für `web` mit `400 section_not_editable`. |
+| `[web]`, vhosts, Profile, Decoys, Timeouts oder Limits lesen oder ändern | Ja, über `GET` oder `PATCH /v1/config`. Der abgeleitete Snapshot `web.runtime` wird weder ausgegeben noch kann er geschrieben werden. Verschachtelte Tabellen werden feldweise zusammengeführt; Arrays ersetzen das bisherige Array vollständig. Jede Änderung an `[web.limits]` wird als gewünschte Konfiguration angenommen, aber bis zum Prozessneustart als zurückgestellt gemeldet. |
 | `server.listeners` speichern | Ja, über `PATCH /v1/config`; ein geänderter WEB-Listener bleibt jedoch bis zum Prozessneustart zurückgestellt. |
 | Außerhalb der API geänderte WEB-Konfiguration anwenden | Ja, über `POST /v1/system/reload` und anschließende Abfrage des Vorgangsstatus. |
 | Begrenzte serverseitige WEB-Request- und Lifecycle-Details untersuchen | Ja, über ein authentifiziertes `GET /web-status`. |
+| Lifecycle, Kapazitätsebenen, Learning-/Debug-Zustand und aktive Sitzungen untersuchen | Ja, über `GET /v1/runtime/web/status` und `/v1/runtime/web/sessions`. |
+| Ausgewählte aktive WEB-Sitzungen schließen | Ja, über die asynchrone Operation `POST /v1/runtime/web/sessions/close`. |
+| Debug-Datensätze löschen oder Carrier-Learning zurücksetzen | Ja, über die entsprechenden Runtime-POST-Endpunkte. |
 | `[access.users]` verwalten | Ja, über `/v1/users`. Das Erstellen eines Benutzers erzeugt kein WEB-Profil. |
 | Einen Benutzer widerrufen | Ja. `/v1/users/{username}/disable` aktualisiert die Admission sofort und beendet die aktiven Sitzungen dieses Benutzers. |
 
@@ -270,6 +273,20 @@ read_only = false
 ```
 
 Die API-Whitelist prüft den direkten TCP-Peer und vertraut `X-Forwarded-For` nicht. Änderungen an `[server.api]` selbst erfordern einen Prozessneustart.
+
+### Runtime-Status und Steuerung
+
+`GET /v1/runtime/web/status` liefert immer den veröffentlichten Lifecycle (`starting`, `no_web_listener`, `running`, `draining`, `drained` oder `deadline_exceeded`), dessen Epoche und Alter, die effektiven Listener-Adressen und die Verfügbarkeit. Solange die prozesseigene WEB-Runtime lebt, ergänzt `runtime` die zufällige 128-Bit-`runtime_instance`, die aktive Generation, unveränderliche Limits, ebenenlokale Kapazitätszähler, Carrier-Learning-/Debug-Epochen und Summen. Die Statuserfassung liest jede Ebene nicht blockierend: Eine umkämpfte Ebene wird ausgelassen und in `partial` benannt; der Endpunkt wartet nie auf die Datenebene, bereinigt sie nicht und verändert sie nicht.
+
+`GET /v1/runtime/web/sessions` liefert standardmäßig höchstens 50 und bei gesetztem `limit` höchstens 200 Sitzungen. Der geordnete Scan ist auf 1000 Kandidaten begrenzt. `cursor` und `session_ref` verwenden die undurchsichtige kanonische Form `ws1.<runtime-instance>.<lowercase-hex-id>`; ein exakter `session_ref` darf nicht mit `cursor` oder `limit` kombiniert werden. Filter sind `ip`, `host`, `user`, `user_agent_id`, `key_id`, `carrier` und `state`; doppelte oder unbekannte Query-Felder werden abgelehnt. Der Detailpfad lautet `GET /v1/runtime/web/sessions/{session_ref}`. Ein gespeicherter Tombstone einer geschlossenen Sitzung ergibt `410`; ein umkämpfter exakter Snapshot ergibt `503 web_snapshot_busy`. Antworten enthalten nur begrenzte, nicht geheime Metadaten und niemals Bootstrap-/Session-Bearer, Capabilities, Secret-Hashes oder synthetische KDF-Ports.
+
+Jeder Runtime-POST verlangt exakt `Content-Type: application/json`, lehnt unbekannte JSON-Felder ab, beachtet API-Authentifizierung, Whitelist und `read_only` und enthält die aktuelle `runtime_instance` als ABA-Sperre. Verfügbare Steuerungen:
+
+- `POST /v1/runtime/web/sessions/close` mit genau einem Selektor: `{"kind":"refs","session_refs":[...]}`, `{"kind":"filter",...}` oder `{"kind":"all"}`. Exakte Referenzen sind auf 200 begrenzt, ein Filter darf nicht leer sein, nur eine Close-Operation darf laufen, und `all` wird abgelehnt, solange die effektive Ausgabe aktiviert ist. Die `202`-Antwort liefert `operation_id`; fragen Sie `GET /v1/runtime/web/operations/{operation_id}` ab. Die Operation scannt in Blöcken von 128 nur Sitzungen bis einschließlich ihres beim Start fixierten High-Water-Marks.
+- `POST /v1/runtime/web/debug/clear` mit `{"runtime_instance":"..."}`. Die Antwort meldet gelöschte Datensätze, weiterhin von bereits gerenderten Snapshots gehaltene Bytes und die neue Epoche. Laufende Writer der alten Epoche können den Ring nicht erneut füllen.
+- `POST /v1/runtime/web/carrier-learning/reset` mit derselben Body-Form. Der Endpunkt löscht gespeicherte prozesslokale Evidenz und erhöht die Learning-Epoche; bereits fixierte Versuchsketten und aktive Sitzungen bleiben unverändert.
+
+Für ein deterministisches Close-all patchen Sie `{"web":{"enabled":false}}` mit aktiviertem Runtime-Reload, warten auf `runtime.manager.issuance_enabled = false`, senden den Selektor `all` mit derselben `runtime_instance` und fragen die Operation bis zu einem Endzustand ab. Das Deaktivieren von WEB stoppt neue Bootstrap-/Session-Ausgabe, schließt bestehende Sitzungen aber niemals implizit.
 
 ### Serverseitige WEB-Debug-Ansicht
 

@@ -2591,6 +2591,8 @@ Diese hot-reload-fähige Tabelle steuert den prozesseigenen serverseitigen WEB-D
 
 Eine Änderung von `enabled` oder einem Erfassungsfeld löscht gespeicherte Datensätze und verwirft Commits, die unter der vorherigen Policy-Epoche begonnen wurden. Ändert sich nur das standardmäßige oder maximale Beobachtungsfenster, bleiben kompatible Datensätze erhalten. `full` speichert den vollständigen Body eines erkannten Carriers nur bis `web.limits.max_body_bytes`; Decoy-Bodys bleiben immer auf einen Präfix begrenzt. Ein Präfix, der nur mit einer gleichzeitig erhöhten, neustartpflichtigen Kapazität zulässig wäre, wird zusammen mit `web.debug` bis zum Neustart zurückgestellt. URI-Queries werden nie gespeichert, Werte von Credential-Headern werden ausgelassen, Body-Kopien werden von bekannten WEB-Capabilities und Bearer-Tokens bereinigt und Profilschlüssel ausschließlich als domänengetrennter Fingerprint mit 16 Hex-Zeichen dargestellt.
 
+Die authentifizierte JSON-Steuerung kann den Ring mit `POST /v1/runtime/web/debug/clear` explizit löschen. Die erforderliche prozessbezogene `runtime_instance` sperrt veraltete Controller, die zurückgegebene Epoche sperrt laufende Writer und `leased_bytes` meldet Speicher, der noch von bereits gerenderten Snapshots gehalten wird.
+
 # [web.limits]
 
 Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Request-Bodys, statischen Snapshots und Admission-Pfade. Alle Werte werden gemeinsam validiert: Eigentümerbezogene Grenzen dürfen die globalen Grenzen nicht überschreiten, Queue-Reserven müssen den Fortschritt von Control Frames gewährleisten, Body-Reservierungen müssen in ihr globales Budget passen und alle deklarierten Byte-Grenzen müssen in `memory_envelope_bytes` passen. Jede Änderung in dieser Tabelle erfordert einen Prozessneustart.
@@ -2697,7 +2699,7 @@ Genau ein Decoy-Modus ist erforderlich:
 
 | Schlüssel | Typ | Erforderlich | Default | Beschreibung |
 | --- | --- | --- | --- | --- |
-| `user` | `String` | ja | — | Vorhandener Schlüssel aus `[access.users]`. |
+| `user` | `String` | ja | — | Vorhandener Schlüssel mit 1–64 Byte aus `[access.users]`; die Grenze hält Runtime-Status und Filter beschränkt. |
 | `secret_mode` | `"plain"` oder `"dd"` | ja | — | Exakte Secret-Darstellung für Telegram Desktop. `ee` wird nicht unterstützt. |
 | `max_sessions` | `usize` | nein | `web.limits.max_sessions_global` | Aktive Sitzungen für dieses Profil. |
 | `max_streams` | `usize` | nein | `web.limits.max_streams_global` | Aktive logische Streams für dieses Profil. |
@@ -2707,10 +2709,11 @@ Profilgrenzen müssen ungleich null sein und dürfen die zugehörigen globalen G
 
 ## WEB-Lebenszyklus und API-Verwaltung
 
-- Config-Watcher und Generations-Reload wenden `web.enabled`, Carrier- und Negotiation-Richtlinie, `web.debug`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Bestehende Sitzungen und laufende Negotiation-Ketten behalten Kandidaten, Grenzen und absolute Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden die aktive Generation.
+- Config-Watcher und Generations-Reload wenden `web.enabled`, Carrier- und Negotiation-Richtlinie, `web.debug`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Ein einzelner unveränderlicher expandierter Source-Snapshot wird validiert und aktiviert; der Watcher einer Kandidatengeneration startet erst nach deren Aktivierung. Bestehende Sitzungen und laufende Negotiation-Ketten behalten Carrier-Kandidaten, Grenzen, Timeouts und absolute Deadlines ihres Ausgabezeitpunkts; neue Bridge-Sitzungen verwenden genau eine fixierte aktive Generation.
 - Bestand und Vertrauensrichtlinie der WEB-Listener unter `server.listeners` sowie alle Werte in `web.limits` sind prozesseigen und erfordern einen Neustart.
-- Es gibt keine veränderbare Ressource `/v1/web`. `GET /web-status` stellt authentifizierte, schreibgeschützte HTML-Diagnosen bereit; `GET /v1/config` lässt `[web]` aus und `PATCH /v1/config` lehnt einen Schlüssel `web` mit `400 section_not_editable` ab.
-- Zum entfernten Anwenden einer WEB-Richtlinie ändern Sie die zuständige TOML-Datei und rufen `POST /v1/system/reload` auf. Prüfen Sie anschließend `GET /v1/system/reload/{id}` und dessen `deferred_process_fields`. Starten Sie Telemt neu, wenn das Feld `server.listeners` oder `web.limits` enthält.
+- `GET /v1/config` liefert den vollständigen verfassten `[web]`-Baum außer dem abgeleiteten Snapshot `web.runtime`. `PATCH /v1/config` akzeptiert ein dünn besetztes `web`-Objekt, führt Tabellen tief zusammen, ersetzt Arrays vollständig, validiert den gesamten Kandidaten und meldet `web.limits` bis zum Neustart in `deferred_process_fields`.
+- `GET /v1/runtime/web/status`, `/sessions`, `/sessions/{session_ref}` und `/operations/{operation_id}` stellen begrenzten, nicht geheimen Runtime-Zustand bereit. POST-Steuerungen schließen ausgewählte Sitzungen, löschen Debugdaten oder setzen Carrier-Learning zurück und verlangen die aktuelle zufällige `runtime_instance`.
+- `web.enabled = false` stoppt nach der Aktivierung neue Bootstrap-/Session-Ausgaben, schließt aber keine aktiven Sitzungen. Warten Sie für Close-all auf `manager.issuance_enabled = false`, senden Sie den asynchronen Selektor `all` und fragen Sie dessen Operation ab.
 - Vorhandene Access-Benutzer können über `/v1/users` erstellt, geändert, rotiert, aktiviert, deaktiviert und gelöscht werden. Das Erstellen eines Benutzers fügt kein WEB-Profil hinzu. Das Deaktivieren aktualisiert die Admission sofort und beendet die aktiven Sitzungen dieses Benutzers.
 - `PATCH /v1/config` kann `server.listeners` einschließlich der WEB-Listener-Felder speichern; ein geänderter WEB-Listener wird jedoch erst nach einem Prozessneustart aktiv.
 

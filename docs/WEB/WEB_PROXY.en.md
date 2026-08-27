@@ -241,20 +241,23 @@ The frontend or `defaults` section must also set `timeout client 65s` or longer 
 
 Each logical stream keeps its session's creation-time client IP and owns a process-unique, non-zero synthetic source port for the complete relay lifetime. This preserves one stable, non-colliding source/destination tuple for Direct and Middle-End KDF routing.
 
-HTTP idle accounting protects only explicitly bounded request-body, long-poll, decoy connect/response-head, and pending-Upgrade phases until their exact deadlines. Between exchanges, and after a response head is ready, progress resets the idle clock while a stalled response body remains idle-bounded. Completion of an older phase cannot release the deadline protection owned by a newer phase.
+HTTP idle accounting protects only explicitly bounded request-body, long-poll, decoy connect/response-head, and pending-Upgrade phases. The operation's own deadline remains exact; if its lease is still present at that instant, the connection watchdog allows at most one connection-idle interval for the scheduled task to publish its timeout/result before forcing closure. Between exchanges, and after a response head is ready, progress resets the idle clock while a stalled response body remains idle-bounded. Completion of an older phase cannot release the deadline protection owned by a newer phase.
 
 An `OPEN` reserves the bounded logical-stream and tuple ownership but does not consume the relay generation's `max_connections` permit. Telemt acquires that permit only after the first inner byte arrives; the frozen first-byte deadline and stream limits bound silent opens, and capacity exhaustion then closes only the affected stream.
 
 ## API management
 
-API management is available, but it is intentionally partial. There is no mutable `/v1/web` resource; the API listener exposes the read-only HTML debug view at `/web-status`.
+WEB configuration, runtime status, and bounded runtime controls share the authenticated API listener. `/web-status` remains a read-only HTML diagnostic view; state-changing operations exist only under `/v1/runtime/web`.
 
 | Operation | API support |
 | --- | --- |
-| Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | No. `GET /v1/config` omits `[web]`; `PATCH /v1/config` returns `400 section_not_editable` for `web`. |
+| Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | Yes, through `GET` or `PATCH /v1/config`. The derived `web.runtime` snapshot is never returned or writable. Nested tables merge field-by-field; arrays replace the previous array wholesale. Every `[web.limits]` change is accepted as desired configuration but reported as deferred until process restart. |
 | Persist `server.listeners` | Yes, through `PATCH /v1/config`, but a changed WEB listener remains deferred until process restart. |
 | Apply an externally edited WEB configuration | Yes, through `POST /v1/system/reload`, then inspect the operation status. |
 | Inspect bounded server-side WEB request and lifecycle details | Yes, through authenticated `GET /web-status`. |
+| Inspect lifecycle, capacity planes, learning/debug state, and live sessions | Yes, through `GET /v1/runtime/web/status` and `/v1/runtime/web/sessions`. |
+| Close selected live WEB sessions | Yes, through the asynchronous `POST /v1/runtime/web/sessions/close` operation. |
+| Clear debug records or reset carrier learning | Yes, through the corresponding runtime POST endpoints. |
 | Manage `[access.users]` | Yes, through `/v1/users`. User creation does not create a WEB profile. |
 | Revoke one user | Yes. `/v1/users/{username}/disable` updates admission immediately and cancels that user's active sessions. |
 
@@ -270,6 +273,20 @@ read_only = false
 ```
 
 The API whitelist checks the direct TCP peer and does not trust `X-Forwarded-For`. Changes to `[server.api]` itself require a process restart.
+
+### Runtime status and control
+
+`GET /v1/runtime/web/status` always returns the published lifecycle (`starting`, `no_web_listener`, `running`, `draining`, `drained`, or `deadline_exceeded`), its epoch and age, effective listener addresses, and availability. When the process-owned WEB runtime is alive, `runtime` adds its random 128-bit `runtime_instance`, active generation, immutable limits, plane-local capacity counters, carrier-learning/debug epochs, and totals. Status collection uses non-blocking plane reads: a contended plane is omitted and named in `partial`; the endpoint never waits for, cleans up, or mutates the data plane.
+
+`GET /v1/runtime/web/sessions` returns at most 50 sessions by default and at most 200 when `limit` is supplied. Its ordered scan is capped at 1000 candidates. `cursor` and `session_ref` use the opaque canonical form `ws1.<runtime-instance>.<lowercase-hex-id>`; exact `session_ref` is mutually exclusive with `cursor` and `limit`. Filters are `ip`, `host`, `user`, `user_agent_id`, `key_id`, `carrier`, and `state`; duplicate or unknown query fields are rejected. The detail route is `GET /v1/runtime/web/sessions/{session_ref}`. A retained closed-session tombstone returns `410`; a contended exact snapshot returns `503 web_snapshot_busy`. Responses expose bounded non-secret metadata and never expose bootstrap/session bearers, capabilities, secret hashes, or synthetic/KDF ports.
+
+Every runtime POST requires `Content-Type: application/json` exactly, rejects unknown JSON fields, obeys API authentication, whitelist, and `read_only`, and carries the current `runtime_instance` as an ABA fence. Available controls are:
+
+- `POST /v1/runtime/web/sessions/close` with one selector: `{"kind":"refs","session_refs":[...]}`, `{"kind":"filter",...}`, or `{"kind":"all"}`. Exact refs are limited to 200, a filter must be non-empty, only one close operation may run, and `all` is rejected while effective issuance remains enabled. The `202` response returns `operation_id`; poll `GET /v1/runtime/web/operations/{operation_id}`. The operation scans only sessions at or below its submission high-water mark in chunks of 128.
+- `POST /v1/runtime/web/debug/clear` with `{"runtime_instance":"..."}`. The response reports cleared records, bytes still leased by already rendered snapshots, and the new epoch. In-flight writers from the old epoch cannot repopulate the ring.
+- `POST /v1/runtime/web/carrier-learning/reset` with the same body shape. It clears retained process-local evidence and advances the learning epoch; already frozen attempt chains and live sessions are unchanged.
+
+For a deterministic close-all, patch `{"web":{"enabled":false}}` with runtime reload enabled, wait until `runtime.manager.issuance_enabled` is `false`, submit the `all` selector using that same `runtime_instance`, and poll the operation to a terminal state. Disabling WEB stops new bootstrap/session issuance but never implicitly closes existing sessions.
 
 ### Server-side WEB debug view
 

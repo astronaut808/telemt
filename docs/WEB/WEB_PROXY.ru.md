@@ -241,20 +241,23 @@ backend telemt_web
 
 Каждый logical stream сохраняет client IP своей сессии и владеет уникальным в пределах процесса ненулевым synthetic source port до завершения relay. Это сохраняет один стабильный непересекающийся source/destination tuple для Direct и Middle-End KDF routing.
 
-HTTP idle accounting защищает только явно ограниченные фазы request body, long poll, подключения/response head decoy и ожидания Upgrade до их точных deadlines. Между обменами и после готовности response head прогресс сбрасывает idle-таймер, а зависший response body остаётся ограничен idle timeout. Завершение старой фазы не может снять deadline-защиту, которой уже владеет новая фаза.
+HTTP idle accounting защищает только явно ограниченные фазы request body, long poll, подключения/response head decoy и ожидания Upgrade. Собственный deadline операции остаётся точным; если в этот момент её lease ещё существует, connection watchdog даёт запланированной задаче не более одного connection-idle interval для публикации timeout/result, после чего принудительно закрывает connection. Между обменами и после готовности response head прогресс сбрасывает idle-таймер, а зависший response body остаётся ограничен idle timeout. Завершение старой фазы не может снять deadline-защиту, которой уже владеет новая фаза.
 
 `OPEN` резервирует bounded ownership logical stream и tuple, но не занимает permit `max_connections` relay generation. Telemt получает этот permit только после первого внутреннего байта; замороженный first-byte deadline и stream limits ограничивают silent opens, а исчерпание capacity закрывает только затронутый stream.
 
 ## Управление через API
 
-Управление через API доступно, но намеренно ограничено. Изменяемого ресурса `/v1/web` нет; API-listener предоставляет read-only HTML debug view по адресу `/web-status`.
+Конфигурация WEB, статус runtime и bounded runtime-управление доступны на одном аутентифицированном API-listener. `/web-status` остаётся read-only HTML-диагностикой; операции, изменяющие состояние, существуют только под `/v1/runtime/web`.
 
 | Операция | Поддержка API |
 | --- | --- |
-| Чтение или изменение `[web]`, vhosts, profiles, decoys, timeouts или limits | Нет. `GET /v1/config` не возвращает `[web]`; `PATCH /v1/config` отвечает `400 section_not_editable` на ключ `web`. |
+| Чтение или изменение `[web]`, vhosts, profiles, decoys, timeouts или limits | Да, через `GET` или `PATCH /v1/config`. Производный snapshot `web.runtime` не возвращается и недоступен для записи. Вложенные tables сливаются по полям; arrays целиком заменяют прежний array. Любое изменение `[web.limits]` принимается как desired configuration, но помечается deferred до перезапуска процесса. |
 | Сохранение `server.listeners` | Да, через `PATCH /v1/config`, но изменённый WEB-listener остаётся deferred до перезапуска процесса. |
 | Применение WEB-конфигурации, изменённой вне API | Да, через `POST /v1/system/reload` с последующей проверкой статуса операции. |
 | Просмотр bounded серверных WEB request- и lifecycle-деталей | Да, через аутентифицированный `GET /web-status`. |
+| Просмотр lifecycle, capacity planes, состояния learning/debug и активных сессий | Да, через `GET /v1/runtime/web/status` и `/v1/runtime/web/sessions`. |
+| Закрытие выбранных активных WEB-сессий | Да, через асинхронную операцию `POST /v1/runtime/web/sessions/close`. |
+| Очистка debug-записей или сброс carrier learning | Да, через соответствующие runtime POST endpoints. |
 | Управление `[access.users]` | Да, через `/v1/users`. Создание пользователя не создаёт WEB-профиль. |
 | Отзыв отдельного пользователя | Да. `/v1/users/{username}/disable` немедленно обновляет admission и завершает активные сессии пользователя. |
 
@@ -270,6 +273,20 @@ read_only = false
 ```
 
 API whitelist проверяет непосредственный TCP peer и не доверяет `X-Forwarded-For`. Изменения самой секции `[server.api]` требуют перезапуска процесса.
+
+### Статус и управление runtime
+
+`GET /v1/runtime/web/status` всегда возвращает опубликованный lifecycle (`starting`, `no_web_listener`, `running`, `draining`, `drained` или `deadline_exceeded`), его epoch и возраст, эффективные адреса listeners и доступность. Пока process-owned WEB runtime существует, поле `runtime` добавляет случайный 128-битный `runtime_instance`, активное поколение, неизменяемые limits, capacity counters отдельных planes, epochs carrier-learning/debug и суммарные counters. Status собирается неблокирующим чтением каждого plane: занятый plane пропускается и указывается в `partial`; endpoint никогда не ожидает data plane, не выполняет cleanup и не изменяет его.
+
+`GET /v1/runtime/web/sessions` возвращает не более 50 сессий по умолчанию и не более 200 при заданном `limit`. Упорядоченный scan ограничен 1000 кандидатами. `cursor` и `session_ref` имеют opaque canonical вид `ws1.<runtime-instance>.<lowercase-hex-id>`; точный `session_ref` нельзя сочетать с `cursor` или `limit`. Доступны фильтры `ip`, `host`, `user`, `user_agent_id`, `key_id`, `carrier` и `state`; повторяющиеся или неизвестные query fields отклоняются. Детальная операция — `GET /v1/runtime/web/sessions/{session_ref}`. Сохранённый tombstone закрытой сессии возвращает `410`; занятый точный snapshot — `503 web_snapshot_busy`. Ответы содержат только bounded несекретные metadata и никогда не раскрывают bootstrap/session bearers, capabilities, hashes секретов или synthetic/KDF ports.
+
+Каждый runtime POST требует ровно `Content-Type: application/json`, отклоняет неизвестные JSON fields, наследует API authentication, whitelist и `read_only`, а также содержит текущий `runtime_instance` как ABA-fence. Доступные операции:
+
+- `POST /v1/runtime/web/sessions/close` с одним selector: `{"kind":"refs","session_refs":[...]}`, `{"kind":"filter",...}` или `{"kind":"all"}`. Точные refs ограничены 200, filter должен быть непустым, одновременно выполняется не более одной close operation, а `all` отклоняется, пока effective issuance включён. Ответ `202` содержит `operation_id`; опрашивайте `GET /v1/runtime/web/operations/{operation_id}`. Операция chunks по 128 сканирует только сессии не выше submission high-water mark.
+- `POST /v1/runtime/web/debug/clear` с `{"runtime_instance":"..."}`. Ответ содержит число удалённых записей, bytes, всё ещё удерживаемые уже отрисовываемыми snapshots, и новый epoch. In-flight writers старого epoch не могут снова заполнить ring.
+- `POST /v1/runtime/web/carrier-learning/reset` с тем же body. Операция очищает сохранённый process-local evidence и увеличивает learning epoch; уже замороженные attempt chains и активные сессии не изменяются.
+
+Для детерминированного close-all отправьте patch `{"web":{"enabled":false}}` с включённым runtime reload, дождитесь `runtime.manager.issuance_enabled = false`, отправьте selector `all` с тем же `runtime_instance` и опрашивайте operation до terminal state. Отключение WEB прекращает новую выдачу bootstrap/session credentials, но никогда не закрывает существующие сессии неявно.
 
 ### Серверная WEB-отладка
 

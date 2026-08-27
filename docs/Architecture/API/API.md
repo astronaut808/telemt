@@ -104,6 +104,13 @@ Notes:
 | `GET` | `/v1/runtime/connections/summary` | none | `200` | `RuntimeEdgeConnectionsSummaryData` |
 | `GET` | `/v1/runtime/events/recent` | none | `200` | `RuntimeEdgeEventsData` |
 | `GET` | `/v1/runtime/tls-fingerprints` | optional `limit=1..1000` | `200` | `RuntimeEdgeTlsFingerprintsData` |
+| `GET` | `/v1/runtime/web/status` | none | `200` | `WebStatusData` |
+| `GET` | `/v1/runtime/web/sessions` | bounded query | `200` | `SessionPage` |
+| `GET` | `/v1/runtime/web/sessions/{session_ref}` | none | `200` or `410` | `SessionRow` or closed tombstone |
+| `POST` | `/v1/runtime/web/sessions/close` | `CloseRequest` | `202` | `ControlOperationStatus` |
+| `GET` | `/v1/runtime/web/operations/{operation_id}` | none | `200` | `ControlOperationStatus` |
+| `POST` | `/v1/runtime/web/debug/clear` | `RuntimeInstanceRequest` | `200` | `DebugClearData` |
+| `POST` | `/v1/runtime/web/carrier-learning/reset` | `RuntimeInstanceRequest` | `200` | `LearningResetData` |
 | `GET` | `/v1/stats/users/active-ips` | none | `200` | `UserActiveIps[]` |
 | `GET` | `/v1/stats/users` | none | `200` | `UserInfo[]` |
 | `GET` | `/v1/config` | none | `200` | `ConfigData` |
@@ -145,6 +152,13 @@ Notes:
 | `GET /v1/runtime/me-selftest` | Returns ME self-test state for KDF, time skew, IP family, PID, and SOCKS BND observations. |
 | `GET /v1/runtime/connections/summary` | Returns runtime-edge connection totals and top-N users by connections/throughput. |
 | `GET /v1/runtime/events/recent` | Returns recent API/runtime event records with optional `limit` query. |
+| `GET /v1/runtime/web/status` | Returns WEB listener lifecycle and a non-blocking, plane-local snapshot of the process-owned WEB runtime when available. |
+| `GET /v1/runtime/web/sessions` | Returns a bounded ordered page of live WEB sessions with strict filters and opaque process-fenced references. |
+| `GET /v1/runtime/web/sessions/{session_ref}` | Returns one exact live-session snapshot or a retained closed-session tombstone. |
+| `POST /v1/runtime/web/sessions/close` | Accepts one bounded asynchronous point-in-time close operation. |
+| `GET /v1/runtime/web/operations/{operation_id}` | Returns one of the 32 most recently retained WEB close-operation states. |
+| `POST /v1/runtime/web/debug/clear` | Clears the bounded WEB debug ring under an epoch fence. |
+| `POST /v1/runtime/web/carrier-learning/reset` | Clears process-local carrier-learning evidence without changing live attempt chains. |
 | `GET /v1/stats/users/active-ips` | Returns users that currently have non-empty active source-IP lists. |
 | `GET /v1/stats/users` | Alias of `GET /v1/users`; returns disk-first user views with runtime lag flag. |
 | `GET /v1/config` | Returns the current editable config sections as JSON (no `access.*`) plus the revision. |
@@ -176,12 +190,19 @@ Notes:
 | `405` | `method_not_allowed` | Unsupported method for `/v1/users/{username}` route shape. |
 | `409` | `revision_conflict` | `If-Match` revision mismatch. |
 | `409` | `reload_in_progress` | Another reload operation is non-terminal. |
+| `409` | `web_runtime_mismatch` | A runtime instance, session reference, or operation reference belongs to another WEB process instance. |
+| `409` | `web_issuance_enabled` | A WEB close-all operation was requested while effective issuance remained enabled. |
+| `409` | `web_operation_in_progress` | Another bounded WEB close operation is active. |
 | `409` | `user_exists` | User already exists on create. |
 | `409` | `last_user_forbidden` | Attempt to delete last configured user. |
 | `413` | `payload_too_large` | Body exceeds `request_body_limit_bytes`. |
+| `415` | `unsupported_media_type` | A WEB runtime POST does not carry exactly one `Content-Type: application/json` header. |
+| `410` | success envelope | A valid WEB session reference resolves to a retained closed-session tombstone. |
 | `500` | `internal_error` | Internal error (I/O, serialization, config load/save). |
 | `503` | `api_disabled` | API disabled in config. |
 | `503` | `maestro_unavailable` | Maestro's reload command channel is unavailable. |
+| `503` | `web_runtime_unavailable` | The WEB runtime is not running or has left the readable lifecycle. |
+| `503` | `web_snapshot_busy` | An exact non-blocking WEB session snapshot encountered lock contention. |
 
 ## Routing and Method Edge Cases
 
@@ -204,8 +225,8 @@ Notes:
 - Body size limit is enforced during streaming read (`413 payload_too_large`).
 - Invalid transport body frame returns `400 bad_request` (`Invalid request body`).
 - Invalid JSON returns `400 bad_request` (`Invalid JSON body`).
-- `Content-Type` is not required for JSON parsing.
-- Unknown JSON fields are ignored by deserialization.
+- `Content-Type` is not required for existing config/user/reload JSON parsing. Every WEB runtime POST requires exactly one header with the exact value `application/json`.
+- Existing request DTOs retain their documented unknown-field behavior. WEB runtime POST DTOs reject unknown JSON fields.
 - `PATCH` uses JSON Merge Patch semantics for optional per-user fields: omitted means unchanged, explicit `null` removes the config entry, and a non-null value sets it.
 - `If-Match` supports both quoted and unquoted values; surrounding whitespace is trimmed.
 
@@ -214,6 +235,7 @@ Notes:
 | Endpoint | Query | Behavior |
 | --- | --- | --- |
 | `GET /v1/runtime/events/recent` | `limit=<usize>` | Optional. Invalid/missing value falls back to default `50`. Effective value is clamped to `[1, 1000]` and additionally bounded by ring-buffer capacity. |
+| `GET /v1/runtime/web/sessions` | `limit`, `cursor`, `session_ref`, `ip`, `host`, `user`, `user_agent_id`, `key_id`, `carrier`, `state` | `limit` defaults to 50 and is bounded to `1..=200`; the ordered candidate scan stops at 1000. Duplicate and unknown fields are rejected. `session_ref` selects an exact logical session and cannot be combined with `cursor` or `limit`. |
 
 ## Request Contracts
 
@@ -261,11 +283,11 @@ bob = ["198.51.100.42/32"]
 
 ### `PatchConfigRequest`
 
-A sparse JSON object containing only the top-level config sections to modify. Each key must be one of the editable sections (`general`, `timeouts`, `censorship`, `upstreams`, `dc_overrides`) or the partially editable `server` object (only `listeners` is allowed under `server`; see below). Tables within a section are deep-merged field-by-field into the existing config; arrays and scalar values replace the existing value wholesale. Untouched sections and file comments are preserved.
+A sparse JSON object containing only the top-level config sections to modify. Each key must be one of the editable sections (`general`, `timeouts`, `censorship`, `upstreams`, `dc_overrides`, `web`) or the partially editable `server` object (only `listeners` is allowed under `server`; see below). Tables within a section are deep-merged field-by-field into the existing config; arrays and scalar values replace the existing value wholesale. Untouched sections and file comments are preserved.
 
 **Rejected keys:**
 - `access` → `400 access_not_editable` (users/secrets are managed via `POST/PATCH /v1/users`).
-- `network`, `web`, or any unknown top-level key → `400 section_not_editable`.
+- `network` or any unknown top-level key → `400 section_not_editable`.
 - `server` with any key other than `listeners` (e.g. `port`, `api`, `admin_api`) → `400 field_not_editable`.
 - An object with no editable keys → `400 bad_request` (empty patch).
 
@@ -299,9 +321,91 @@ Returned by `GET /v1/config` as the envelope `data`. The fields are exactly the 
 | `censorship` | `object?` | `[censorship]` section, if present. |
 | `upstreams` | `object?` | `[upstreams]` section, if present. |
 | `dc_overrides` | `object?` | `[dc_overrides]` section, if present. |
+| `web` | `object?` | Complete authored `[web]` section, if present. The derived runtime-only `web.runtime` field is excluded. |
 | `server` | `object?` | Partial `[server]` view when editable nested fields are present. Currently only `listeners` may appear; `api`/`admin_api`, `port`, unix sockets, and other bind-identity fields are never returned. |
 
-Sections absent from the config file are absent from the response (not `null`). Only the editable sections above are returned; `access` (users/secrets) and `network` (per-node addresses) are always excluded. Under `server`, only the nested field-level allowlist (`listeners`) is exposed.
+Sections absent from the config file are absent from the response (not `null`). Only the editable sections above are returned; `access` (users/secrets) and `network` (per-node addresses) are always excluded. Under `server`, only the nested field-level allowlist (`listeners`) is exposed. Changes under `[web.limits]` are valid desired configuration but remain process-deferred; the patch response reports `web.limits` in `deferred_process_fields` until restart.
+
+### WEB runtime identity and lifecycle
+
+The WEB control plane is process-fenced. `runtime_instance` is a random 128-bit lowercase hexadecimal value created with the process-owned WEB runtime. Session references use `ws1.<runtime_instance>.<16-lowercase-hex-id>` and close-operation references use `wo1.<runtime_instance>.<16-lowercase-hex-id>`. Treat all three as opaque. A reference from another process instance returns `409 web_runtime_mismatch`, preventing an old controller from targeting reused counters after restart.
+
+`GET /v1/config` is the desired on-disk configuration view. `GET /v1/runtime/web/status` is the effective process view. Its envelope `revision` still identifies the current source graph and can therefore be newer than the active runtime generation while a reload is pending.
+
+`WebStatusData` contains:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `lifecycle` | `string` | `starting`, `no_web_listener`, `running`, `draining`, `drained`, or `deadline_exceeded`. |
+| `lifecycle_epoch` | `u64` | Monotonic publication epoch. |
+| `lifecycle_age_ms` | `u64` | Monotonic age of the current lifecycle publication. |
+| `available` | `bool` | Whether a readable process runtime is currently published. |
+| `reason` | `string?` | Stable unavailability reason when `available=false`. |
+| `listeners` | `string[]` | Effective bound WEB listener addresses. |
+| `effective_config_enabled` | `bool` | `web.enabled` in the API request's active runtime generation. |
+| `runtime` | `WebRuntimeStatus?` | Present while the weak process-runtime publication can be upgraded. |
+
+`WebRuntimeStatus` includes `runtime_instance`, `generation_id`, immutable effective `limits`, manager/stream/budget/WebSocket/learning/debug planes, permit usage, task/counter totals, and `partial`. Plane locks are read with `try_lock`; a contended plane is omitted and named in `partial`. Status collection performs no cleanup, waits, or data-plane mutation, so fields are plane-local observations rather than one globally atomic snapshot. `runtime.manager.issuance_enabled` is the authority to check before close-all.
+
+### WEB session enumeration
+
+`GET /v1/runtime/web/sessions` defaults to `limit=50`, permits `1..=200`, and scans at most 1000 ordered candidates. `next_cursor` continues after the last scanned opaque session reference. `scan_truncated` reports the scan bound, `partial_sessions` counts contended per-session snapshots, and `partial` names an unavailable manager plane. The complete serialized page remains below the API response envelope because every string and row count is bounded.
+
+Filters are exact unless stated otherwise:
+
+| Query field | Contract |
+| --- | --- |
+| `cursor`, `session_ref` | Canonical opaque reference for the current `runtime_instance`; `session_ref` forces one-row lookup semantics and is mutually exclusive with `cursor` and `limit`. |
+| `ip` | Canonically formatted IPv4 or IPv6 address. |
+| `host` | Non-empty, at most 253 bytes. |
+| `user` | Non-empty, at most 64 bytes. |
+| `user_agent_id` | Exactly 32 lowercase hexadecimal characters. |
+| `key_id` | Exactly 16 lowercase hexadecimal characters; this is a non-secret domain-separated fingerprint. |
+| `carrier` | `https`, `https-lanes`, `websocket`, or `websocket-lanes`. |
+| `state` | `provisional`, `replacing`, `committed`, `healthy`, `closing`, `superseded`, or transient live-index `closed`. |
+
+Each `SessionRow` contains `session_ref`, optional bounded `user_agent` and `user_agent_id`, plus client IP, host, user, key fingerprint, carrier/attempt/class/state, stream/task/lane/WebSocket counts, pending/control usage, age/idle timing, and optional negotiation time remaining. No bootstrap token, session bearer, raw capability, configured secret/hash, or synthetic source/KDF port is returned. `GET /v1/runtime/web/sessions/{session_ref}` returns `200` for a live row, `410` with `{state:"closed", attempt}` for a bounded retained tombstone, `404` if unknown, or `503 web_snapshot_busy` on lock contention.
+
+### WEB runtime mutations
+
+Every WEB runtime POST requires the currently published `runtime_instance`, exactly one `Content-Type: application/json` header, no query parameters, and a JSON object with no unknown fields. All mutations inherit API authentication, direct-peer whitelist, body limit, audit recording, and `read_only` enforcement.
+
+`POST /v1/runtime/web/sessions/close` accepts:
+
+```json
+{
+  "runtime_instance": "0123456789abcdef0123456789abcdef",
+  "selector": {
+    "kind": "refs",
+    "session_refs": ["ws1.0123456789abcdef0123456789abcdef.0000000000000001"]
+  }
+}
+```
+
+The selector is exactly one of:
+
+- `refs`: `1..=200` unique current-instance session references.
+- `filter`: at least one session filter using the same fields and bounds as enumeration.
+- `all`: every session at or below the operation's submission high-water mark; rejected with `409 web_issuance_enabled` until effective issuance is disabled.
+
+Only one close operation runs at a time. Work is chunked into at most 128 registry candidates between cancellation points, never awaits while holding a manager/session lock, and never targets sessions created above its high-water mark. `202` returns `ControlOperationStatus`; poll its `operation_id` through `GET /v1/runtime/web/operations/{operation_id}`. The process retains 32 statuses. Fields include `state` (`queued`, `running`, `completed`, `cancelled`, or `failed`), the high-water reference, requested/scanned/matched/signalled/conflicted counters, timestamps, and an optional sanitized failure token.
+
+`POST /v1/runtime/web/debug/clear` and `POST /v1/runtime/web/carrier-learning/reset` both accept:
+
+```json
+{"runtime_instance":"0123456789abcdef0123456789abcdef"}
+```
+
+Debug clear swaps the retained ring under a new epoch and reports `records_cleared`, still-leased snapshot bytes, and `epoch`; old in-flight commits cannot restore removed data. Learning reset swaps bounded evidence under a new epoch and reports `entries_cleared` and `epoch`; live sessions and already frozen negotiation chains are unaffected.
+
+Deterministic close-all sequence:
+
+1. `PATCH /v1/config?reload=drain` with `{"web":{"enabled":false}}`.
+2. Poll the accepted reload, then `GET /v1/runtime/web/status` until `runtime.manager.issuance_enabled=false`.
+3. Submit the `all` close selector with the same status `runtime_instance`.
+4. Poll the returned operation to a terminal state.
+
+`web.enabled=false` only stops new bridge/bootstrap/session issuance. It never implicitly closes active WEB sessions.
 
 ### `PatchConfigResponse`
 
@@ -1524,20 +1628,23 @@ The revision is verified again after preparation. With `failure_policy=rollback`
 
 ## WEB Proxy Management
 
-The API provides partial operational control for WEB mode. It does not expose a mutable `/v1/web` resource, but it serves bounded read-only HTML diagnostics at `GET /web-status`.
+The API exposes WEB desired configuration through the common config resource, process state through `/v1/runtime/web`, and bounded read-only HTML diagnostics at `GET /web-status`. There is no separate `/v1/web` configuration resource.
 
 | Operation | Current contract |
 | --- | --- |
-| Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | Not exposed. `GET /v1/config` omits `[web]`; a `web` key in `PATCH /v1/config` returns `400 section_not_editable`. |
+| Read or patch `[web]`, vhosts, profiles, decoys, timeouts, or limits | Supported through `GET` and `PATCH /v1/config`; `web.runtime` is derived and excluded. Tables deep-merge, arrays replace wholesale, and `web.limits` remains process-deferred. |
 | Persist `server.listeners` | Supported through `PATCH /v1/config`. Arrays replace wholesale. A changed WEB listener is process-owned and remains deferred until process restart. |
 | Apply an externally edited WEB config | Update the owning TOML source, call `POST /v1/system/reload`, then poll `GET /v1/system/reload/{id}`. |
 | Inspect restart requirements | Read `deferred_process_fields` from reload status. `server.listeners` and `web.limits` require process restart. |
-| Manage access users | Use `/v1/users`. Creating a user does not add it to `web.vhosts.profiles`; profile membership remains file-managed. |
+| Inspect WEB lifecycle, capacity, sessions, operations, learning, and debug state | Use the authenticated `GET /v1/runtime/web/*` routes documented above. |
+| Close selected or all point-in-time sessions | Use `POST /v1/runtime/web/sessions/close`; close-all first requires effective issuance to be disabled. |
+| Clear debug records or reset carrier learning | Use `POST /v1/runtime/web/debug/clear` or `/carrier-learning/reset` with the current `runtime_instance`. |
+| Manage access users | Use `/v1/users`. Creating a user does not add it to `web.vhosts.profiles`; add profile membership through the `web` config patch. |
 | Disable one user | `POST /v1/users/{username}/disable` updates admission immediately and cancels the user's active sessions. |
 | Rotate a profiled user's secret | Use `/v1/users/{username}/rotate-secret`; the config watcher rebuilds WEB capabilities from the new access snapshot. The API returns the secret, not a `tg://webproxy` link. |
 | Read WEB-specific runtime diagnostics | Use authenticated `GET /web-status`; filters cover client IP, process session ID, User-Agent, and non-secret key fingerprint, with optional grouping, expandable HTTP request-to-response details, and WebSocket handshake/message/frame rows. |
 
-`web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots are runtime-generation fields. A changed carrier applies only to newly issued bridge sessions; existing sessions retain their creation-time carrier. WEB listener inventory and trust policy, plus all `[web.limits]`, are process-owned. A successful reload can therefore activate the runtime-owned subset while reporting the process-owned subset as deferred.
+`web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots are runtime-generation fields. A changed carrier applies only to newly issued bridge sessions; existing sessions and issued bootstrap chains retain their issuance-time policy. `web.enabled=false` stops new issuance but never closes live sessions implicitly. WEB listener inventory and trust policy, plus all `[web.limits]`, are process-owned. A successful reload can therefore activate the runtime-owned subset while reporting the process-owned subset as deferred.
 
 Before deleting a user referenced by a WEB profile, remove and apply the profile first. User mutations validate the complete resulting configuration, so a dangling WEB profile is rejected rather than persisted.
 

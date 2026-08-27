@@ -2591,6 +2591,8 @@ This hot-reloadable table controls the process-owned server-side WEB debug recor
 
 Changing `enabled` or any capture field clears retained records and rejects commits started under the previous policy epoch. Changing only the default or maximum observation window preserves compatible retained records. `full` retains a complete recognized carrier body only up to `web.limits.max_body_bytes`; decoy bodies always remain prefix-bounded. A prefix that depends on a simultaneously increased restart-only capacity is deferred with `web.debug` until restart. URI queries are never retained, credential header values are omitted, body copies are scrubbed for known WEB capabilities and bearer tokens, and profile keys are represented only by a domain-separated 16-hex fingerprint.
 
+Authenticated JSON control may clear the ring explicitly with `POST /v1/runtime/web/debug/clear`; the required process `runtime_instance` fences stale controllers, the returned epoch fences in-flight writers, and `leased_bytes` reports memory still owned by already rendered snapshots.
+
 # [web.limits]
 
 These process-wide ceilings make every WEB registry, queue, request body, static snapshot, and admission path bounded. All values are validated together. Per-owner limits cannot exceed global limits, queue reserves must preserve control-frame progress, body reservations must fit their global budget, and all declared byte ceilings must fit `memory_envelope_bytes`. Changing any value in this table requires a process restart.
@@ -2697,7 +2699,7 @@ Exactly one decoy mode is required:
 
 | Key | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `user` | `String` | yes | — | Existing key from `[access.users]`. |
+| `user` | `String` | yes | — | Existing 1–64-byte key from `[access.users]`; the bound keeps runtime status and filters bounded. |
 | `secret_mode` | `"plain"` or `"dd"` | yes | — | Exact Telegram Desktop secret representation. `ee` is not supported. |
 | `max_sessions` | `usize` | no | `web.limits.max_sessions_global` | Live sessions for this profile. |
 | `max_streams` | `usize` | no | `web.limits.max_streams_global` | Live logical streams for this profile. |
@@ -2707,10 +2709,11 @@ Profile limits must be non-zero and no greater than their corresponding global l
 
 ## WEB lifecycle and API management
 
-- The config watcher and generation reload apply `web.enabled`, carrier and negotiation policy, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots without a process restart. Existing sessions and in-flight negotiation chains keep their acquisition-time carrier candidates, limits, and absolute deadlines; newly issued bridge sessions use the active generation.
+- The config watcher and generation reload apply `web.enabled`, carrier and negotiation policy, `web.debug`, `web.timeouts`, vhosts, profiles, and decoy snapshots without a process restart. One immutable expanded source snapshot is validated and activated; a candidate generation's watcher starts only after that generation becomes active. Existing sessions and in-flight negotiation chains keep their issuance-time carrier candidates, limits, timeouts, and absolute deadlines; newly issued bridge sessions use one pinned active generation.
 - WEB listener inventory and trust policy under `server.listeners`, and every `web.limits` value, are process-owned and restart-required.
-- There is no mutable `/v1/web` resource. `GET /web-status` provides authenticated read-only HTML diagnostics; `GET /v1/config` omits `[web]`, and `PATCH /v1/config` rejects a `web` key with `400 section_not_editable`.
-- To manage WEB policy remotely, update the owned TOML file and call `POST /v1/system/reload`; inspect `GET /v1/system/reload/{id}` and its `deferred_process_fields`. Restart Telemt when it contains `server.listeners` or `web.limits`.
+- `GET /v1/config` returns the complete authored `[web]` tree except the derived `web.runtime` snapshot. `PATCH /v1/config` accepts a sparse `web` object, deep-merges tables, replaces arrays wholesale, validates the complete candidate, and reports `web.limits` in `deferred_process_fields` until restart.
+- `GET /v1/runtime/web/status`, `/sessions`, `/sessions/{session_ref}`, and `/operations/{operation_id}` expose bounded non-secret runtime state. POST controls close selected sessions, clear debug data, or reset carrier learning and require the current random `runtime_instance`.
+- `web.enabled = false` stops new bootstrap/session issuance after activation but does not close live sessions. For close-all, wait until status reports `manager.issuance_enabled = false`, submit the asynchronous `all` selector, and poll its operation.
 - Existing access users can be created, changed, rotated, enabled, disabled, and deleted through `/v1/users`. Creating a user does not add a WEB profile. Disabling a user immediately updates admission and cancels that user's active sessions.
 - `PATCH /v1/config` can persist `server.listeners`, including WEB listener fields, but a changed WEB listener does not become active until process restart.
 
