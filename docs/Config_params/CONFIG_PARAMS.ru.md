@@ -2484,12 +2484,19 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
 | `carrier` | `"https"`, `"https-lanes"`, `"websocket"` или `"websocket-lanes"` | `"https"` | `✔` |
+| `carriers` | `false` или непустой массив уникальных carrier | `false` | `✔` |
+| `carrier_learning` | `bool` | `true` | `✔` |
+| `carrier_negotiation_aggressiveness` | `"conservative"`, `"balanced"` или `"aggressive"` | `"conservative"` | `✔` |
 | `debug` | таблица | выключено, ограниченные defaults | `✔` |
 | `limits` | таблица | ограниченные defaults | `✘` |
 | `timeouts` | таблица | ограниченные defaults | `✔` |
 | `vhosts` | массив таблиц | `[]` | `✔` |
 
-Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `https` сохраняет сериализованный HTTPS transport. В `https-lanes` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; carrier требует `max_http_handlers >= 2` и публичного HTTP/2 на TLS-терминаторе. `websocket` переносит все logical streams через одно упорядоченное RFC 6455 connection, а `websocket-lanes` выделяет отдельное connection каждому ненулевому stream и изолирует сбои lane. Оба WebSocket carrier используют `GET /api/v1/ws` после создания HTTPS-сессии и требуют от TLS-терминатора сохранять HTTP/1.1 Upgrade headers. Reload применяет `carrier` только к новым bridge sessions. Отключение WEB после reload прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
+Для `enabled = true` нужен как минимум один доступный по сетевой политике WEB-listener, один vhost и один профиль в каждом vhost. `https` сохраняет сериализованный HTTPS transport и требует `max_http_handlers >= 2`. В `https-lanes` stream zero и каждый logical stream получают независимые uplink sequence, downlink cursor, retry и long poll; carrier требует `max_http_handlers >= 4` и публичного HTTP/2 на TLS-терминаторе. `websocket` переносит все logical streams через одно упорядоченное RFC 6455 connection, а `websocket-lanes` выделяет отдельное connection каждому ненулевому stream и изолирует сбои lane. Оба WebSocket carrier используют `GET /api/v1/ws` после создания HTTPS-сессии и требуют от TLS-терминатора сохранять HTTP/1.1 Upgrade headers.
+
+Если `carriers` отсутствует или равен `false`, auto-negotiation и обучение выключены, а `carrier` задаёт единственный режим. Непустой массив `carriers` включает стартовый перебор в заданном порядке; `carrier` ровно один раз добавляется последним fallback-вариантом. Пустой массив, дубликаты и `true` запрещены. Клиент может перейти к следующему кандидату только до commit carrier; для смены carrier после commit нужна новая сессия. Native-клиент без метаданных, включая Telegram iOS, всегда использует настроенный фиксированный `carrier`, даже при включённом auto-negotiation. Текущий iOS поддерживает только `https`, поэтому такой deployment должен задавать `carrier = "https"`. Классификация User-Agent CFNetwork и Darwin не определяет поддержку carrier. Явные capabilities нативного iOS пересекаются с `{https}`; capabilities остальных явных клиентов применяются как переданы.
+
+`carrier_learning` действует только при включённом auto-negotiation. Обучение локально для процесса, хранится в памяти, ограничено и учитывает только положительный результат: evidence добавляет лишь carrier, достигший определённого сервером состояния healthy. `conservative` требует наиболее широкой выборки и отключает ранжирование по IP, `balanced` использует умеренные пороги для User-Agent/профиля и допустимый публичный IP только для разрешения равенства, а `aggressive` реагирует на первые ограниченные samples. Сообщённые клиентом ошибки остаются только диагностикой и не создают отрицательный evidence. Reload применяет новую policy к новым цепочкам negotiation и инвалидирует несовместимый сохранённый evidence. Отключение WEB прекращает выдачу новых bridge- и session-credentials; для отзыва активных сессий отдельного пользователя используйте users API.
 
 # [web.debug]
 
@@ -2523,10 +2530,15 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `max_frames_per_body` | `usize` | `4096` | Максимальное число frames в одном carrier body. |
 | `max_http_connections` | `usize` | `1024` | Принятые WEB HTTP connections на весь процесс. |
 | `max_http_handlers` | `usize` | `512` | Одновременно выполняемые HTTP handlers на весь процесс; HTTPS lanes могут занять long polls не более половины лимита, оставляя остаток для session, uplink и control work. |
+| `max_lane_open_waits_per_session` | `usize` | `16` | Канонические downlink polls с cursor zero, которые могут ожидать конкурирующий lane `OPEN` в одной сессии. |
+| `pending_bytes_per_lane` | `usize` | `8388608` | Байты queued и resident `DATA`, разрешённые одной независимой HTTPS- или WebSocket-lane. |
+| `pending_items_per_lane` | `usize` | `1024` | Элементы queued и resident `DATA`, разрешённые одной независимой HTTPS- или WebSocket-lane. |
 | `websocket_bytes_global` | `usize` | `268435456` | Подбюджет transient WebSocket codec, messages и write staging внутри `pending_bytes_global`. |
-| `websocket_admission_watermark_pct` | `u8` | `75` | Доля WebSocket byte-budget, после которой новый admission может вытеснить owner-first victim. |
-| `websocket_eviction_watermark_pct` | `u8` | `90` | Доля WebSocket byte-budget, после которой queue pressure может вытеснить подходящее connection с наиболее старым прогрессом. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | Watermark WebSocket byte-budget для нового base admission и расчёта fair share при детерминированном replacement. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | Watermark выделения WebSocket data, после которого давление общей queue может запросить детерминированный cleanup. |
 | `websocket_http_connection_reserve` | `usize` | `64` | Число принятых HTTP connections, недоступных WebSocket upgrades и сохраняющих capacity для обычного HTTP и decoy. |
+| `max_websocket_evictions_in_flight` | `usize` | `8` | Process-wide предел одновременных точных WebSocket eviction claims при admission и pressure cleanup. |
+| `max_carrier_learning_entries` | `usize` | `4096` | Process-wide предел записей bounded carrier-learning evidence. |
 | `max_body_readers` | `usize` | `32` | Одновременно собираемые request bodies на весь процесс. |
 | `max_body_bytes_global` | `usize` | `67108864` | Глобальный байтовый резерв для собранных bodies. |
 | `max_sessions_global` | `usize` | `128` | Активные WEB-сессии на весь процесс. |
@@ -2550,7 +2562,7 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 | `max_static_bytes` | `usize` | `67108864` | Размер static snapshots всех vhosts. |
 | `debug_records_capacity` | `usize` | `65536` | Максимальное число сохранённых WEB debug records. |
 | `debug_bytes_global` | `usize` | `67108864` | Глобальная байтовая граница сохранённых и находящихся в обработке WEB debug данных; минимум 4096. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Заявленный envelope для HTTP heads, bodies, общих queues/WebSocket I/O, static snapshots и bounded debug/status buffers; максимум 4 GiB. |
+| `memory_envelope_bytes` | `usize` | `1342177280` | Заявленный envelope для HTTP heads, bodies, общих queues/WebSocket I/O, состояния lanes, carrier learning, static snapshots и bounded debug/status buffers; максимум 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Устойчивая process-wide скорость выдачи bootstrap. |
 | `new_bootstraps_burst` | `u32` | `256` | Process-wide burst выдачи bootstrap. |
 | `new_sessions_per_minute` | `u32` | `600` | Устойчивая process-wide скорость создания сессий. |
@@ -2560,21 +2572,31 @@ WEB-режим переносит MTProxy-трафик Telegram Desktop внут
 
 # [web.timeouts]
 
-Все таймауты задаются в секундах и должны входить в диапазон `1..=3600`. Самый длинный request deadline должен быть меньше `http_idle_secs`.
+Если в строке не указано иное, таймауты задаются в секундах и должны входить в диапазон `1..=3600`. Настроенные серверные deadlines отдельных HTTP-фаз должны быть меньше `http_idle_secs`; защищённые фазы сохраняют собственные deadlines, поэтому idle-таймер не является общим deadline запроса. Client-side окно повторов bridge имеет отдельные границы.
 
 | Ключ | Тип | По умолчанию | Hot-Reload | Описание |
 | --- | --- | --- | --- | --- |
 | `header_secs` | `u64` | `10` | `✔` | Получение полного заголовка HTTP-запроса. |
 | `body_secs` | `u64` | `30` | `✔` | Сбор одного аутентифицированного carrier body. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Выполнение внутреннего MTProxy handshake. |
+| `stream_first_byte_secs` | `u64` | `30` | `✔` | Получение первого внутреннего MTProxy-байта после `OPEN`; диапазон `1..=300`. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Максимальная длительность пустого downlink long poll. |
+| `bridge_request_secs` | `u64` | `10` | `✔` | Deadline одной HTTP attempt в bridge до полного чтения response body; для `/down` дополнительно разрешён `long_poll_secs`. Диапазон `1..=60`. |
+| `bridge_retry_secs` | `u64` | `90` | `✔` | Абсолютное окно повторов bridge, включая attempts и backoff; диапазон `1..=300`, не меньше `bridge_request_secs`. |
+| `carrier_probe_coalesce_ms` | `u64` | `0` | `✔` | Опциональное ожидание bridge после `OPEN` для соответствующего `DATA`; миллисекунды в диапазоне `0..=10`, где `0` сохраняет немедленный probe. |
+| `lane_open_wait_secs` | `u64` | `2` | `✔` | Ожидание канонического downlink с cursor zero, опередившего свой lane `OPEN`; не больше `long_poll_secs`. |
+| `carrier_health_secs` | `u64` | `30` | `✔` | Интервал наблюдения после commit, необходимый для добавления carrier-learning evidence. |
+| `websocket_upgrade_secs` | `u64` | `5` | `✔` | Максимальное ожидание превращения принятого HTTP Upgrade в WebSocket; диапазон `1..=60`. |
+| `websocket_open_secs` | `u64` | `15` | `✔` | Абсолютный deadline первого carrier binary message после Upgrade; диапазон `1..=300`. |
 | `websocket_write_secs` | `u64` | `30` | `✔` | Максимальное ожидание одной WebSocket write или flush операции. |
 | `websocket_backpressure_secs` | `u64` | `30` | `✔` | Максимальное ожидание прогресса общего byte-budget или queue перед закрытием затронутого connection. |
 | `websocket_eviction_secs` | `u64` | `1` | `✔` | Grace period для освобождения slot и budget вытесненным WebSocket до отказа admission. |
+| `carrier_negotiation_deadlines_secs` | `[u64; 4]` | `[3, 5, 8, 12]` | `✔` | Строго возрастающие cumulative offsets: bridge применяет их перед первым запросом `/session`, сервер — при приёме первой automatic attempt. Checkpoints для одного—четырёх кандидатов: `[d3]`, `[d0, d3]`, `[d0, d1, d3]` и `[d0, d1, d2, d3]`; последний кандидат всегда использует `d3`. |
+| `carrier_learning_secs` | `u64` | `600` | `✔` | Фиксированный срок двух process-local окон evidence; диапазон `2..=86400`. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Срок неиспользованного bootstrap и replay-marker закрытого token. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Максимальная неактивность carrier до закрытия сессии. |
-| `http_idle_secs` | `u64` | `75` | `✔` | Idle lifetime WEB HTTP keep-alive connection. |
-| `shutdown_secs` | `u64` | `15` | `✔` | Deadline корректного завершения WEB. |
+| `http_idle_secs` | `u64` | `75` | `✔` | Лимит простоя между HTTP-обменами и при отсутствии прогресса уже выданного response body. Явно ограниченные фазы request body, long poll, decoy и ожидания Upgrade сохраняют собственные deadlines и не обрываются этим таймером. Значение фиксируется при приёме connection. |
+| `shutdown_secs` | `u64` | `15` | `✔` | Один абсолютный бюджет завершения процесса, общий для всех listener acceptors и connections, а также для WEB sessions и auxiliary tasks. Активное значение фиксируется один раз при начале shutdown. |
 | `decoy_header_secs` | `u64` | `30` | `✔` | Deadline подключения и получения response head от HTTP decoy. |
 
 # [[web.vhosts]]
@@ -2611,7 +2633,7 @@ Hostname нормализуется при валидации и должен п
 
 ## Lifecycle WEB и управление через API
 
-- Config watcher и generation reload применяют `web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Существующие сессии сохраняют carrier, лимиты и deadlines своего момента создания; новые bridge sessions используют активное поколение.
+- Config watcher и generation reload применяют `web.enabled`, policy carrier/negotiation, `web.debug`, `web.timeouts`, vhosts, profiles и decoy snapshots без перезапуска процесса. Существующие сессии и начатые negotiation chains сохраняют полученные при создании candidates, лимиты и абсолютные deadlines; новые bridge sessions используют активное поколение.
 - Состав WEB-listeners и их trust policy в `server.listeners`, а также все значения `web.limits` принадлежат процессу и требуют перезапуска.
 - Изменяемого ресурса `/v1/web` нет. `GET /web-status` предоставляет аутентифицированную read-only HTML-диагностику; `GET /v1/config` не возвращает `[web]`, а `PATCH /v1/config` отклоняет ключ `web` с `400 section_not_editable`.
 - Для удалённого применения WEB policy измените соответствующий TOML-файл и вызовите `POST /v1/system/reload`; проверьте `GET /v1/system/reload/{id}` и поле `deferred_process_fields`. Если оно содержит `server.listeners` или `web.limits`, перезапустите Telemt.

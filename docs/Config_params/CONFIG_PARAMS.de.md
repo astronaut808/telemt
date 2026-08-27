@@ -2558,12 +2558,19 @@ Der WEB-Modus transportiert MTProxy-Datenverkehr von Telegram Desktop über HTTP
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `false` | `✔` |
 | `carrier` | `"https"`, `"https-lanes"`, `"websocket"` oder `"websocket-lanes"` | `"https"` | `✔` |
+| `carriers` | `false` oder ein nicht leeres Array eindeutiger Carrier | `false` | `✔` |
+| `carrier_learning` | `bool` | `true` | `✔` |
+| `carrier_negotiation_aggressiveness` | `"conservative"`, `"balanced"` oder `"aggressive"` | `"conservative"` | `✔` |
 | `debug` | Tabelle | deaktiviert, begrenzte Defaults | `✔` |
 | `limits` | Tabelle | begrenzte Defaults | `✘` |
 | `timeouts` | Tabelle | begrenzte Defaults | `✔` |
 | `vhosts` | Tabellen-Array | `[]` | `✔` |
 
-`enabled = true` erfordert mindestens einen durch die Netzwerkrichtlinie zugelassenen WEB-Listener, einen vhost und mindestens ein Profil in jedem vhost. `https` behält den serialisierten HTTPS-Transport bei. Mit `https-lanes` erhalten Stream null und jeder logische Stream eigene Uplink-Sequenzen, Downlink-Cursor, Wiederholungen und Long Polls; dieser Carrier erfordert `max_http_handlers >= 2` und öffentliches HTTP/2 am TLS-Terminator. `websocket` transportiert alle logischen Streams über eine geordnete RFC-6455-Verbindung, während `websocket-lanes` jedem Stream ungleich null eine eigene Verbindung zuweist und Lane-Fehler isoliert. Beide WebSocket-Carrier verwenden nach der HTTPS-Sitzungserstellung `GET /api/v1/ws` und erfordern, dass der TLS-Terminator die HTTP/1.1-Upgrade-Header unverändert weiterleitet. Ein Reload wendet `carrier` nur auf neu ausgegebene Bridge-Sitzungen an. Das Deaktivieren von WEB beendet nach dem Reload die Ausgabe neuer Bridge- und Session-Zugangsdaten; zum Widerrufen aktiver Sitzungen eines einzelnen Benutzers verwenden Sie die Users-API.
+`enabled = true` erfordert mindestens einen durch die Netzwerkrichtlinie zugelassenen WEB-Listener, einen vhost und mindestens ein Profil in jedem vhost. `https` behält den serialisierten HTTPS-Transport bei und erfordert `max_http_handlers >= 2`. Mit `https-lanes` erhalten Stream null und jeder logische Stream eigene Uplink-Sequenzen, Downlink-Cursor, Wiederholungen und Long Polls; dieser Carrier erfordert `max_http_handlers >= 4` und öffentliches HTTP/2 am TLS-Terminator. `websocket` transportiert alle logischen Streams über eine geordnete RFC-6455-Verbindung, während `websocket-lanes` jedem Stream ungleich null eine eigene Verbindung zuweist und Lane-Fehler isoliert. Beide WebSocket-Carrier verwenden nach der HTTPS-Sitzungserstellung `GET /api/v1/ws` und erfordern, dass der TLS-Terminator die HTTP/1.1-Upgrade-Header unverändert weiterleitet.
+
+Fehlt `carriers` oder ist es `false`, sind Auto-Negotiation und Lernen deaktiviert und `carrier` ist der einzige Modus. Ein nicht leeres `carriers`-Array aktiviert die Start-Negotiation in der konfigurierten Reihenfolge; `carrier` wird genau einmal als letzter Fallback angehängt. Leere Arrays, Duplikate und `true` werden abgelehnt. Der Client darf nur vor dem Carrier-Commit zum nächsten Kandidaten wechseln; nach dem Commit erfordert ein Carrier-Wechsel eine neue Sitzung. Ein nativer Client ohne Metadaten, einschließlich Telegram iOS, verwendet immer den konfigurierten festen `carrier`, auch bei aktivierter Negotiation. Das aktuelle iOS unterstützt nur `https`; solche Bereitstellungen müssen daher `carrier = "https"` setzen. Die CFNetwork- und Darwin-User-Agent-Klassifizierung leitet keine Carrier-Unterstützung ab. Explizite native iOS-Capabilities werden mit `{https}` geschnitten; andere explizite Client-Capabilities gelten wie gemeldet.
+
+`carrier_learning` wirkt nur bei aktivierter Negotiation. Das Lernen ist prozesslokal, speicherresident, begrenzt und ausschließlich positiv: Nur ein Carrier, der den serverdefinierten Zustand healthy erreicht, liefert Evidenz. `conservative` erfordert die breiteste Evidenz und deaktiviert IP-Ranking, `balanced` verwendet mittlere User-Agent-/Profil-Schwellen sowie geeignete öffentliche IPs nur als Tie-Breaker, und `aggressive` reagiert auf die ersten begrenzten Samples. Vom Client gemeldete Fehler bleiben rein diagnostisch und erzeugen keine negative Evidenz. Ein Reload wendet die Richtlinie auf neue Negotiation-Ketten an und verwirft inkompatible gespeicherte Evidenz. Das Deaktivieren von WEB beendet die Ausgabe neuer Bridge- und Session-Zugangsdaten; zum Widerrufen aktiver Sitzungen eines einzelnen Benutzers verwenden Sie die Users-API.
 
 # [web.debug]
 
@@ -2597,10 +2604,15 @@ Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Req
 | `max_frames_per_body` | `usize` | `4096` | Maximale Zahl geparster oder ausgegebener Frames pro Carrier-Body. |
 | `max_http_connections` | `usize` | `1024` | Prozessweit akzeptierte WEB-HTTP-Verbindungen. |
 | `max_http_handlers` | `usize` | `512` | Prozessweit gleichzeitig ausgeführte HTTP-Handler; HTTPS-Lanes dürfen höchstens die Hälfte mit Long Polls belegen, der Rest bleibt für Session-, Uplink- und Steuerarbeit verfügbar. |
+| `max_lane_open_waits_per_session` | `usize` | `16` | Kanonische Cursor-null-Downlink-Polls, die pro Sitzung auf ein konkurrierendes Lane-`OPEN` warten dürfen. |
+| `pending_bytes_per_lane` | `usize` | `8388608` | Eingereihte und residente `DATA`-Bytes pro unabhängiger HTTPS- oder WebSocket-Lane. |
+| `pending_items_per_lane` | `usize` | `1024` | Eingereihte und residente `DATA`-Elemente pro unabhängiger HTTPS- oder WebSocket-Lane. |
 | `websocket_bytes_global` | `usize` | `268435456` | Transientes Teilbudget für WebSocket-Codecs, Messages und Write-Staging innerhalb von `pending_bytes_global`. |
-| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket-Byte-Anteil, ab dem neue Admission eine Owner-First-Verbindung ersetzen darf. |
-| `websocket_eviction_watermark_pct` | `u8` | `90` | WebSocket-Byte-Anteil, ab dem Queue-Druck die zulässige Verbindung mit dem ältesten Fortschritt verdrängen darf. |
+| `websocket_admission_watermark_pct` | `u8` | `75` | WebSocket-Byte-Watermark für neue Basis-Admission und die Fair-Share-Berechnung des deterministischen Ersatzes. |
+| `websocket_eviction_watermark_pct` | `u8` | `90` | Watermark für WebSocket-Datenallokationen, ab dem gemeinsamer Queue-Druck ein deterministisches Cleanup anfordern darf. |
 | `websocket_http_connection_reserve` | `usize` | `64` | Für WebSocket-Upgrades gesperrte HTTP-Verbindungen, die Kapazität für gewöhnliches HTTP und Decoys erhalten. |
+| `max_websocket_evictions_in_flight` | `usize` | `8` | Prozessweite Obergrenze gleichzeitiger exakter WebSocket-Verdrängungs-Claims bei Admission und Druck-Cleanup. |
+| `max_carrier_learning_entries` | `usize` | `4096` | Prozessweite Obergrenze begrenzter Carrier-Learning-Evidenzeinträge. |
 | `max_body_readers` | `usize` | `32` | Prozessweit gleichzeitig gesammelte Request-Bodys. |
 | `max_body_bytes_global` | `usize` | `67108864` | Globales Byte-Budget für gesammelte Bodys. |
 | `max_sessions_global` | `usize` | `128` | Prozessweit aktive WEB-Sitzungen. |
@@ -2624,7 +2636,7 @@ Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Req
 | `max_static_bytes` | `usize` | `67108864` | Bytes statischer Snapshots über alle vhosts. |
 | `debug_records_capacity` | `usize` | `65536` | Maximale Zahl gespeicherter WEB-Debugdatensätze. |
 | `debug_bytes_global` | `usize` | `67108864` | Globale Byte-Obergrenze für gespeicherte und in Verarbeitung befindliche WEB-Debugdaten; mindestens 4096. |
-| `memory_envelope_bytes` | `usize` | `805306368` | Deklarierter Rahmen für HTTP-Heads, Bodys, gemeinsame Queues/WebSocket-I/O, statische Snapshots und begrenzte Debug-/Statuspuffer; maximal 4 GiB. |
+| `memory_envelope_bytes` | `usize` | `1342177280` | Deklarierter Rahmen für HTTP-Heads, Bodys, gemeinsame Queues/WebSocket-I/O, Lane-Zustand, Carrier-Learning, statische Snapshots und begrenzte Debug-/Statuspuffer; maximal 4 GiB. |
 | `new_bootstraps_per_minute` | `u32` | `1200` | Nachhaltige prozessweite Ausgaberate für Bootstraps. |
 | `new_bootstraps_burst` | `u32` | `256` | Prozessweiter Burst für die Bootstrap-Ausgabe. |
 | `new_sessions_per_minute` | `u32` | `600` | Nachhaltige prozessweite Erstellungsrate für Sitzungen. |
@@ -2634,21 +2646,31 @@ Diese prozessweiten Obergrenzen begrenzen alle WEB-Register, Warteschlangen, Req
 
 # [web.timeouts]
 
-Alle Timeouts werden in Sekunden angegeben und müssen im Bereich `1..=3600` liegen. Die längste Request-Deadline muss kleiner als `http_idle_secs` sein.
+Sofern eine Zeile nichts anderes angibt, werden Timeouts in Sekunden angegeben und müssen im Bereich `1..=3600` liegen. Konfigurierte serverseitige Deadlines einzelner HTTP-Phasen müssen kleiner als `http_idle_secs` sein; geschützte Phasen behalten ihre eigenen Deadlines, sodass der Idle-Timer keine Gesamtdeadline für einen Request ist. Das clientseitige Bridge-Retry-Fenster hat eigene Grenzen.
 
 | Schlüssel | Typ | Default | Hot-Reload | Beschreibung |
 | --- | --- | --- | --- | --- |
 | `header_secs` | `u64` | `10` | `✔` | Empfang eines vollständigen HTTP-Request-Heads. |
 | `body_secs` | `u64` | `30` | `✔` | Sammeln eines authentifizierten Carrier-Bodys. |
 | `stream_handshake_secs` | `u64` | `10` | `✔` | Abschluss eines inneren MTProxy-Handshakes. |
+| `stream_first_byte_secs` | `u64` | `30` | `✔` | Empfang des ersten inneren MTProxy-Bytes nach `OPEN`; validiert im Bereich `1..=300`. |
 | `long_poll_secs` | `u64` | `25` | `✔` | Maximale Dauer eines leeren Downlink-Long-Polls. |
+| `bridge_request_secs` | `u64` | `10` | `✔` | Bridge-seitige Deadline eines HTTP-Versuchs bis zum vollständigen Lesen des Response-Bodys; `/down` erhält zusätzlich `long_poll_secs`. Bereich `1..=60`. |
+| `bridge_retry_secs` | `u64` | `90` | `✔` | Absolutes Bridge-Retry-Fenster einschließlich Versuchen und Backoff; Bereich `1..=300` und nicht kleiner als `bridge_request_secs`. |
+| `carrier_probe_coalesce_ms` | `u64` | `0` | `✔` | Optionales Bridge-Warten nach `OPEN` auf passendes `DATA`; Millisekunden im Bereich `0..=10`, wobei `0` sofortiges Probing beibehält. |
+| `lane_open_wait_secs` | `u64` | `2` | `✔` | Wartezeit für einen kanonischen Cursor-null-Downlink, der sein Lane-`OPEN` überholt; höchstens `long_poll_secs`. |
+| `carrier_health_secs` | `u64` | `30` | `✔` | Beobachtungsintervall nach dem Commit, bevor ein Carrier Learning-Evidenz liefern kann. |
+| `websocket_upgrade_secs` | `u64` | `5` | `✔` | Maximale Wartezeit, bis ein akzeptiertes HTTP-Upgrade zum WebSocket wird; Bereich `1..=60`. |
+| `websocket_open_secs` | `u64` | `15` | `✔` | Absolute Deadline für die erste Carrier-Binärnachricht nach dem Upgrade; Bereich `1..=300`. |
 | `websocket_write_secs` | `u64` | `30` | `✔` | Maximale Wartezeit für einen WebSocket-Write oder Flush. |
 | `websocket_backpressure_secs` | `u64` | `30` | `✔` | Maximale Wartezeit auf Fortschritt des gemeinsamen Byte-Budgets oder einer Queue, bevor die betroffene Verbindung geschlossen wird. |
 | `websocket_eviction_secs` | `u64` | `1` | `✔` | Karenzzeit, in der ein verdrängter WebSocket Slot und Budget freigeben muss, bevor Admission fehlschlägt. |
+| `carrier_negotiation_deadlines_secs` | `[u64; 4]` | `[3, 5, 8, 12]` | `✔` | Streng steigende kumulative Offsets: Die Bridge verwendet sie vor ihrem ersten `/session`-Request, der Server bei Annahme des ersten automatischen Versuchs. Die Checkpoints für ein bis vier Kandidaten sind `[d3]`, `[d0, d3]`, `[d0, d1, d3]` und `[d0, d1, d2, d3]`; der letzte Kandidat verwendet immer `d3`. |
+| `carrier_learning_secs` | `u64` | `600` | `✔` | Feste Lebensdauer zweier prozesslokaler Evidenzfenster; Bereich `2..=86400`. |
 | `bootstrap_lifetime_secs` | `u64` | `120` | `✔` | Lebensdauer ungenutzter Bootstraps und geschlossener Token-Replay-Marker. |
 | `reconnect_grace_secs` | `u64` | `120` | `✔` | Maximale Carrier-Inaktivität bis zum Schließen der Sitzung. |
-| `http_idle_secs` | `u64` | `75` | `✔` | Idle-Lebensdauer einer WEB-HTTP-Keep-Alive-Verbindung. |
-| `shutdown_secs` | `u64` | `15` | `✔` | Deadline für das kontrollierte Beenden von WEB. |
+| `http_idle_secs` | `u64` | `75` | `✔` | Idle-Grenze zwischen HTTP-Austauschvorgängen und bei ausbleibendem Fortschritt eines bereits ausgegebenen Response-Bodys. Explizit begrenzte Request-Body-, Long-Poll-, Decoy- und ausstehende Upgrade-Phasen behalten ihre eigenen Deadlines und werden nicht durch diesen Timer verkürzt. Der Wert wird beim Annehmen der Verbindung fixiert. |
+| `shutdown_secs` | `u64` | `15` | `✔` | Ein absolutes Budget für das Beenden des Prozesses, das von allen Listener-Acceptoren und Verbindungen sowie WEB-Sitzungs- und Hilfstask-Drains gemeinsam verwendet wird. Der aktive Wert wird beim Start des Shutdowns einmalig erfasst. |
 | `decoy_header_secs` | `u64` | `30` | `✔` | Deadline für Verbindung und Response-Head eines HTTP-Decoys. |
 
 # [[web.vhosts]]
@@ -2685,7 +2707,7 @@ Profilgrenzen müssen ungleich null sein und dürfen die zugehörigen globalen G
 
 ## WEB-Lebenszyklus und API-Verwaltung
 
-- Config-Watcher und Generations-Reload wenden `web.enabled`, `web.carrier`, `web.debug`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Bestehende Sitzungen behalten Carrier, Grenzen und Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden die aktive Generation.
+- Config-Watcher und Generations-Reload wenden `web.enabled`, Carrier- und Negotiation-Richtlinie, `web.debug`, `web.timeouts`, vhosts, Profile und Decoy-Snapshots ohne Prozessneustart an. Bestehende Sitzungen und laufende Negotiation-Ketten behalten Kandidaten, Grenzen und absolute Deadlines ihres Erstellungszeitpunkts; neu ausgegebene Bridge-Sitzungen verwenden die aktive Generation.
 - Bestand und Vertrauensrichtlinie der WEB-Listener unter `server.listeners` sowie alle Werte in `web.limits` sind prozesseigen und erfordern einen Neustart.
 - Es gibt keine veränderbare Ressource `/v1/web`. `GET /web-status` stellt authentifizierte, schreibgeschützte HTML-Diagnosen bereit; `GET /v1/config` lässt `[web]` aus und `PATCH /v1/config` lehnt einen Schlüssel `web` mit `400 section_not_editable` ab.
 - Zum entfernten Anwenden einer WEB-Richtlinie ändern Sie die zuständige TOML-Datei und rufen `POST /v1/system/reload` auf. Prüfen Sie anschließend `GET /v1/system/reload/{id}` und dessen `deferred_process_fields`. Starten Sie Telemt neu, wenn das Feld `server.listeners` oder `web.limits` enthält.

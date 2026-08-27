@@ -28,7 +28,9 @@ WEB-listener Telemt
 
 - Публичный endpoint всегда имеет вид `https://HOST:443`.
 - Поддерживаются 16-байтовые MTProxy-секреты `plain` и `dd`. FakeTLS-секреты `ee` в WEB-режиме не поддерживаются.
-- `web.carrier = "https"` выбирает сериализованные HTTPS uplink и long polling. `https-lanes` выбирает независимые HTTPS sequencing и polling для каждого logical stream. `websocket` выбирает один упорядоченный WebSocket для всех streams. `websocket-lanes` выбирает отдельный WebSocket с независимым ownership для каждого ненулевого logical stream.
+- `web.carrier` выбирает единственный carrier при выключенном auto-negotiation и последний fallback при включённом. `https` использует сериализованные HTTPS uplink и long polling. `https-lanes` использует независимые HTTPS sequencing и polling для каждого logical stream. `websocket` использует один упорядоченный WebSocket для всех streams. `websocket-lanes` использует отдельный WebSocket с независимым ownership для каждого ненулевого logical stream.
+- Отсутствующий `web.carriers` или `web.carriers = false` отключает auto-negotiation и обучение. Непустой массив включает только стартовый последовательный перебор; уже committed session никогда не мигрирует.
+- Нативные клиенты без канонических headers carrier negotiation используют настроенный фиксированный `carrier`, даже когда `carriers` включает negotiation для поддерживающих его клиентов. Текущий Telegram iOS поддерживает только `https`, поэтому для metadata-free iOS оператор должен задать `web.carrier = "https"`; `https-lanes` этим клиентом не поддерживается. User-Agent, включая CFNetwork или Darwin, никогда не выводит capabilities неявно. Если нативный iOS всё же отправляет явные negotiation metadata, Telemt пересекает их с server-authoritative ceiling `{https}` и отклоняет пустой результат; остальные явные клиенты используют заявленный capability set.
 - Capability, bootstrap и session credentials — отдельные значения с ограниченным сроком жизни. Carrier credentials считаются секретами и не должны попадать в access logs.
 - Bootstrap является bearer credential, а не token с привязкой к source address. Адрес клиента и его IP-семейство могут измениться между загрузкой bridge и созданием session. Адрес выдачи продолжает учитываться в лимите неиспользованных bootstrap, а владельцем session становится адрес первого корректного запроса создания.
 - Внутренняя MTProxy-аутентификация ограничена пользователем и режимом секрета, выбранными профилем vhost. Некорректный внутренний handshake закрывает только свой logical stream и никогда не попадает в TCP masking path.
@@ -91,17 +93,52 @@ max_streams = 512
 max_streams_per_session = 64
 ```
 
+## Server-side negotiation carrier
+
+Auto-negotiation необязателен и выключен, пока `carriers` не задан явным непустым массивом. Настроенный `carrier` остаётся последним fallback и добавляется ровно один раз, даже если уже присутствует в массиве:
+
+```toml
+[web]
+enabled = true
+carrier = "https"
+carriers = ["websocket-lanes", "websocket", "https-lanes"]
+carrier_learning = true
+carrier_negotiation_aggressiveness = "conservative"
+
+[web.timeouts]
+carrier_negotiation_deadlines_secs = [3, 5, 8, 12]
+carrier_health_secs = 30
+carrier_learning_secs = 600
+bridge_request_secs = 10
+bridge_retry_secs = 90
+carrier_probe_coalesce_ms = 0
+```
+
+Сгенерированный bridge отправляет канонические headers `X-Carrier-Capabilities`, `X-Carrier-Attempt` и, после первой попытки, `X-Carrier-Failure` в запросе `/session`. Каждый успешный automatic response возвращает `X-Carrier-Mode`, `X-Carrier-Attempt`, `X-Carrier-Candidate-Count`, `X-Carrier-Deadline` и `X-Carrier-State`. Bridge запускает локальный cumulative clock непосредственно перед первым запросом `/session`, а сервер фиксирует отдельный absolute chain deadline при приёме первой automatic attempt. Оба используют настроенные offsets и не сбрасываются при replacement. Для одного, двух, трёх и четырёх effective candidates checkpoints attempts равны соответственно `[d3]`, `[d0, d3]`, `[d0, d1, d3]` и `[d0, d1, d2, d3]`; финальному candidate всегда принадлежит `d3`. Successor остаётся допустимым до собственного checkpoint. Состояния: `provisional`, `committed` и `healthy`.
+
+Попытки строго последовательны. Принятый прогресс `OPEN` или `DATA` немедленно фиксирует выбранный carrier и окончательно закрывает границу replacement. Аутентифицированный `409` для committed chain повторяет metadata зафиксированного carrier и является terminal response, а не разрешением перейти дальше. Точный replay `/session` применяется только пока результат этого запроса неоднозначен. После аутентифицированного выбора provisional carrier transport failure сразу запрашивает следующую attempt; если предыдущий probe всё же успел committed, сервер возвращает terminal `409` и не разрешает небезопасный replacement. Финальный абсолютный deadline на сервере также ограничивает lifetime successor, ответ которого клиент не получил. Динамическое post-commit переключение намеренно не поддерживается: для смены carrier требуется новая сессия.
+
+Каждая HTTP-операция bridge имеет абсолютный budget `bridge_retry_secs` и не более девяти attempts. `bridge_request_secs` охватывает Fetch response head и полное чтение response body; для downlink attempt дополнительно разрешён настроенный long-poll interval. Network failures и ответы `408`, `429`, `502`, `503` или `504` используют bounded exponential backoff, а `Retry-After` не может расширить абсолютный budget. При `carrier_probe_coalesce_ms = 0` первый упорядоченный probe с `OPEN` отправляется немедленно. Значение до 10 мс позволяет включить соответствующий `DATA`, пришедший в этом окне; multiplexed carriers сохраняют весь предшествующий порядок frames, а lane carriers забирают только выбранную lane. HTTP downlink не запускается до acknowledgement probe. Multiplexed WebSocket Upgrade может начаться сразу после его выбора ответом `/session` и затем включить queued probe data; lane WebSocket ждёт известного stream ID.
+
+Automatic WebSocket использует `tproxy-auto-v1.<session-token>` или `tproxy-auto-lane-v1.<session-token>.<stream-id>`. Первое принятое binary message с реальным прогрессом `OPEN` или `DATA` фиксирует carrier; затем сервер пишет пустой binary commit ACK именно в это connection. Ping/Pong не фиксирует carrier и не считается learning evidence.
+
+Committed attempt становится healthy, только когда transport-specific двунаправленный evidence остаётся корректным в течение `carrier_health_secs`. HTTPS требует принятый `DATA`, подтверждённый непустой post-commit downlink batch и аутентифицированную активность не раньше health deadline. WebSocket требует записи точного commit ACK, последующего принятого `OPEN` или `DATA` от того же owner и сохранения этого owner живым до конца интервала. Более раннее закрытие нейтрально и не записывает результат обучения.
+
+Обучение process-local, in-memory, positive-only и ограничено `max_carrier_learning_entries`. Оно ранжирует только поддерживаемые клиентом настроенные candidates, всегда оставляет fallback последним и сохраняет настроенный порядок при равных scores. Evidence User-Agent и профиля имеет основной вес; допустимый IP служит только tie-breaker. Для IP evidence требуется ровно один явный глобально маршрутизируемый `X-Forwarded-For`; private, loopback, link-local, carrier-grade NAT, documentation, multicast и их IPv4-mapped эквиваленты исключаются. Категории ошибок от клиента и request latency используются только для диагностики и не создают отрицательный или ranking evidence. `conservative` требует 3 outcomes User-Agent или 8 outcomes профиля в 4 cohorts и отключает IP evidence; `balanced` использует соответственно 2, 6 в 3 cohorts и 3 outcomes допустимого IP; `aggressive` — 1, 4 в 2 cohorts и 1 outcome IP. Выключение обучения или смена policy при reload очищает несовместимый evidence, не меняя уже начатые сессии.
+
 `https` остаётся default и сохраняет исходное сериализованное поведение. В `https-lanes` lane zero отведена под session control, а каждому ненулевому logical stream соответствует своя lane. У каждой lane собственные uplink sequence, retry digest, downlink cursor, unacknowledged replay batch, очередь и lifecycle newest-poll-wins. Поэтому медленный stream не блокирует другой stream на уровне WEB-протокола.
 
 Это устраняет сериализацию между WEB-streams на уровне приложения. Публичный HTTP/2 всё ещё работает поверх одного или нескольких TCP-connections, поэтому потеря пакетов может вызвать transport-level head-of-line blocking; `https-lanes` не является HTTP/3- или QUIC-carrier.
 
-Все lane queues входят в существующие per-session и process-wide byte/item budgets. Bridge дополнительно ограничивает одну lane 8 MiB и 1024 элементами. Lane long polls могут занимать не более половины `web.limits.max_http_handlers`, оставляя handler capacity для session creation, uplink, DELETE и другой control work. Для `https-lanes` требуется `max_http_handlers >= 2`.
+Все lane queues и resident response bodies входят в существующие per-session и process-wide byte/item budgets. Telemt дополнительно ограничивает одну lane значениями `pending_bytes_per_lane` и `pending_items_per_lane`; сгенерированный bridge ограничивает свои очереди 8 MiB и 1024 элементами. Lane long polls могут занимать не более половины `web.limits.max_http_handlers`, оставляя handler capacity для session creation, uplink, DELETE и другой control work. Для `https` требуется `max_http_handlers >= 2`, для `https-lanes` — `max_http_handlers >= 4`.
 
-Paths `/api/v1/up` и `/api/v1/down` не меняются. В `https-lanes` каждый запрос к ним содержит один канонический десятичный `X-Lane-ID`. Uplink sequence начинается с `1`, а downlink cursor — с `0` независимо для каждой lane. Lane zero принимает только session `PONG`; все frames ненулевой lane должны иметь тот же stream ID, а новая lane должна начинаться с `OPEN`. После отправки всей queued и unacknowledged downlink data закрытой lane Telemt возвращает пустой ответ с `X-Lane-Closed: 1`, и bridge прекращает её polling. Retry остаются byte-identical и повторяют исходный acknowledgement или downlink batch.
+Paths `/api/v1/up` и `/api/v1/down` не меняются. В `https-lanes` каждый запрос к ним содержит один канонический десятичный `X-Lane-ID`. Uplink sequence начинается с `1`, а downlink cursor — с `0` независимо для каждой lane. Lane zero принимает только session `PONG`; все frames ненулевой lane должны иметь тот же stream ID, а новая lane должна начинаться с `OPEN`. Канонический downlink с cursor zero, пришедший немного раньше `OPEN` своей lane, ждёт до `lane_open_wait_secs` без создания lane state; число таких ожиданий ограничено per-session и process auxiliary permits. Истечение таймаута возвращает пустой `204`, а отсутствующая lane с продвинутым cursor остаётся protocol failure и уходит в decoy. После отправки всей queued и unacknowledged downlink data закрытой lane Telemt возвращает пустой ответ с `X-Lane-Closed: 1`, и bridge прекращает её polling. Retry остаются byte-identical и повторяют исходный acknowledgement или downlink batch.
 
 Оба WebSocket carrier по-прежнему создают и удаляют parent session через HTTPS, после чего используют строгий bodyless Upgrade-запрос `GET /api/v1/ws`. `websocket` передаёт в `Sec-WebSocket-Protocol` ровно `tproxy-v1.<session-token>`; binary messages являются упорядоченными carrier batches, а ошибка протокола, deadline или connection закрывает всю parent session. `websocket-lanes` передаёт ровно `tproxy-lane-v1.<session-token>.<stream-id>`, где stream ID записан каноническим десятичным числом из диапазона `1..=16777215`. Первое binary message должно начинаться с `OPEN`, все frames должны содержать этот stream ID, а сбой после Upgrade закрывает только данную lane. Lane-zero WebSocket отсутствует: HTTPS переносит `HELLO` и `WELCOME`, а liveness connection обеспечивает RFC 6455 Ping/Pong.
 
-WebSocket codec buffers и находящиеся в обработке read/write messages делят process-owned `pending_bytes_global` с carrier queues и дополнительно ограничены `websocket_bytes_global`. Admission оставляет `websocket_http_connection_reserve` принятых connections для обычного HTTP и decoy. При pressure вытеснение сначала выбирает того же owner, затем connection с наиболее старым прогрессом; pre-Upgrade и dead connections идут раньше активных lanes и multiplexed sessions. После `long_poll_secs` без peer activity отправляется transport Ping, в том числе при непрерывном downlink traffic, а отсутствие peer activity в течение удвоенного creation-time интервала делает connection кандидатом на cleanup.
+До HTTP `101` reservation WebSocket lane привязывается к точным process connection и incarnation lane; принятый `OPEN` передаёт ownership точному incarnation stream до запуска его backend task. Поздний poll, close или drop reservation от старого socket не может подтвердить, закрыть или освободить replacement, повторно использующий тот же числовой lane ID.
+
+WebSocket codec buffers и находящиеся в обработке read/write messages делят process-owned `pending_bytes_global` с carrier queues и дополнительно ограничены `websocket_bytes_global`. Admission оставляет `websocket_http_connection_reserve` принятых connections для обычного HTTP и decoy. При admission replacement сначала глобально выбираются dead active connections, затем применяются уровни locality: та же session, тот же profile owner и тот же client IP. Не связанный с ними healthy victim допустим только когда requester использует меньше своей fair byte share, а owner victim — больше. Внутри одного уровня locality claimed или upgraded connections идут перед active lanes, lanes — перед active multiplexed sessions; дальнейший порядок детерминируют время последнего прогресса, создания и connection ID. Cleanup при memory pressure использует тот же dead-first и lifecycle-порядок, предпочитая owners выше fair share, но продолжает eviction, если все owners находятся на своей share или ниже. `max_websocket_evictions_in_flight` ограничивает одновременные точные eviction claims. Deadlines Upgrade, первого message, write, backpressure и eviction заморожены из parent session. После `long_poll_secs` без peer activity отправляется transport Ping, в том числе при непрерывном downlink traffic, а отсутствие peer activity в течение удвоенного creation-time интервала делает active connection кандидатом на cleanup.
 
 Любая ошибка authentication, shape, lane reservation или capacity до Upgrade следует по очищенному decoy path и не раскрывает WebSocket-специфичный status. Точный subprotocol содержит session bearer и не должен попадать в logs.
 
@@ -198,11 +235,15 @@ backend telemt_web
 | --- | --- |
 | Состав WEB-listeners, bind address и trust policy | Принадлежат процессу; перезапустите Telemt. |
 | Любое значение `[web.limits]` | Process-owned контракт памяти и ресурсов; перезапустите Telemt. |
-| `web.enabled`, `web.carrier`, `web.debug`, timeouts, vhosts, profiles и decoys | Применяются config watcher или runtime generation reload. |
-| Существующие HTTP connections и WEB sessions | Сохраняют carrier, лимиты и session deadlines своего момента создания; новые bridge sessions получают активный carrier. WebSocket write, backpressure и eviction operations читают активные hot-reloaded deadlines. Новые logical streams используют активное relay generation. |
-| Завершение процесса | Использует последнее применённое значение `web.timeouts.shutdown_secs`. |
+| `web.enabled`, policy carrier/negotiation, `web.debug`, timeouts, vhosts, profiles и decoys | Применяются config watcher или runtime generation reload. |
+| Существующие HTTP connections и WEB sessions | Сохраняют HTTP idle limit, carrier candidates, лимиты, body timeout, lifetime replay-marker закрытого token и абсолютные session/negotiation deadlines своего момента создания; каждый выданный bridge содержит собственные request, retry и probe-coalescing значения. WebSocket Upgrade, open, write, backpressure и eviction operations используют замороженные deadlines parent session. Новые bridges получают активную policy, а новые logical streams используют активное relay generation. |
+| Завершение процесса | Один раз фиксирует последнее применённое значение `web.timeouts.shutdown_secs` и использует единый абсолютный deadline для listener acceptors и connections, WEB sessions и auxiliary tasks. Последовательные компоненты не получают отдельные полные бюджеты. |
 
 Каждый logical stream сохраняет client IP своей сессии и владеет уникальным в пределах процесса ненулевым synthetic source port до завершения relay. Это сохраняет один стабильный непересекающийся source/destination tuple для Direct и Middle-End KDF routing.
+
+HTTP idle accounting защищает только явно ограниченные фазы request body, long poll, подключения/response head decoy и ожидания Upgrade до их точных deadlines. Между обменами и после готовности response head прогресс сбрасывает idle-таймер, а зависший response body остаётся ограничен idle timeout. Завершение старой фазы не может снять deadline-защиту, которой уже владеет новая фаза.
+
+`OPEN` резервирует bounded ownership logical stream и tuple, но не занимает permit `max_connections` relay generation. Telemt получает этот permit только после первого внутреннего байта; замороженный first-byte deadline и stream limits ограничивают silent opens, а исчерпание capacity закрывает только затронутый stream.
 
 ## Управление через API
 
@@ -248,7 +289,7 @@ default_window_secs = 180
 max_window_secs = 3600
 ```
 
-Откройте `http://127.0.0.1:9091/web-status`, используя те же whitelist непосредственных peers и точный header `Authorization`, что и для API. Завершающий slash разрешён. Допускается только `GET`. Страница поддерживает фильтры `window_secs`, канонический `ip`, числовой `session`, регистронезависимый `user_agent` и `key`. Повторяйте `group_by=ip`, `group_by=session`, `group_by=user_agent` или `group_by=key` для построения сгруппированных сводок; `limit` ограничен диапазоном `1..=1000`. HTTP rows раскрываются от request до response с method, path, очищенными headers, метаданными или байтами body, timing points, frames и типизированными lifecycle events. Для WebSocket добавляются очищенный handshake `GET` → `101` и bounded per-message direction, message type, payload/body capture, processing time, connection/lane identifiers и разобранные inner frames. Raw subprotocol и session tokens никогда не сохраняются.
+Откройте `http://127.0.0.1:9091/web-status`, используя те же whitelist непосредственных peers и точный header `Authorization`, что и для API. Завершающий slash разрешён. Допускается только `GET`. Страница поддерживает фильтры `window_secs`, канонический `ip`, числовой `session`, регистронезависимый `user_agent` и `key`. Повторяйте `group_by=ip`, `group_by=session`, `group_by=user_agent` или `group_by=key` для построения сгруппированных сводок; `limit` ограничен диапазоном `1..=1000`. HTTP rows раскрываются от request до response с method, path, очищенными headers, метаданными или байтами body, timing points, frames и типизированными lifecycle events, включая carrier attempt, commit, healthy и reported-failure transitions. Для WebSocket добавляются очищенный handshake `GET` → `101` и bounded per-message direction, message type, payload/body capture, processing time, connection/lane identifiers и разобранные inner frames. Raw subprotocol и session tokens никогда не сохраняются.
 
 Process-owned кольцевой буфер переживает замену runtime generation. Изменения capture policy очищают несовместимые сохранённые записи; изменения только окна наблюдения этого не делают. По умолчанию кольцо ограничено 65536 записями и 64 MiB сохранённых плюс находящихся в обработке данных, HTML-response — 8 MiB, grouping — 1024 группами; одновременно page permits могут удерживать не более двух response bodies. Изменяйте `web.limits.debug_records_capacity` или `web.limits.debug_bytes_global` только с перезапуском процесса. Hot prefix, который помещается только в одновременно увеличенную restart-only ёмкость, откладывается до этого перезапуска.
 
@@ -267,7 +308,7 @@ curl -sS http://127.0.0.1:9091/v1/system/reload/RELOAD_ID \
   -H "Authorization: ${TELEMT_API_AUTH}"
 ```
 
-Терминальный статус `succeeded` подтверждает активацию runtime. Изменённый `web.carrier` используют новые bridge sessions; существующие сессии не мигрируют. Если `deferred_process_fields` содержит `server.listeners` или `web.limits`, файл валиден и сохранён, но эти настройки всё ещё требуют перезапуска Telemt.
+Терминальный статус `succeeded` подтверждает активацию runtime. Изменённые carrier, candidates, deadlines или learning policy используют новые bridge sessions; существующие сессии и начатые attempt chains не мигрируют. Если `deferred_process_fields` содержит `server.listeners` или `web.limits`, файл валиден и сохранён, но эти настройки всё ещё требуют перезапуска Telemt.
 
 Операции с access users используют существующие endpoints, например:
 
@@ -291,7 +332,7 @@ curl -sS -X POST http://127.0.0.1:9091/v1/users/web-user/rotate-secret \
 - Отключите логирование request target и authorization на TLS-терминаторе либо используйте проверенный формат с редактированием. Raw queries содержат bridge capabilities, а `Authorization` — bootstrap или session bearer credentials.
 - Сохраняйте один стабильный публичный адрес на vhost. Если DNS возвращает несколько ingress addresses, каждый deployment должен использовать адрес своего внешнего пути.
 - Bootstrap- и session-registries локальны для процесса. Для multi-process или multi-host upstream pool нужна affinity всего vhost: bridge GET, создание сессии, uplink, downlink и DELETE. Одному процессу Telemt дополнительная affinity не нужна.
-- Неиспользованный bootstrap переживает reload конфигурации, только если остаётся активной точная identity профиля: host, `public_addr`, user, secret mode, carrier и capability. Уже созданные sessions сохраняют неизменные carrier и identity профиля и остаются lifecycle-bounded.
+- Неиспользованный bootstrap переживает reload конфигурации, только если остаётся активной точная identity профиля: host, `public_addr`, user, secret mode, carrier candidates, negotiation deadlines и capability. Уже созданные sessions сохраняют неизменные carrier и identity профиля и остаются lifecycle-bounded.
 - Decoy входит в anti-probing contract. До распространения ссылок проверьте через публичный TLS endpoint его обычный ответ 404 и response timing.
 
 ## Первичная проверка
@@ -304,6 +345,7 @@ curl -sS -X POST http://127.0.0.1:9091/v1/users/web-user/rotate-secret \
 6. Для `websocket` подтвердите один response `101`, binary relay traffic и RFC 6455 Ping/Pong после 25 секунд. Для `websocket-lanes` проверьте как минимум два одновременных stream sockets и убедитесь, что закрытие или повреждение одной lane не закрывает sibling или parent session.
 7. Проверьте reconnect и как минимум один long poll длительнее 25 секунд, чтобы frontend timeouts не обрывали carrier.
 8. Проверяйте лимиты пользователя и logical MTProxy connections по logical-stream counters, а не по числу HTTP connections.
+9. При включённом auto-negotiation проверьте настроенную последовательность, replay точно той же попытки после намеренно потерянного response, terminal-поведение после commit и lifecycle rows `carrier_committed`/`carrier_healthy` в `/web-status`. Убедитесь, что нативный клиент без metadata использует фиксированный `carrier` без automatic response headers, а явные capabilities остаются неизменными.
 
 ## Диагностика
 
@@ -311,6 +353,8 @@ curl -sS -X POST http://127.0.0.1:9091/v1/users/web-user/rotate-secret \
 | --- | --- |
 | WEB-конфигурация валидна на диске, но поведение listener’а не изменилось | Проверьте `deferred_process_fields`; listener и `[web.limits]` требуют перезапуска. |
 | Carrier-запросы попадают в decoy | Проверьте точный vhost, secret mode ссылки, CIDR непосредственного proxy и единственное корректно разбираемое значение `X-Forwarded-For`. |
+| Downlink `https-lanes`, участвующий в гонке, попадает в decoy с `404` | Убедитесь, что он начинается с `X-Down-Cursor: 0`, сохраняйте `X-Lane-ID` и задайте `lane_open_wait_secs` выше наблюдаемого разрыва down-before-`OPEN`. Продвинутый cursor отсутствующей lane намеренно закрывается fail-closed. |
+| Auto-negotiation переходит дальше после уже принятого трафика | Такое поведение некорректно. Проверьте аутентифицированный replay `X-Carrier-State` и lifecycle row commit carrier; ответ `committed` или `healthy` terminal и требует новой сессии. |
 | Long polls разрываются через фиксированный интервал | Поднимите client, server, send и read timeouts NGINX/HAProxy выше `web.timeouts.long_poll_secs`. |
 | WebSocket Upgrade попадает в decoy вместо `101` | Сохраните HTTP/1.1 `Connection: Upgrade`, `Upgrade: websocket`, единственный точный `Sec-WebSocket-Protocol` и канонический bodyless request `/api/v1/ws`. Также проверьте соответствие carrier/session и process connection reserve. |
 | Один stream `websocket-lanes` закрылся, а siblings остались подключены | Это штатная failure boundary. Проверьте message/frame rows этой lane в `/web-status`; malformed, cross-lane, write-timeout и backend-close закрывают только затронутую lane. |
