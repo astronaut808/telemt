@@ -3572,24 +3572,24 @@ async fn render_metrics(
     let _ = writeln!(out, "# TYPE telemt_user_connections_current gauge");
     let _ = writeln!(
         out,
-        "# HELP telemt_user_octets_from_client Per-user bytes received"
+        "# HELP telemt_user_octets_from_client_total Per-user total bytes received"
     );
-    let _ = writeln!(out, "# TYPE telemt_user_octets_from_client counter");
+    let _ = writeln!(out, "# TYPE telemt_user_octets_from_client_total counter");
     let _ = writeln!(
         out,
-        "# HELP telemt_user_octets_to_client Per-user bytes sent"
+        "# HELP telemt_user_octets_to_client_total Per-user total bytes sent"
     );
-    let _ = writeln!(out, "# TYPE telemt_user_octets_to_client counter");
+    let _ = writeln!(out, "# TYPE telemt_user_octets_to_client_total counter");
     let _ = writeln!(
         out,
-        "# HELP telemt_user_msgs_from_client Per-user messages received"
+        "# HELP telemt_user_msgs_from_client_total Per-user total messages received"
     );
-    let _ = writeln!(out, "# TYPE telemt_user_msgs_from_client counter");
+    let _ = writeln!(out, "# TYPE telemt_user_msgs_from_client_total counter");
     let _ = writeln!(
         out,
-        "# HELP telemt_user_msgs_to_client Per-user messages sent"
+        "# HELP telemt_user_msgs_to_client_total Per-user total messages sent"
     );
-    let _ = writeln!(out, "# TYPE telemt_user_msgs_to_client counter");
+    let _ = writeln!(out, "# TYPE telemt_user_msgs_to_client_total counter");
     let _ = writeln!(
         out,
         "# HELP telemt_ip_reservation_rollback_total IP reservation rollbacks caused by later limit checks"
@@ -3708,28 +3708,28 @@ async fn render_metrics(
             );
             let _ = writeln!(
                 out,
-                "telemt_user_octets_from_client{{user=\"{}\"}} {}",
+                "telemt_user_octets_from_client_total{{user=\"{}\"}} {}",
                 user,
                 s.octets_from_client
                     .load(std::sync::atomic::Ordering::Relaxed)
             );
             let _ = writeln!(
                 out,
-                "telemt_user_octets_to_client{{user=\"{}\"}} {}",
+                "telemt_user_octets_to_client_total{{user=\"{}\"}} {}",
                 user,
                 s.octets_to_client
                     .load(std::sync::atomic::Ordering::Relaxed)
             );
             let _ = writeln!(
                 out,
-                "telemt_user_msgs_from_client{{user=\"{}\"}} {}",
+                "telemt_user_msgs_from_client_total{{user=\"{}\"}} {}",
                 user,
                 s.msgs_from_client
                     .load(std::sync::atomic::Ordering::Relaxed)
             );
             let _ = writeln!(
                 out,
-                "telemt_user_msgs_to_client{{user=\"{}\"}} {}",
+                "telemt_user_msgs_to_client_total{{user=\"{}\"}} {}",
                 user,
                 s.msgs_to_client.load(std::sync::atomic::Ordering::Relaxed)
             );
@@ -3990,10 +3990,10 @@ mod tests {
         assert!(output.contains("telemt_me_endpoint_quarantine_draining_suppressed_total 1"));
         assert!(output.contains("telemt_user_connections_total{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_connections_current{user=\"alice\"} 1"));
-        assert!(output.contains("telemt_user_octets_from_client{user=\"alice\"} 1024"));
-        assert!(output.contains("telemt_user_octets_to_client{user=\"alice\"} 2048"));
-        assert!(output.contains("telemt_user_msgs_from_client{user=\"alice\"} 1"));
-        assert!(output.contains("telemt_user_msgs_to_client{user=\"alice\"} 2"));
+        assert!(output.contains("telemt_user_octets_from_client_total{user=\"alice\"} 1024"));
+        assert!(output.contains("telemt_user_octets_to_client_total{user=\"alice\"} 2048"));
+        assert!(output.contains("telemt_user_msgs_from_client_total{user=\"alice\"} 1"));
+        assert!(output.contains("telemt_user_msgs_to_client_total{user=\"alice\"} 2"));
         assert!(output.contains("telemt_user_unique_ips_current{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_unique_ips_recent_window{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_unique_ips_limit{user=\"alice\"} 4"));
