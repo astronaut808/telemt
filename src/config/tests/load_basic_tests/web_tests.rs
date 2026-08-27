@@ -57,6 +57,17 @@ fn web_config_builds_canonical_runtime_snapshot() {
 }
 
 #[test]
+fn web_profile_user_labels_are_bounded_for_runtime_status() {
+    let user = "a".repeat(65);
+    let invalid = WEB_CONFIG.replace("alice", &user);
+
+    assert!(
+        load_config_error_from_temp_toml(&invalid)
+            .contains("web.vhosts[0].profiles[0].user must contain 1..64 bytes")
+    );
+}
+
+#[test]
 fn web_carriers_missing_or_false_disable_negotiation() {
     let missing = load_config_from_temp_toml(WEB_CONFIG);
     assert!(!missing.web.carrier_negotiation_enabled());

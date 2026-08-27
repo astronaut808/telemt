@@ -17,6 +17,7 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{WebClientIpSource, WebRuntimeVhost};
+use crate::maestro::generation::RuntimeGeneration;
 use crate::web::bridge;
 use crate::web::manager::{ManagerError, WebProcessRuntime};
 
@@ -201,6 +202,7 @@ async fn handle_request(
             client_ip_source,
             trusted_proxy_cidrs,
             runtime,
+            generation,
             vhost,
         )
         .await;
@@ -214,6 +216,7 @@ async fn handle_root(
     client_ip_source: WebClientIpSource,
     trusted_proxy_cidrs: &[IpNetwork],
     runtime: Arc<WebProcessRuntime>,
+    generation: Arc<RuntimeGeneration>,
     vhost: Arc<WebRuntimeVhost>,
 ) -> HttpResponse {
     let (candidate, canonical) = bridge_candidate(request.uri().query());
@@ -229,7 +232,16 @@ async fn handle_root(
         trace.set_route(TraceRoute::Bridge);
         trace.set_effective_ip(client_ip);
     }
-    let bootstrap = match runtime.issue_bootstrap(Arc::clone(&profile), client_ip) {
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    let bootstrap = match runtime.issue_bootstrap_for_request(
+        &generation,
+        Arc::clone(&profile),
+        client_ip,
+        user_agent,
+    ) {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
             runtime.trace().record_profile_lifecycle(
@@ -248,7 +260,6 @@ async fn handle_root(
         trace.bind_profile(&profile, bootstrap.trace_session_id);
         trace.register_redaction(bootstrap.token.as_bytes());
     }
-    let generation = runtime.active_generation();
     let config = generation.config();
     let page = bridge::render(
         &vhost.host,

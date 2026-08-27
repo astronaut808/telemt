@@ -14,6 +14,7 @@ use super::bind::{BoundListeners, BoundTcpListener, PreparedTcpListener, prepare
 use super::plan::{ListenerBindSpec, listener_bind_plan};
 #[cfg(unix)]
 use super::unix::UnixAcceptHandle;
+use crate::web::control::{WebRuntimeControl, WebRuntimeLifecycle};
 use crate::web::manager::{WebProcessRuntime, WebShutdownOutcome};
 use crate::web::trace::WebTraceStore;
 
@@ -22,6 +23,8 @@ pub(crate) struct ListenerManager {
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     slots: BTreeMap<SocketAddr, ListenerSlot>,
     web_runtime: Option<Arc<WebProcessRuntime>>,
+    web_control: WebRuntimeControl,
+    web_listeners: Arc<[SocketAddr]>,
     #[cfg(unix)]
     unix: Option<UnixAcceptHandle>,
 }
@@ -46,11 +49,15 @@ impl ListenerManager {
         bound: BoundListeners,
         active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
         trace: Arc<WebTraceStore>,
+        web_control: WebRuntimeControl,
     ) -> Self {
-        let has_web = bound
+        let web_listeners: Arc<[SocketAddr]> = bound
             .listeners
             .iter()
-            .any(|listener| listener.spec.transport == ListenerTransport::Web);
+            .filter(|listener| listener.spec.transport == ListenerTransport::Web)
+            .map(|listener| listener.spec.addr)
+            .collect();
+        let has_web = !web_listeners.is_empty();
         let web_runtime =
             has_web.then(|| WebProcessRuntime::start_with_trace(active_runtime.clone(), trace));
         let mut slots = BTreeMap::new();
@@ -65,10 +72,23 @@ impl ListenerManager {
         let unix = bound
             .unix_listener
             .map(|listener| UnixAcceptHandle::start(listener, active_runtime.clone()));
+        web_control.publish(
+            if has_web {
+                WebRuntimeLifecycle::Running
+            } else {
+                WebRuntimeLifecycle::NoWebListener
+            },
+            Arc::clone(&web_listeners),
+            web_runtime
+                .as_ref()
+                .map_or_else(std::sync::Weak::new, Arc::downgrade),
+        );
         Self {
             active_runtime,
             slots,
             web_runtime,
+            web_control,
+            web_listeners,
             #[cfg(unix)]
             unix,
         }
@@ -76,10 +96,18 @@ impl ListenerManager {
 
     #[cfg(test)]
     pub(crate) fn empty(active_runtime: Arc<ArcSwap<RuntimeGeneration>>) -> Self {
+        let web_control = WebRuntimeControl::new();
+        web_control.publish(
+            WebRuntimeLifecycle::NoWebListener,
+            Arc::from([]),
+            std::sync::Weak::new(),
+        );
         Self {
             active_runtime,
             slots: BTreeMap::new(),
             web_runtime: None,
+            web_control,
+            web_listeners: Arc::from([]),
             #[cfg(unix)]
             unix: None,
         }
@@ -217,6 +245,13 @@ impl ListenerManager {
 
     /// Stops every accept task and applies one deadline to the complete WEB ingress.
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
+        self.web_control.publish(
+            WebRuntimeLifecycle::Draining,
+            Arc::clone(&self.web_listeners),
+            self.web_runtime
+                .as_ref()
+                .map_or_else(std::sync::Weak::new, Arc::downgrade),
+        );
         if self.web_runtime.is_none() {
             let mut errors = Vec::new();
             for slot in self.slots.values_mut() {
@@ -235,6 +270,11 @@ impl ListenerManager {
             {
                 self.unix = None;
             }
+            self.web_control.publish(
+                WebRuntimeLifecycle::Drained,
+                Arc::clone(&self.web_listeners),
+                std::sync::Weak::new(),
+            );
             return if errors.is_empty() {
                 Ok(())
             } else {
@@ -289,6 +329,15 @@ impl ListenerManager {
         {
             self.unix = None;
         }
+        self.web_control.publish(
+            if web_outcome == WebShutdownOutcome::DeadlineExceeded {
+                WebRuntimeLifecycle::DeadlineExceeded
+            } else {
+                WebRuntimeLifecycle::Drained
+            },
+            Arc::clone(&self.web_listeners),
+            std::sync::Weak::new(),
+        );
         if errors.is_empty() {
             Ok(())
         } else {
@@ -367,7 +416,8 @@ mod tests {
             runtime.config().web.debug.clone(),
             &runtime.config().web.limits,
         );
-        let mut manager = ListenerManager::start(bound, active_runtime, trace);
+        let mut manager =
+            ListenerManager::start(bound, active_runtime, trace, WebRuntimeControl::new());
         let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let blocked_addr = blocker.local_addr().unwrap();
         let mut desired = ProxyConfig::default();
@@ -394,7 +444,8 @@ mod tests {
             runtime.config().web.debug.clone(),
             &runtime.config().web.limits,
         );
-        let mut manager = ListenerManager::start(bound, active_runtime, trace);
+        let mut manager =
+            ListenerManager::start(bound, active_runtime, trace, WebRuntimeControl::new());
         let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let new_addr = reservation.local_addr().unwrap();
         drop(reservation);

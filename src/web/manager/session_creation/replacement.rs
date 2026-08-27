@@ -21,6 +21,7 @@ impl WebProcessRuntime {
         let now = Instant::now();
         let mut state = self.state.lock();
         remove_expired_locked(&mut state, now);
+        state.apply_issuance_policy(generation.id, config.web.enabled);
         let valid = state.bootstraps.get(&bootstrap_hash).is_some_and(|entry| {
             entry.carrier_transitioning
                 && entry.carrier_phase == CarrierChainPhase::Provisional
@@ -37,7 +38,7 @@ impl WebProcessRuntime {
             .is_some_and(|session| Arc::ptr_eq(session, &replacement.old_session));
         if !valid
             || state.closed
-            || !config.web.enabled
+            || !state.issuance_enabled
             || !generation
                 .proxy_shared
                 .is_user_enabled(&replacement.profile.user)
@@ -121,6 +122,13 @@ impl WebProcessRuntime {
             deadline_secs: Some(entry.profile.carrier_negotiation_deadlines_secs[3]),
             carrier_state: Some(CarrierChainPhase::Provisional.as_str()),
         };
+        if let Some(index) = state.session_index.get_mut(&replacement.trace_session_id)
+            && index.session_hash == old_hash
+        {
+            index.session_hash = session_hash;
+            index.bootstrap_hash = bootstrap_hash;
+            index.attempt = replacement.attempt;
+        }
         let identity = session.trace_identity();
         let old_identity = replacement.old_session.trace_identity();
         drop(state);

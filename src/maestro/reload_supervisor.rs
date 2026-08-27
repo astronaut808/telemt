@@ -278,7 +278,11 @@ impl ReloadSupervisor {
         self.control
             .mark_phase(command.reload_id, ReloadPhase::Activating)
             .await;
-        let new_runtime = prepared.generation;
+        let PreparedRuntime {
+            generation: new_runtime,
+            detected_ips,
+            config_watcher_activation,
+        } = prepared;
         if let Err(error) = install_dns(&new_runtime.config().network.dns_overrides) {
             let message = format!("runtime DNS activation failed: {}", error);
             if command.request.failure_policy == ReloadFailurePolicy::Rollback {
@@ -313,14 +317,16 @@ impl ReloadSupervisor {
         };
         old_runtime.stop_accepting_sessions();
         let replaced = self.active_runtime.swap(new_runtime.clone());
-        self.web_trace.apply_policy(&new_runtime.config().web.debug);
+        self.web_trace
+            .apply_policy(new_runtime.id, &new_runtime.config().web.debug);
+        config_watcher_activation.send_replace(true);
         if let Some(pending) = pending_listener_transition {
             self.listener_manager
                 .lock()
                 .await
                 .finish_transition(pending);
         }
-        self.detected_ips_tx.send_replace(prepared.detected_ips);
+        self.detected_ips_tx.send_replace(detected_ips);
         self.runtime_log_filter
             .apply_reload(&new_runtime.config().general.log_level);
         self.runtime_watch_tx

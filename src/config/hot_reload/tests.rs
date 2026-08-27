@@ -256,6 +256,46 @@ fn reload_applies_hot_change_on_first_observed_snapshot() {
     let _ = std::fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn candidate_watcher_waits_for_activation_and_reconciles_disk() {
+    let initial_tag = "10101010101010101010101010101010";
+    let disk_tag = "20202020202020202020202020202020";
+    let path = temp_config_path("telemt_hot_reload_activation_gate");
+    write_reload_config(&path, Some(initial_tag), None);
+    let initial = Arc::new(ProxyConfig::load(&path).unwrap());
+    write_reload_config(&path, Some(disk_tag), None);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let (activation_tx, activation_rx) = watch::channel(false);
+    let (mut config_rx, _log_rx, watcher) = spawn_config_watcher(
+        path.clone(),
+        initial,
+        None,
+        None,
+        cancellation.clone(),
+        Some(activation_rx),
+    );
+    let watcher = tokio::spawn(watcher);
+
+    tokio::task::yield_now().await;
+    assert_eq!(
+        config_rx.borrow().general.ad_tag.as_deref(),
+        Some(initial_tag)
+    );
+    activation_tx.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), config_rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        config_rx.borrow_and_update().general.ad_tag.as_deref(),
+        Some(disk_tag)
+    );
+
+    cancellation.cancel();
+    watcher.await.unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn reload_keeps_hot_apply_when_non_hot_fields_change() {
     let initial_tag = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

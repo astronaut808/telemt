@@ -61,6 +61,26 @@ pub(super) struct WebSocketRegistry {
     closed: bool,
 }
 
+/// Point-in-time WebSocket registry counters.
+#[derive(Clone, Copy)]
+pub(super) struct WebSocketRegistryStatus {
+    pub(super) entries: usize,
+    pub(super) claims: usize,
+    pub(super) evictions_in_flight: usize,
+    pub(super) closed: bool,
+}
+
+impl WebSocketRegistry {
+    pub(super) fn status(&self) -> WebSocketRegistryStatus {
+        WebSocketRegistryStatus {
+            entries: self.entries.len(),
+            claims: self.claims.len(),
+            evictions_in_flight: self.evictions_in_flight,
+            closed: self.closed,
+        }
+    }
+}
+
 /// Exact process-owned admission retained through the upgraded socket lifetime.
 pub(crate) struct WebSocketConnection {
     runtime: std::sync::Weak<WebProcessRuntime>,

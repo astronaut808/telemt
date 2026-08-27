@@ -63,18 +63,20 @@ impl ConnectionActivity {
         if state.failed {
             return true;
         }
-        let request_protected = state
+        let request_deadline = state
             .request
             .as_ref()
             .and_then(|request| request.deadline)
-            .is_some_and(|deadline| now <= deadline.deadline);
-        let upgrade_protected = state
+            .map(|deadline| deadline.deadline);
+        let upgrade_deadline = state
             .upgrade
             .as_ref()
-            .is_some_and(|upgrade| now <= upgrade.deadline.deadline);
-        !request_protected
-            && !upgrade_protected
-            && now.saturating_duration_since(state.last_progress) >= idle
+            .map(|upgrade| upgrade.deadline.deadline);
+        let protected_until = request_deadline.into_iter().chain(upgrade_deadline).max();
+        let idle_since = protected_until
+            .filter(|deadline| *deadline > state.last_progress)
+            .unwrap_or(state.last_progress);
+        now.saturating_duration_since(idle_since) >= idle
     }
 
     fn fail(&self) {
@@ -388,6 +390,20 @@ mod tests {
 
         drop(lease);
         assert!(!activity.should_close(Instant::now(), Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn expired_operation_lease_gets_one_idle_interval_to_publish_its_result() {
+        let activity = ConnectionActivity::new();
+        let request = RequestActivity::begin(activity.clone()).unwrap();
+        let now = Instant::now();
+        let _lease = request
+            .deadline_handle()
+            .lease_until(now + Duration::from_secs(1))
+            .unwrap();
+
+        assert!(!activity.should_close(now + Duration::from_millis(1500), Duration::from_secs(1)));
+        assert!(activity.should_close(now + Duration::from_secs(2), Duration::from_secs(1)));
     }
 
     #[test]

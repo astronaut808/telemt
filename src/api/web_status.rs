@@ -41,10 +41,9 @@ impl AsRef<[u8]> for RenderedPage {
 pub(super) async fn render(
     raw_query: Option<&str>,
     store: &Arc<WebTraceStore>,
-    policy: &WebDebugConfig,
 ) -> Response<Full<Bytes>> {
-    store.apply_policy(policy);
-    let query = match parse_query(raw_query, policy) {
+    let status = store.status();
+    let query = match parse_query(raw_query, &status.policy) {
         Ok(query) => query,
         Err(error) => return html_error(StatusCode::BAD_REQUEST, "Invalid query", &error),
     };
@@ -62,7 +61,6 @@ pub(super) async fn render(
         0
     };
     let records = store.snapshot_matching(|record| record_matches(record, &query, since_millis));
-    let status = store.status();
     let mut html = String::with_capacity(MAX_PAGE_BYTES);
     push_page_start(&mut html);
     html.push_str("<h1>WEB status</h1>");

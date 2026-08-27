@@ -52,10 +52,18 @@ pub(crate) struct WebDataBudgetSnapshot {
     pub(crate) queue_bytes: usize,
     /// Total queue items currently retained.
     pub(crate) queue_items: usize,
+    /// Control bytes included in the queue total.
+    pub(crate) queue_control_bytes: usize,
+    /// Control items included in the queue total.
+    pub(crate) queue_control_items: usize,
     /// Total WebSocket bytes currently retained.
     pub(crate) websocket_bytes: usize,
     /// Largest combined byte usage observed since process start.
     pub(crate) high_water_bytes: usize,
+    /// Distinct profile owners currently charged.
+    pub(crate) owners: usize,
+    /// Whether shutdown closed this allocation authority.
+    pub(crate) closed: bool,
 }
 
 /// Bounded owner-usage view captured before WebSocket registry selection.
@@ -259,9 +267,27 @@ impl WebDataBudget {
         WebDataBudgetSnapshot {
             queue_bytes: state.queue_bytes,
             queue_items: state.queue_items,
+            queue_control_bytes: state.queue_control_bytes,
+            queue_control_items: state.queue_control_items,
             websocket_bytes: state.websocket_bytes,
             high_water_bytes: state.high_water_bytes,
+            owners: state.owner_bytes.len(),
+            closed: state.closed,
         }
+    }
+
+    pub(super) fn try_snapshot(&self) -> Option<WebDataBudgetSnapshot> {
+        let state = self.state.try_lock()?;
+        Some(WebDataBudgetSnapshot {
+            queue_bytes: state.queue_bytes,
+            queue_items: state.queue_items,
+            queue_control_bytes: state.queue_control_bytes,
+            queue_control_items: state.queue_control_items,
+            websocket_bytes: state.websocket_bytes,
+            high_water_bytes: state.high_water_bytes,
+            owners: state.owner_bytes.len(),
+            closed: state.closed,
+        })
     }
 
     pub(super) fn close(&self) {

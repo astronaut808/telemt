@@ -24,6 +24,9 @@ mod backend;
 mod downlink;
 // Response ownership keeps detached batches charged until the last body clone drops.
 mod resident;
+// Read-only control-plane snapshots stay isolated from carrier operations.
+mod status;
+pub(crate) use status::WebSessionStatus;
 // Lane carrier state isolates request sequencing and downlink replay per logical stream.
 mod lanes;
 // Lane batch staging transfers queue ownership without escaping process budgets.
@@ -205,6 +208,7 @@ pub(crate) struct WebSession {
     carrier_class: CarrierClientClass,
     learning_context: Option<CarrierLearningContext>,
     automatic_carrier: bool,
+    created_at: Instant,
     limits: WebLimitsConfig,
     timeouts: WebTimeoutsConfig,
     state: Mutex<SessionState>,
@@ -268,6 +272,7 @@ impl WebSession {
             carrier_class,
             learning_context,
             automatic_carrier,
+            created_at: Instant::now(),
             limits,
             timeouts,
             state: Mutex::new(SessionState {
@@ -342,6 +347,11 @@ impl WebSession {
     /// Returns the process-unique non-secret trace identifier.
     pub(crate) fn trace_session_id(&self) -> u64 {
         self.trace_session_id
+    }
+
+    /// Returns the immutable carrier-attempt incarnation number.
+    pub(crate) fn carrier_attempt(&self) -> u8 {
+        self.carrier_attempt
     }
 
     /// Creates a child cancellation boundary for one owned carrier task.

@@ -76,6 +76,61 @@ async fn request_with_body_delay(
 }
 
 #[tokio::test]
+async fn issued_bootstrap_timeouts_survive_reload_before_session_creation() {
+    let capability = [20u8; 32];
+    let mut initial_config = runtime_config(capability, WebCarrier::Https);
+    initial_config.web.timeouts.body_secs = 3;
+    initial_config.web.timeouts.long_poll_secs = 3;
+    initial_config.web.timeouts.bootstrap_lifetime_secs = 5;
+    let generation = test_runtime_generation(1, initial_config);
+    let active_runtime = Arc::new(ArcSwap::from(Arc::clone(&generation)));
+    let runtime = WebProcessRuntime::start(Arc::clone(&active_runtime));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(capability);
+    let root = format!(
+        "GET /?bridge={encoded} HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    let root_response = request(&listener, &runtime, root).await;
+    let (_, root_body) = split_response(&root_response);
+    let bootstrap = std::str::from_utf8(root_body)
+        .unwrap()
+        .split_once("bootstrap=\"")
+        .and_then(|(_, suffix)| suffix.split_once('"'))
+        .map(|(token, _)| token.to_string())
+        .unwrap();
+
+    let mut replacement_config = runtime_config(capability, WebCarrier::Https);
+    replacement_config.web.timeouts.body_secs = 1;
+    replacement_config.web.timeouts.long_poll_secs = 1;
+    replacement_config.web.timeouts.bootstrap_lifetime_secs = 1;
+    let replacement = test_runtime_generation(2, replacement_config);
+    active_runtime.store(Arc::clone(&replacement));
+
+    let hello = frame::encode(FrameType::Hello, 0, &[1]);
+    let create_head = format!(
+        "POST /api/v1/session HTTP/1.1\r\nHost: proxy.example.com\r\nX-Forwarded-For: 192.0.2.10\r\nAuthorization: Bearer {bootstrap}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        hello.len()
+    )
+    .into_bytes();
+    let create_response = request_with_body_delay(
+        &listener,
+        &runtime,
+        create_head,
+        &hello,
+        std::time::Duration::from_millis(1200),
+    )
+    .await;
+    assert!(create_response.starts_with(b"HTTP/1.1 200"));
+
+    runtime.shutdown().await;
+    generation.stop_sessions().await;
+    generation.stop_background_tasks().await;
+    replacement.stop_sessions().await;
+    replacement.stop_background_tasks().await;
+}
+
+#[tokio::test]
 async fn live_session_body_and_closed_token_timeouts_survive_reload() {
     let capability = [21u8; 32];
     let mut initial_config = runtime_config(capability, WebCarrier::Https);

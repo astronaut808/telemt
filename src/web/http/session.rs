@@ -68,7 +68,7 @@ pub(super) async fn handle_session(
         return serve_decoy(request, vhost, true, &runtime).await;
     };
     let ip_learning_eligible = carrier_ip_learning_eligible(&request, client_ip);
-    let Some((trace_session_id, profile, frozen_body_timeout)) =
+    let Some((trace_session_id, profile, body_timeout)) =
         runtime.bootstrap_trace_identity(token_hash, &vhost.host)
     else {
         return serve_decoy(request, vhost, true, &runtime).await;
@@ -77,9 +77,6 @@ pub(super) async fn handle_session(
         trace.set_route(TraceRoute::Session);
         trace.bind_profile(&profile, trace_session_id);
     }
-    let body_timeout = frozen_body_timeout.unwrap_or_else(|| {
-        Duration::from_secs(runtime.active_generation().config().web.timeouts.body_secs)
-    });
     let CollectedBody {
         request,
         body,

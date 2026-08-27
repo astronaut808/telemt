@@ -6,7 +6,8 @@ use tokio::time::Instant as TokioInstant;
 use tracing::{info, warn};
 
 use super::state::{
-    decrement_map, remember_closed_token_locked, remove_bootstrap_locked, remove_expired_locked,
+    decrement_map, remember_closed_session_locked, remember_closed_token_locked,
+    remove_bootstrap_locked, remove_expired_locked,
 };
 use super::{ProfileKey, TokenHash, WebProcessRuntime};
 
@@ -37,9 +38,9 @@ impl WebProcessRuntime {
         closed_token_lifetime: Duration,
     ) {
         let mut state = self.state.lock();
-        if state.sessions.remove(&hash).is_none() {
+        let Some(session) = state.sessions.remove(&hash) else {
             return;
-        }
+        };
         decrement_map(&mut state.sessions_per_ip, &client_ip);
         decrement_map(&mut state.sessions_per_profile, &profile_key);
         remember_closed_token_locked(
@@ -49,6 +50,21 @@ impl WebProcessRuntime {
             closed_token_lifetime,
             self.limits.max_sessions_global.saturating_mul(16),
         );
+        let trace_session_id = session.trace_session_id();
+        if state
+            .session_index
+            .get(&trace_session_id)
+            .is_some_and(|index| index.session_hash == hash)
+        {
+            state.session_index.remove(&trace_session_id);
+            remember_closed_session_locked(
+                &mut state,
+                trace_session_id,
+                session.carrier_attempt(),
+                closed_token_lifetime,
+                self.limits.max_sessions_global,
+            );
+        }
         let bootstrap_hashes = state
             .bootstraps
             .iter()
@@ -70,6 +86,7 @@ impl WebProcessRuntime {
     pub(crate) fn begin_shutdown(self: &std::sync::Arc<Self>) -> WebShutdownDrain {
         let started = TokioInstant::now();
         self.shutdown.cancel();
+        self.close_control_submission_gate();
         self.close_websockets();
         self.data_budget.close();
         self.http_connections.close();
@@ -141,6 +158,7 @@ impl WebProcessRuntime {
         drop(learning);
         let (sessions, expired_chains) = {
             let mut state = self.state.lock();
+            state.apply_issuance_policy(generation.id, config.enabled);
             let expired = state
                 .bootstraps
                 .iter()
@@ -293,6 +311,7 @@ mod tests {
     use super::*;
     use crate::config::ProxyConfig;
     use crate::maestro::generation::test_runtime_generation;
+    use crate::web::manager::{CloseOperationSelector, ControlError};
 
     struct DropProbe {
         polls: Arc<AtomicUsize>,
@@ -365,6 +384,44 @@ mod tests {
 
         assert_eq!(polls.load(Ordering::Acquire), 0);
         assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            drain
+                .wait_until(TokioInstant::now() + Duration::from_secs(1))
+                .await,
+            WebShutdownOutcome::Drained
+        );
+        generation.stop_sessions().await;
+        generation.stop_background_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn initial_trace_policy_is_attributed_to_active_generation() {
+        let (runtime, generation) = runtime();
+
+        assert_eq!(runtime.trace().status().policy_generation, generation.id);
+
+        runtime.shutdown().await;
+        generation.stop_sessions().await;
+        generation.stop_background_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_the_control_submission_gate() {
+        let (runtime, generation) = runtime();
+        let drain = runtime.begin_shutdown();
+
+        assert!(matches!(
+            runtime.start_close_operation(
+                runtime.runtime_instance(),
+                CloseOperationSelector::Refs(vec![1]),
+            ),
+            Err(ControlError::Closed)
+        ));
+        assert!(matches!(
+            runtime.reset_carrier_learning(),
+            Err(crate::web::manager::ManagerError::Closed)
+        ));
+        assert!(matches!(runtime.clear_debug(), Err(ControlError::Closed)));
         assert_eq!(
             drain
                 .wait_until(TokioInstant::now() + Duration::from_secs(1))

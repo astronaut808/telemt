@@ -10,8 +10,8 @@ use zeroize::Zeroizing;
 use super::negotiation::carrier_attempt_deadline_index;
 use super::session_admission::admit_initial;
 use super::state::{
-    CarrierChainPhase, decrement_map, matching_profile, new_unique_token, profile_key,
-    remember_closed_token_locked, remove_expired_locked,
+    CarrierChainPhase, LiveSessionIndex, decrement_map, matching_profile, new_unique_token,
+    profile_key, remember_closed_token_locked, remove_expired_locked,
 };
 use super::{
     CarrierLearningContext, CarrierRequest, CreateResult, ManagerError, TokenHash,
@@ -56,6 +56,10 @@ impl WebProcessRuntime {
         let now = Instant::now();
         let mut state = self.state.lock();
         remove_expired_locked(&mut state, now);
+        state.apply_issuance_policy(generation.id, config.web.enabled);
+        if state.closed || !state.issuance_enabled {
+            return Err(ManagerError::Closed);
+        }
         let Some(entry) = state.bootstraps.get(&bootstrap_hash) else {
             return Err(ManagerError::Authentication);
         };
@@ -201,9 +205,7 @@ impl WebProcessRuntime {
         }
         let trace_session_id = entry.trace_session_id;
         let issued_profile = Arc::clone(&entry.profile);
-        if state.closed || !config.web.enabled {
-            return Err(ManagerError::Closed);
-        }
+        let issued_timeouts = entry.timeouts.clone();
         let profile = config
             .web
             .runtime
@@ -303,33 +305,39 @@ impl WebProcessRuntime {
             learning_context,
             carrier_request.is_automatic(),
             self.limits.clone(),
-            config.web.timeouts.clone(),
+            issued_timeouts.clone(),
         );
         state.sessions.insert(session_hash, Arc::clone(&session));
         *state.sessions_per_ip.entry(client_ip).or_insert(0) += 1;
         *state.sessions_per_profile.entry(profile_key).or_insert(0) += 1;
-        let entry = state
-            .bootstraps
-            .get_mut(&bootstrap_hash)
-            .ok_or(ManagerError::Authentication)?;
-        entry.used = true;
-        entry.body_digest = body_digest;
-        entry.session_token = Zeroizing::new(session_token.clone());
-        entry.session = Some(Arc::clone(&session));
-        entry.carrier_request = Some(carrier_request);
-        entry.carrier_candidates = candidates.into();
-        entry.carrier_scores = scores;
-        entry.carrier_attempt = 1;
-        entry.carrier_phase = CarrierChainPhase::Provisional;
-        entry.carrier_started_at = carrier_request.is_automatic().then_some(now);
-        entry.carrier_deadline_at = carrier_deadline_at;
-        entry.carrier_failures = [None; 3];
-        entry.carrier_learning_epoch = learning_epoch.unwrap_or(0);
-        entry.expires_at = now + Duration::from_secs(config.web.timeouts.bootstrap_lifetime_secs);
-        entry.session_client_ip = Some(client_ip);
-        entry.session_ip_learning_eligible = ip_learning_eligible;
-        let issuance_ip = entry.issuance_ip;
-        let candidate_count = u8::try_from(entry.carrier_candidates.len()).unwrap_or(4);
+        let (issuance_ip, candidate_count, user_agent, user_agent_id) = {
+            let entry = state
+                .bootstraps
+                .get_mut(&bootstrap_hash)
+                .ok_or(ManagerError::Authentication)?;
+            entry.used = true;
+            entry.body_digest = body_digest;
+            entry.session_token = Zeroizing::new(session_token.clone());
+            entry.session = Some(Arc::clone(&session));
+            entry.carrier_request = Some(carrier_request);
+            entry.carrier_candidates = candidates.into();
+            entry.carrier_scores = scores;
+            entry.carrier_attempt = 1;
+            entry.carrier_phase = CarrierChainPhase::Provisional;
+            entry.carrier_started_at = carrier_request.is_automatic().then_some(now);
+            entry.carrier_deadline_at = carrier_deadline_at;
+            entry.carrier_failures = [None; 3];
+            entry.carrier_learning_epoch = learning_epoch.unwrap_or(0);
+            entry.expires_at = now + Duration::from_secs(issued_timeouts.bootstrap_lifetime_secs);
+            entry.session_client_ip = Some(client_ip);
+            entry.session_ip_learning_eligible = ip_learning_eligible;
+            (
+                entry.issuance_ip,
+                u8::try_from(entry.carrier_candidates.len()).unwrap_or(4),
+                entry.user_agent.clone(),
+                entry.user_agent_id,
+            )
+        };
         decrement_map(&mut state.bootstraps_per_ip, &issuance_ip);
         self.sessions_created.fetch_add(1, Ordering::Relaxed);
         let identity = session.trace_identity();
@@ -345,6 +353,16 @@ impl WebProcessRuntime {
                 .is_automatic()
                 .then_some(CarrierChainPhase::Provisional.as_str()),
         };
+        state.session_index.insert(
+            trace_session_id,
+            LiveSessionIndex {
+                session_hash,
+                bootstrap_hash,
+                attempt: 1,
+                user_agent,
+                user_agent_id,
+            },
+        );
         drop(state);
         self.trace.record_carrier_lifecycle(
             client_ip,

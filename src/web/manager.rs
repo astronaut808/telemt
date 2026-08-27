@@ -38,8 +38,16 @@ pub(crate) use lifecycle::WebShutdownOutcome;
 mod budget;
 // WebSocket admission, replacement, and liveness are process-scoped.
 mod websocket;
+// Bounded read-only snapshots and opaque session references serve the API.
+mod status;
+pub(crate) use status::{
+    SessionDetail, SessionFilter, SessionListRequest, SessionRefError, WebRuntimeStatus,
+};
+// Asynchronous bounded close operations isolate mutation lifecycle from HTTP requests.
+mod control;
 pub(crate) use budget::WebSocketBudgetLease;
 use budget::{WebDataBudget, WebSocketBudgetClass};
+pub(crate) use control::{CloseOperationSelector, ControlError};
 pub(crate) use negotiation::{
     CarrierCapabilities, CarrierClientClass, CarrierFailure, CarrierLearningContext, CarrierRequest,
 };
@@ -128,6 +136,7 @@ pub(crate) struct BootstrapResult {
 
 /// Process-owned bounded WEB credential, session, and memory coordinator.
 pub(crate) struct WebProcessRuntime {
+    runtime_instance: Arc<str>,
     active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
     trace: Arc<WebTraceStore>,
     limits: WebLimitsConfig,
@@ -147,6 +156,8 @@ pub(crate) struct WebProcessRuntime {
     websocket_clock: std::time::Instant,
     websocket_notify: Arc<Notify>,
     data_budget: Arc<WebDataBudget>,
+    control_operations: Mutex<control::ControlOperationRegistry>,
+    next_control_operation_id: AtomicU64,
     shutdown: CancellationToken,
     tasks: TaskTracker,
     sessions_created: AtomicU64,
@@ -172,7 +183,9 @@ impl WebProcessRuntime {
         active_runtime: Arc<ArcSwap<RuntimeGeneration>>,
         trace: Arc<WebTraceStore>,
     ) -> Arc<Self> {
-        let config = active_runtime.load().config();
+        let initial_generation = active_runtime.load_full();
+        let config = initial_generation.config();
+        trace.apply_policy(initial_generation.id, &config.web.debug);
         let limits = config.web.limits.clone();
         let learning_capacity = limits.max_carrier_learning_entries;
         let mut carrier_learning = learning::CarrierLearning::new(learning_capacity);
@@ -188,6 +201,7 @@ impl WebProcessRuntime {
         let lane_poll_limit = limits.max_http_handlers / 2;
         let lane_aux_poll_limit = (lane_poll_limit / 2).max(1);
         let runtime = Arc::new(Self {
+            runtime_instance: Arc::from(format!("{:032x}", rand::random::<u128>())),
             active_runtime,
             trace,
             http_connections: Arc::new(Semaphore::new(limits.max_http_connections)),
@@ -203,8 +217,10 @@ impl WebProcessRuntime {
             websocket_clock: std::time::Instant::now(),
             websocket_notify: Arc::new(Notify::new()),
             data_budget: WebDataBudget::new(limits.clone()),
+            control_operations: Mutex::new(control::ControlOperationRegistry::default()),
+            next_control_operation_id: AtomicU64::new(1),
             limits,
-            state: Mutex::new(ManagerState::default()),
+            state: Mutex::new(ManagerState::new(initial_generation.id, config.web.enabled)),
             stream_admission: Mutex::new(StreamAdmissionState::default()),
             learning: Mutex::new(carrier_learning),
             shutdown: CancellationToken::new(),
@@ -229,8 +245,11 @@ impl WebProcessRuntime {
                         let Some(runtime) = weak.upgrade() else {
                             break;
                         };
-                        let policy = runtime.active_generation().config().web.debug.clone();
-                        runtime.trace.apply_policy(&policy);
+                        let generation = runtime.active_generation();
+                        let policy = generation.config().web.debug.clone();
+                        runtime
+                            .trace
+                            .apply_policy(generation.id, &policy);
                         runtime.cleanup();
                     }
                 }
@@ -242,6 +261,11 @@ impl WebProcessRuntime {
     /// Loads the currently active generation without retaining older generations.
     pub(crate) fn active_generation(&self) -> Arc<RuntimeGeneration> {
         self.active_runtime.load_full()
+    }
+
+    /// Returns the random process-instance fence used by control-plane references.
+    pub(crate) fn runtime_instance(&self) -> &str {
+        &self.runtime_instance
     }
 
     /// Returns the process-owned WEB debug trace store.

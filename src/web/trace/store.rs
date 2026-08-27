@@ -41,6 +41,10 @@ impl Drop for StoredTraceRecord {
 pub(crate) struct TraceStoreStatus {
     /// Current debug policy.
     pub(crate) policy: Arc<WebDebugConfig>,
+    /// Runtime generation that last authored the effective policy.
+    pub(crate) policy_generation: u64,
+    /// Epoch fencing in-flight records across policy changes and clears.
+    pub(crate) epoch: u64,
     /// Retained record count.
     pub(crate) records: usize,
     /// Configured record capacity.
@@ -61,11 +65,22 @@ pub(crate) struct TraceStoreStatus {
     pub(crate) latest_seq: Option<u64>,
 }
 
+/// Result of one constant-time logical trace clear.
+pub(crate) struct TraceClearOutcome {
+    /// Records detached from the ring.
+    pub(crate) records_cleared: usize,
+    /// Bytes still retained by in-flight snapshots after detached records drop.
+    pub(crate) leased_bytes: usize,
+    /// New epoch rejecting commits started before the clear.
+    pub(crate) epoch: u64,
+}
+
 /// Process-owned bounded WEB debug trace store.
 pub(crate) struct WebTraceStore {
     policy: ArcSwap<WebDebugConfig>,
     policy_update: Mutex<()>,
     enabled: AtomicBool,
+    policy_generation: AtomicU64,
     epoch: AtomicU64,
     records_capacity: usize,
     bytes_capacity: usize,
@@ -88,6 +103,7 @@ impl WebTraceStore {
             enabled: AtomicBool::new(policy.enabled),
             policy: ArcSwap::from_pointee(policy),
             policy_update: Mutex::new(()),
+            policy_generation: AtomicU64::new(0),
             epoch: AtomicU64::new(1),
             records_capacity: limits.debug_records_capacity,
             bytes_capacity: limits.debug_bytes_global,
@@ -106,11 +122,16 @@ impl WebTraceStore {
         })
     }
 
-    /// Applies one hot policy and clears incompatible retained records.
-    pub(crate) fn apply_policy(&self, policy: &WebDebugConfig) {
+    /// Applies one generation-authored policy and rejects stale generation writers.
+    pub(crate) fn apply_policy(&self, generation: u64, policy: &WebDebugConfig) {
         let _policy_update = self.policy_update.lock();
+        let current_generation = self.policy_generation.load(Ordering::Acquire);
+        if generation < current_generation {
+            return;
+        }
         let current = self.policy.load_full();
         if current.as_ref() == policy {
+            self.policy_generation.store(generation, Ordering::Release);
             return;
         }
         let capture_changed = current.enabled != policy.enabled
@@ -122,10 +143,40 @@ impl WebTraceStore {
             || current.body_prefix_bytes != policy.body_prefix_bytes
             || current.decoy_body_prefix_bytes != policy.decoy_body_prefix_bytes;
         self.policy.store(Arc::new(policy.clone()));
+        self.policy_generation.store(generation, Ordering::Release);
         self.enabled.store(policy.enabled, Ordering::Release);
         if capture_changed {
             self.epoch.fetch_add(1, Ordering::AcqRel);
-            self.ring.lock().records.clear();
+            let detached = {
+                let mut ring = self.ring.lock();
+                std::mem::replace(
+                    &mut ring.records,
+                    VecDeque::with_capacity(self.records_capacity),
+                )
+            };
+            drop(_policy_update);
+            drop(detached);
+        }
+    }
+
+    /// Clears retained records while fencing all in-flight pre-clear commits.
+    pub(crate) fn clear(&self) -> TraceClearOutcome {
+        let _policy_update = self.policy_update.lock();
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        let detached = {
+            let mut ring = self.ring.lock();
+            std::mem::replace(
+                &mut ring.records,
+                VecDeque::with_capacity(self.records_capacity),
+            )
+        };
+        let records_cleared = detached.len();
+        drop(_policy_update);
+        drop(detached);
+        TraceClearOutcome {
+            records_cleared,
+            leased_bytes: self.used_bytes.load(Ordering::Acquire),
+            epoch,
         }
     }
 
@@ -297,9 +348,12 @@ impl WebTraceStore {
 
     /// Returns current bounds, counters, and retained sequence range.
     pub(crate) fn status(&self) -> TraceStoreStatus {
+        let _policy_update = self.policy_update.lock();
         let ring = self.ring.lock();
         TraceStoreStatus {
             policy: self.policy.load_full(),
+            policy_generation: self.policy_generation.load(Ordering::Acquire),
+            epoch: self.epoch.load(Ordering::Acquire),
             records: ring.records.len(),
             records_capacity: self.records_capacity,
             used_bytes: self.used_bytes.load(Ordering::Acquire),
@@ -310,6 +364,26 @@ impl WebTraceStore {
             earliest_seq: ring.records.front().map(|record| record.record.seq),
             latest_seq: ring.records.back().map(|record| record.record.seq),
         }
+    }
+
+    /// Returns a non-blocking status snapshot or `None` on trace-store contention.
+    pub(crate) fn try_status(&self) -> Option<TraceStoreStatus> {
+        let _policy_update = self.policy_update.try_lock()?;
+        let ring = self.ring.try_lock()?;
+        Some(TraceStoreStatus {
+            policy: self.policy.load_full(),
+            policy_generation: self.policy_generation.load(Ordering::Acquire),
+            epoch: self.epoch.load(Ordering::Acquire),
+            records: ring.records.len(),
+            records_capacity: self.records_capacity,
+            used_bytes: self.used_bytes.load(Ordering::Acquire),
+            bytes_capacity: self.bytes_capacity,
+            contention_drops: self.contention_drops.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            byte_truncations: self.byte_truncations.load(Ordering::Relaxed),
+            earliest_seq: ring.records.front().map(|record| record.record.seq),
+            latest_seq: ring.records.back().map(|record| record.record.seq),
+        })
     }
 
     /// Reserves one of two bounded concurrent status-page render slots.
@@ -427,72 +501,4 @@ pub(crate) fn epoch_millis() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn store(records_capacity: usize, bytes_capacity: usize) -> Arc<WebTraceStore> {
-        let policy = WebDebugConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let limits = WebLimitsConfig {
-            debug_records_capacity: records_capacity,
-            debug_bytes_global: bytes_capacity,
-            ..Default::default()
-        };
-        WebTraceStore::new(policy, &limits)
-    }
-
-    #[test]
-    fn ring_evicts_oldest_records_and_snapshot_leases_survive_clear() {
-        let store = store(2, 4 * BASE_RECORD_RESERVATION);
-        for _ in 0..3 {
-            store.record_lifecycle(
-                None,
-                Some("192.0.2.10".parse().unwrap()),
-                TraceIdentity::default(),
-                TraceLifecycleEvent::BridgeIssued,
-                None,
-                None,
-            );
-        }
-
-        let snapshot = store.snapshot_matching(|_| true);
-        assert_eq!(
-            snapshot
-                .iter()
-                .map(|record| record.record.seq)
-                .collect::<Vec<_>>(),
-            vec![3, 2]
-        );
-        assert_eq!(store.status().evictions, 1);
-        assert_eq!(store.status().used_bytes, 2 * BASE_RECORD_RESERVATION);
-
-        let policy = WebDebugConfig::default();
-        store.apply_policy(&policy);
-        assert_eq!(store.status().records, 0);
-        assert_eq!(store.status().used_bytes, 2 * BASE_RECORD_RESERVATION);
-        drop(snapshot);
-        assert_eq!(store.status().used_bytes, 0);
-    }
-
-    #[test]
-    fn capture_policy_epoch_rejects_an_inflight_old_policy_record() {
-        let store = store(4, 8 * BASE_RECORD_RESERVATION);
-        let request = hyper::Request::builder().uri("/").body(()).unwrap();
-        let exchange = store
-            .begin_http(&request, "192.0.2.20".parse().unwrap())
-            .unwrap();
-
-        let changed = WebDebugConfig {
-            enabled: true,
-            capture_headers: false,
-            ..Default::default()
-        };
-        store.apply_policy(&changed);
-        exchange.commit();
-
-        assert_eq!(store.status().records, 0);
-        assert_eq!(store.status().used_bytes, 0);
-    }
-}
+mod tests;
