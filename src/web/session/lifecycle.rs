@@ -84,6 +84,11 @@ impl WebSession {
         }
     }
 
+    /// Returns the current number of registered logical-stream tasks.
+    pub(crate) fn tasks_live(&self) -> usize {
+        self.tasks_live.load(Ordering::Acquire)
+    }
+
     /// Atomically closes a session only when reconnect grace is still due.
     pub(crate) fn close_if_due(&self, now: Instant) -> bool {
         let healthy = {

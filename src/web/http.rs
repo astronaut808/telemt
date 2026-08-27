@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -13,7 +13,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use ipnetwork::IpNetwork;
-use parking_lot::Mutex;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +44,7 @@ mod websocket;
 mod trace_tests;
 
 use crate::web::trace::{HttpTraceExchange, TraceDirection, TraceLifecycleEvent, TraceRoute};
-use activity::{ActivityBody, RequestActivity};
+use activity::{ActivityBody, ConnectionActivity, RequestActivity, RequestDeadlineHandle};
 use body::{CollectBodyError, CollectedBody, RequestBody, collect_body};
 use decoy::serve_decoy;
 use down::handle_down;
@@ -80,15 +79,22 @@ pub(crate) async fn serve_connection(
     let max_header_bytes = config.web.limits.max_header_bytes;
     let header_timeout = Duration::from_secs(config.web.timeouts.header_secs);
     let idle_timeout = Duration::from_secs(config.web.timeouts.http_idle_secs);
-    let last_activity = Arc::new(Mutex::new(Instant::now()));
-    let service_last_activity = Arc::clone(&last_activity);
+    let connection_activity = ConnectionActivity::new();
+    let service_activity = connection_activity.clone();
     let service = service_fn(move |mut request| {
         let runtime = Arc::clone(&runtime);
         let trusted_proxy_cidrs = Arc::clone(&trusted_proxy_cidrs);
-        let last_activity = Arc::clone(&service_last_activity);
+        let connection_activity = service_activity.clone();
         let client_ip_source = client_ip_source;
         async move {
-            let activity = RequestActivity::begin(last_activity);
+            let Some(activity) = RequestActivity::begin(connection_activity) else {
+                let mut response = service_unavailable();
+                response
+                    .headers_mut()
+                    .insert(header::CONNECTION, HeaderValue::from_static("close"));
+                return Ok::<_, Infallible>(response);
+            };
+            request.extensions_mut().insert(activity.deadline_handle());
             let trace = runtime.trace().begin_http(&request, peer.ip());
             if let Some(trace) = &trace {
                 request.extensions_mut().insert(Arc::clone(trace));
@@ -133,9 +139,7 @@ pub(crate) async fn serve_connection(
             _ = cancellation.cancelled() => break,
             _ = &mut connection => break,
             _ = idle_check.tick() => {
-                if Instant::now().saturating_duration_since(*last_activity.lock())
-                    >= idle_timeout
-                {
+                if connection_activity.should_close(tokio::time::Instant::now(), idle_timeout) {
                     break;
                 }
             }
@@ -402,6 +406,10 @@ fn strip_query<B>(request: &mut Request<B>) {
 
 fn request_trace<B>(request: &Request<B>) -> Option<&Arc<HttpTraceExchange>> {
     request.extensions().get::<Arc<HttpTraceExchange>>()
+}
+
+fn request_deadline<B>(request: &Request<B>) -> Option<RequestDeadlineHandle> {
+    request.extensions().get::<RequestDeadlineHandle>().cloned()
 }
 
 fn set_trace_route<B>(request: &Request<B>, route: TraceRoute) {

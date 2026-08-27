@@ -12,6 +12,7 @@ use crate::web::session::{WebSession, WebSocketLaneReservation};
 use crate::web::trace::{TraceDirection, TraceWebSocketContext};
 
 #[allow(clippy::too_many_arguments)]
+/// Drives one exact WebSocket lane until its isolated failure boundary closes.
 pub(super) async fn run_lane(
     socket: &mut CarrierSocket,
     runtime: &Arc<WebProcessRuntime>,
@@ -35,7 +36,7 @@ pub(super) async fn run_lane(
     let maximum_message = session.limits().carrier_batch_bytes;
     let mut active = false;
     loop {
-        let down = session.poll_down_lane(reservation.lane_id(), cursor);
+        let down = session.poll_down_websocket_lane(reservation.lane_identity(), cursor);
         tokio::pin!(down);
         let event = tokio::select! {
             _ = cancellation.cancelled() => return Err(()),
@@ -106,10 +107,12 @@ pub(super) async fn run_lane(
                             session.close();
                             return Err(());
                         }
-                    } else if acknowledge_commit && sequence > 1 && progressed {
-                        if !session.websocket_peer_after_commit_ack(connection.id()) {
-                            return Err(());
-                        }
+                    } else if acknowledge_commit
+                        && sequence > 1
+                        && progressed
+                        && !session.websocket_peer_after_commit_ack(connection.id())
+                    {
+                        return Err(());
                     }
                     if !active && progressed {
                         if !connection.mark_active() {

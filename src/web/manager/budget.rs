@@ -58,6 +58,21 @@ pub(crate) struct WebDataBudgetSnapshot {
     pub(crate) high_water_bytes: usize,
 }
 
+/// Bounded owner-usage view captured before WebSocket registry selection.
+pub(super) struct WebSocketFairnessSnapshot {
+    /// Equal byte share at the admission watermark for captured owners.
+    pub(super) fair_share: usize,
+    /// Captured shared-budget use indexed by profile owner.
+    pub(super) owner_bytes: HashMap<ProfileKey, usize>,
+}
+
+impl WebSocketFairnessSnapshot {
+    /// Returns the captured byte usage for one quota owner.
+    pub(super) fn owner_usage(&self, owner: ProfileKey) -> usize {
+        self.owner_bytes.get(&owner).copied().unwrap_or(0)
+    }
+}
+
 impl WebDataBudget {
     pub(super) fn new(limits: WebLimitsConfig) -> Arc<Self> {
         Arc::new(Self {
@@ -220,16 +235,10 @@ impl WebDataBudget {
         self.pressured.store(true, Ordering::Release);
     }
 
-    pub(super) fn owner_usage(&self, owner: ProfileKey) -> usize {
-        self.state
-            .lock()
-            .owner_bytes
-            .get(&owner)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub(super) fn fair_share(&self, additional_owner: Option<ProfileKey>) -> usize {
+    pub(super) fn fairness_snapshot(
+        &self,
+        additional_owner: Option<ProfileKey>,
+    ) -> WebSocketFairnessSnapshot {
         let state = self.state.lock();
         let mut owners = state.owner_bytes.len();
         if additional_owner.is_some_and(|owner| !state.owner_bytes.contains_key(&owner)) {
@@ -239,7 +248,10 @@ impl WebDataBudget {
             self.limits.websocket_bytes_global,
             self.limits.websocket_admission_watermark_pct,
         );
-        admission / owners.max(1)
+        WebSocketFairnessSnapshot {
+            fair_share: admission / owners.max(1),
+            owner_bytes: state.owner_bytes.clone(),
+        }
     }
 
     pub(super) fn snapshot(&self) -> WebDataBudgetSnapshot {

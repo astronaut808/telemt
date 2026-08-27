@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
@@ -13,7 +14,7 @@ use super::bind::{BoundListeners, BoundTcpListener, PreparedTcpListener, prepare
 use super::plan::{ListenerBindSpec, listener_bind_plan};
 #[cfg(unix)]
 use super::unix::UnixAcceptHandle;
-use crate::web::manager::WebProcessRuntime;
+use crate::web::manager::{WebProcessRuntime, WebShutdownOutcome};
 use crate::web::trace::WebTraceStore;
 
 /// Process-owned listener inventory and accept-task lifecycle controller.
@@ -214,24 +215,76 @@ impl ListenerManager {
         );
     }
 
-    /// Stops and joins every accept task before sockets are released.
+    /// Stops every accept task and applies one deadline to the complete WEB ingress.
     pub(crate) async fn shutdown(&mut self) -> Result<(), String> {
+        if self.web_runtime.is_none() {
+            let mut errors = Vec::new();
+            for slot in self.slots.values_mut() {
+                if let Err(error_value) = slot.stop().await {
+                    errors.push(error_value);
+                }
+            }
+            #[cfg(unix)]
+            if let Some(unix) = &mut self.unix
+                && let Err(error_value) = unix.stop().await
+            {
+                errors.push(error_value);
+            }
+            self.slots.clear();
+            #[cfg(unix)]
+            {
+                self.unix = None;
+            }
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            };
+        }
+        let timeout_secs = self
+            .active_runtime
+            .load()
+            .config()
+            .web
+            .timeouts
+            .shutdown_secs;
+        let now = tokio::time::Instant::now();
+        let deadline = now
+            .checked_add(Duration::from_secs(timeout_secs))
+            .unwrap_or(now);
+        for slot in self.slots.values() {
+            slot.request_stop();
+        }
+        #[cfg(unix)]
+        if let Some(unix) = &self.unix {
+            unix.request_stop();
+        }
+        let Some(web_runtime) = self.web_runtime.take() else {
+            return Err("WEB runtime disappeared during shutdown orchestration".to_string());
+        };
+        let drain = web_runtime.begin_shutdown();
         let mut errors = Vec::new();
-        for slot in self.slots.values_mut() {
-            if let Err(error_value) = slot.stop().await {
+        let slot_waits = futures_util::future::join_all(
+            self.slots
+                .values_mut()
+                .map(|slot| slot.stop_until(deadline)),
+        );
+        let (slot_results, web_outcome) = tokio::join!(slot_waits, drain.wait_until(deadline));
+        for result in slot_results {
+            if let Err(error_value) = result {
                 errors.push(error_value);
             }
         }
         #[cfg(unix)]
         if let Some(unix) = &mut self.unix
-            && let Err(error_value) = unix.stop().await
+            && let Err(error_value) = unix.stop_until(deadline).await
         {
             errors.push(error_value);
         }
-        self.slots.clear();
-        if let Some(web_runtime) = self.web_runtime.take() {
-            web_runtime.shutdown().await;
+        if web_outcome == WebShutdownOutcome::DeadlineExceeded {
+            errors.push("WEB ingress shutdown deadline exceeded".to_string());
         }
+        self.slots.clear();
         #[cfg(unix)]
         {
             self.unix = None;

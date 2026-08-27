@@ -33,6 +33,7 @@ mod carrier_outcome;
 mod admission;
 // Shutdown and expiry work remain outside request-path coordination.
 mod lifecycle;
+pub(crate) use lifecycle::WebShutdownOutcome;
 // Queue and WebSocket allocations share one process-owned data-plane budget.
 mod budget;
 // WebSocket admission, replacement, and liveness are process-scoped.
@@ -294,13 +295,23 @@ impl WebProcessRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        if self.shutdown.is_cancelled() {
+            drop(future);
+            return;
+        }
         let shutdown = self.shutdown.clone();
-        self.tasks.spawn(async move {
+        let tracked = self.tasks.track_future(async move {
             tokio::select! {
+                biased;
                 _ = shutdown.cancelled() => {}
                 _ = future => {}
             }
         });
+        if self.shutdown.is_cancelled() {
+            drop(tracked);
+            return;
+        }
+        drop(tokio::spawn(tracked));
     }
 
     /// Reserves one body reader and its declared bounded body allocation.
@@ -393,7 +404,7 @@ impl WebProcessRuntime {
             .try_reserve_websocket(owner, bytes, WebSocketBudgetClass::Data)
     }
 
-    /// Admits one WebSocket with owner-first bounded replacement.
+    /// Admits one WebSocket with dead-first, then owner-local bounded replacement.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn admit_websocket(
         self: &Arc<Self>,

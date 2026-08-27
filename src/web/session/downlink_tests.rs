@@ -29,8 +29,10 @@ fn session() -> (Arc<WebSession>, Arc<WebProcessRuntime>) {
         max_streams: 1,
         max_streams_per_session: 1,
     });
-    let mut timeouts = WebTimeoutsConfig::default();
-    timeouts.long_poll_secs = 1;
+    let timeouts = WebTimeoutsConfig {
+        long_poll_secs: 1,
+        ..WebTimeoutsConfig::default()
+    };
     let session = WebSession::new(
         Arc::downgrade(&manager),
         [1; 32],

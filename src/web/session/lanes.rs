@@ -6,8 +6,8 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use super::lane_downlink::take_lane_down_batch;
 use super::{
-    PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState, WebSession,
-    remember_closed,
+    CarrierLaneIdentity, PendingClass, PollResult, QUEUE_ITEM_COST, QueuedFrame, SessionState,
+    WebSession, remember_closed,
 };
 use crate::web::frame::{self, FrameType};
 use crate::web::manager::ManagerError;
@@ -19,14 +19,45 @@ impl WebSession {
         lane_id: u32,
         cursor: u64,
     ) -> Result<PollResult, ManagerError> {
+        self.poll_down_lane_inner(lane_id, None, cursor).await
+    }
+
+    /// Polls only the exact lane incarnation owned by one WebSocket driver.
+    pub(crate) async fn poll_down_websocket_lane(
+        &self,
+        lane: CarrierLaneIdentity,
+        cursor: u64,
+    ) -> Result<PollResult, ManagerError> {
+        self.poll_down_lane_inner(lane.lane_id, Some(lane.instance), cursor)
+            .await
+    }
+
+    async fn poll_down_lane_inner(
+        &self,
+        lane_id: u32,
+        expected_instance: Option<u64>,
+        cursor: u64,
+    ) -> Result<PollResult, ManagerError> {
         if !self.carrier().uses_lanes() || lane_id > frame::MAX_STREAM_ID {
             return Err(ManagerError::Protocol);
         }
-        if !self.wait_for_lane_open(lane_id, cursor).await? {
+        let lane_ready = if let Some(expected_instance) = expected_instance {
+            let state = self.state.lock();
+            if state.closed {
+                return Err(ManagerError::Closed);
+            }
+            state
+                .carrier_lanes
+                .get(&lane_id)
+                .is_some_and(|lane| lane.instance == expected_instance)
+        } else {
+            self.wait_for_lane_open(lane_id, cursor).await?
+        };
+        if !lane_ready {
             return Ok(PollResult {
                 body: Bytes::new(),
                 next_cursor: cursor,
-                lane_closed: false,
+                lane_closed: expected_instance.is_some(),
             });
         }
         let (instance, epoch, notify, healthy) = {
@@ -43,6 +74,13 @@ impl WebSession {
                         lane_closed: true,
                     });
                 };
+                if expected_instance.is_some_and(|instance| lane.instance != instance) {
+                    return Ok(PollResult {
+                        body: Bytes::new(),
+                        next_cursor: cursor,
+                        lane_closed: true,
+                    });
+                }
                 if let Some(unacked) = &lane.unacked {
                     if cursor == unacked.base_cursor {
                         return Ok(PollResult {
