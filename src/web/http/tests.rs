@@ -21,6 +21,9 @@ use crate::web::manager::WebProcessRuntime;
 mod legacy_tests;
 #[path = "negotiation_tests.rs"]
 mod negotiation_tests;
+// Reload-stability tests for session-owned timeout policy.
+#[path = "session_policy_tests.rs"]
+mod session_policy_tests;
 
 const TEST_CARRIER_DEADLINES_SECS: [u64; 4] = [3, 5, 8, 12];
 

@@ -288,6 +288,15 @@ pub struct WebTimeoutsConfig {
     /// Maximum wait for one empty downlink long poll.
     #[serde(default = "default_web_long_poll_timeout_secs")]
     pub long_poll_secs: u64,
+    /// Deadline for one generated-bridge HTTP attempt and response body.
+    #[serde(default = "default_web_bridge_request_secs")]
+    pub bridge_request_secs: u64,
+    /// Absolute generated-bridge budget for one retryable HTTP operation.
+    #[serde(default = "default_web_bridge_retry_secs")]
+    pub bridge_retry_secs: u64,
+    /// Optional delay for coalescing the first OPEN with immediate DATA.
+    #[serde(default = "default_web_carrier_probe_coalesce_ms")]
+    pub carrier_probe_coalesce_ms: u64,
     /// Grace for a canonical downlink poll that races its lane OPEN.
     #[serde(default = "default_web_lane_open_wait_secs")]
     pub lane_open_wait_secs: u64,
@@ -340,6 +349,9 @@ impl Default for WebTimeoutsConfig {
             stream_handshake_secs: default_web_stream_handshake_timeout_secs(),
             stream_first_byte_secs: default_web_stream_first_byte_secs(),
             long_poll_secs: default_web_long_poll_timeout_secs(),
+            bridge_request_secs: default_web_bridge_request_secs(),
+            bridge_retry_secs: default_web_bridge_retry_secs(),
+            carrier_probe_coalesce_ms: default_web_carrier_probe_coalesce_ms(),
             lane_open_wait_secs: default_web_lane_open_wait_secs(),
             carrier_health_secs: default_web_carrier_health_secs(),
             websocket_upgrade_secs: default_web_websocket_upgrade_secs(),

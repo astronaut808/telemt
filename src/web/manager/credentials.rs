@@ -110,19 +110,28 @@ impl WebProcessRuntime {
         })
     }
 
-    /// Resolves non-secret bootstrap trace identity without exposing its credential.
+    /// Resolves bootstrap trace identity and the frozen live-session body timeout.
     pub(crate) fn bootstrap_trace_identity(
         &self,
         hash: TokenHash,
         host: &str,
-    ) -> Option<(u64, Arc<WebRuntimeProfile>)> {
+    ) -> Option<(u64, Arc<WebRuntimeProfile>, Option<Duration>)> {
         let now = Instant::now();
         self.state
             .lock()
             .bootstraps
             .get(&hash)
             .filter(|entry| entry.profile.host == host && now <= entry.expires_at)
-            .map(|entry| (entry.trace_session_id, Arc::clone(&entry.profile)))
+            .map(|entry| {
+                (
+                    entry.trace_session_id,
+                    Arc::clone(&entry.profile),
+                    entry
+                        .session
+                        .as_ref()
+                        .map(|session| Duration::from_secs(session.timeouts().body_secs)),
+                )
+            })
     }
 
     /// Resolves an authenticated session token.

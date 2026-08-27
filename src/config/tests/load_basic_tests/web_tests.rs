@@ -108,10 +108,10 @@ fn web_carriers_reject_true_empty_and_duplicates() {
 }
 
 #[test]
-fn web_carrier_deadlines_and_learning_window_are_configurable() {
+fn web_carrier_and_bridge_deadlines_are_configurable() {
     let configured = WEB_CONFIG.replace(
         "[[web.vhosts]]",
-        "[web.timeouts]\ncarrier_negotiation_deadlines_secs = [1, 2, 4, 9]\ncarrier_learning_secs = 30\n\n[[web.vhosts]]",
+        "[web.timeouts]\ncarrier_negotiation_deadlines_secs = [1, 2, 4, 9]\ncarrier_learning_secs = 30\nbridge_request_secs = 7\nbridge_retry_secs = 41\ncarrier_probe_coalesce_ms = 4\n\n[[web.vhosts]]",
     );
     let config = load_config_from_temp_toml(&configured);
     assert_eq!(
@@ -119,6 +119,51 @@ fn web_carrier_deadlines_and_learning_window_are_configurable() {
         [1, 2, 4, 9]
     );
     assert_eq!(config.web.timeouts.carrier_learning_secs, 30);
+    assert_eq!(config.web.timeouts.bridge_request_secs, 7);
+    assert_eq!(config.web.timeouts.bridge_retry_secs, 41);
+    assert_eq!(config.web.timeouts.carrier_probe_coalesce_ms, 4);
+}
+
+#[test]
+fn web_bridge_deadlines_are_known_in_strict_mode() {
+    let configured = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.timeouts]\nbridge_request_secs = 7\nbridge_retry_secs = 41\ncarrier_probe_coalesce_ms = 4\n\n[[web.vhosts]]",
+    );
+    let configured = format!("[general]\nconfig_strict = true\n{configured}");
+    let config = load_config_from_temp_toml(&configured);
+
+    assert_eq!(config.web.timeouts.bridge_request_secs, 7);
+    assert_eq!(config.web.timeouts.bridge_retry_secs, 41);
+    assert_eq!(config.web.timeouts.carrier_probe_coalesce_ms, 4);
+}
+
+#[test]
+fn web_bridge_deadlines_are_bounded_and_ordered() {
+    for (field, value) in [
+        ("bridge_request_secs", "0"),
+        ("bridge_request_secs", "61"),
+        ("bridge_retry_secs", "0"),
+        ("bridge_retry_secs", "301"),
+        ("carrier_probe_coalesce_ms", "11"),
+    ] {
+        let invalid = WEB_CONFIG.replace(
+            "[[web.vhosts]]",
+            &format!("[web.timeouts]\n{field} = {value}\n\n[[web.vhosts]]"),
+        );
+        assert!(
+            load_config_error_from_temp_toml(&invalid).contains(&format!("web.timeouts.{field}"))
+        );
+    }
+
+    let reversed = WEB_CONFIG.replace(
+        "[[web.vhosts]]",
+        "[web.timeouts]\nbridge_request_secs = 20\nbridge_retry_secs = 10\n\n[[web.vhosts]]",
+    );
+    assert!(
+        load_config_error_from_temp_toml(&reversed)
+            .contains("bridge_request_secs must not exceed bridge_retry_secs")
+    );
 }
 
 #[test]

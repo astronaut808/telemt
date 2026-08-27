@@ -17,6 +17,7 @@ impl WebProcessRuntime {
         client_ip: IpAddr,
         profile_key: ProfileKey,
         profile_host: &str,
+        closed_token_lifetime: Duration,
     ) {
         let mut state = self.state.lock();
         if state.sessions.remove(&hash).is_none() {
@@ -28,14 +29,7 @@ impl WebProcessRuntime {
             &mut state,
             hash,
             profile_host,
-            Duration::from_secs(
-                self.active_runtime
-                    .load()
-                    .config()
-                    .web
-                    .timeouts
-                    .bootstrap_lifetime_secs,
-            ),
+            closed_token_lifetime,
             self.limits.max_sessions_global.saturating_mul(16),
         );
         let bootstrap_hashes = state

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::{Request, StatusCode};
@@ -46,7 +47,15 @@ pub(super) async fn handle_down(
         request,
         body,
         _body_budget,
-    } = match collect_body(request, &runtime, 1, true).await {
+    } = match collect_body(
+        request,
+        &runtime,
+        Duration::from_secs(session.timeouts().body_secs),
+        1,
+        true,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {

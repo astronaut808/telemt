@@ -206,6 +206,7 @@ impl WebSession {
                         self.client_ip,
                         self.profile_key,
                         &self.profile.host,
+                        Duration::from_secs(self.timeouts.bootstrap_lifetime_secs),
                     );
                 }
             }

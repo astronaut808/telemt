@@ -245,15 +245,20 @@ async fn handle_root(
         trace.register_redaction(bootstrap.token.as_bytes());
     }
     let generation = runtime.active_generation();
+    let config = generation.config();
     let page = bridge::render(
         &vhost.host,
         &bootstrap.token,
-        generation.config().web.limits.carrier_batch_bytes,
-        generation.config().web.limits.pending_bytes_per_session,
-        generation.config().web.limits.pending_items_per_session,
+        config.web.limits.carrier_batch_bytes,
+        config.web.limits.pending_bytes_per_session,
+        config.web.limits.pending_items_per_session,
         profile.carrier_negotiation_enabled,
         profile.carriers.len(),
         profile.carrier_negotiation_deadlines_secs,
+        config.web.timeouts.long_poll_secs,
+        config.web.timeouts.bridge_request_secs,
+        config.web.timeouts.bridge_retry_secs,
+        config.web.timeouts.carrier_probe_coalesce_ms,
         &generation.rng,
     );
     let mut response = full_response(StatusCode::OK, Bytes::from(page.body));
@@ -348,7 +353,15 @@ async fn handle_up(
         request,
         body,
         _body_budget,
-    } = match collect_body(request, &runtime, limit, false).await {
+    } = match collect_body(
+        request,
+        &runtime,
+        Duration::from_secs(session.timeouts().body_secs),
+        limit,
+        false,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {

@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode};
@@ -33,17 +34,22 @@ pub(super) async fn handle_session(
         if request.headers().contains_key(header::CONTENT_TYPE) {
             return serve_decoy(request, vhost, true, &runtime).await;
         }
+        let session = runtime.get_session(token_hash, &vhost.host).ok();
         if let Some(trace) = request_trace(&request)
-            && let Ok(session) = runtime.get_session(token_hash, &vhost.host)
+            && let Some(session) = &session
         {
             trace.set_route(TraceRoute::Session);
             trace.bind_identity(session.trace_identity());
         }
+        let body_timeout = session.as_ref().map_or_else(
+            || Duration::from_secs(runtime.active_generation().config().web.timeouts.body_secs),
+            |session| Duration::from_secs(session.timeouts().body_secs),
+        );
         let CollectedBody {
             request,
             body,
             _body_budget,
-        } = match collect_body(request, &runtime, 1, true).await {
+        } = match collect_body(request, &runtime, body_timeout, 1, true).await {
             Ok(result) => result,
             Err(CollectBodyError::Limit) => return service_unavailable(),
             Err(CollectBodyError::Invalid(request)) => {
@@ -62,7 +68,7 @@ pub(super) async fn handle_session(
         return serve_decoy(request, vhost, true, &runtime).await;
     };
     let ip_learning_eligible = carrier_ip_learning_eligible(&request, client_ip);
-    let Some((trace_session_id, profile)) =
+    let Some((trace_session_id, profile, frozen_body_timeout)) =
         runtime.bootstrap_trace_identity(token_hash, &vhost.host)
     else {
         return serve_decoy(request, vhost, true, &runtime).await;
@@ -71,11 +77,14 @@ pub(super) async fn handle_session(
         trace.set_route(TraceRoute::Session);
         trace.bind_profile(&profile, trace_session_id);
     }
+    let body_timeout = frozen_body_timeout.unwrap_or_else(|| {
+        Duration::from_secs(runtime.active_generation().config().web.timeouts.body_secs)
+    });
     let CollectedBody {
         request,
         body,
         _body_budget,
-    } = match collect_body(request, &runtime, CREATE_BODY_LIMIT, false).await {
+    } = match collect_body(request, &runtime, body_timeout, CREATE_BODY_LIMIT, false).await {
         Ok(result) => result,
         Err(CollectBodyError::Limit) => return service_unavailable(),
         Err(CollectBodyError::Invalid(request)) => {
